@@ -1,0 +1,74 @@
+import SwiftUI
+
+private struct ContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// 提詞區塊：固定在預覽頂端、緊鄰前鏡頭的窄區塊。
+/// 只是預覽上的 Overlay，不會進入影片；可以蓋住預覽中的臉。
+struct TeleprompterView: View {
+    @ObservedObject var model: TeleprompterModel
+    let text: String
+    let fontSize: CGFloat
+    let backgroundOpacity: Double
+
+    @State private var dragStartOffset: CGFloat?
+
+    var body: some View {
+        GeometryReader { geo in
+            Text(text)
+                .font(.system(size: fontSize, weight: .semibold))
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .lineSpacing(fontSize * 0.28)
+                .shadow(color: .black.opacity(0.6), radius: 2, x: 0, y: 1)
+                .frame(width: max(0, geo.size.width - 28))
+                .fixedSize(horizontal: false, vertical: true)
+                .background(
+                    GeometryReader { inner in
+                        Color.clear.preference(key: ContentHeightKey.self, value: inner.size.height)
+                    }
+                )
+                .padding(.top, 12)
+                .offset(y: -model.offset)
+                .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+                .clipped()
+                .onPreferenceChange(ContentHeightKey.self) { height in
+                    model.contentHeight = height + 12
+                }
+                .onAppear {
+                    model.viewportHeight = geo.size.height
+                }
+                .onChange(of: geo.size.height) { _, height in
+                    model.viewportHeight = height
+                }
+        }
+        .background(Color.black.opacity(backgroundOpacity))
+        .mask(
+            LinearGradient(
+                stops: [
+                    .init(color: .black, location: 0),
+                    .init(color: .black, location: 0.78),
+                    .init(color: .clear, location: 1)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 4)
+                .onChanged { value in
+                    let start = dragStartOffset ?? model.offset
+                    if dragStartOffset == nil { dragStartOffset = start }
+                    model.setOffset(start - value.translation.height)
+                }
+                .onEnded { _ in
+                    dragStartOffset = nil
+                }
+        )
+    }
+}

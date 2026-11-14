@@ -1,0 +1,6 @@
+*.xcodeproj
+BroccoliCam/Info.plist
+build/
+DerivedData/
+.DS_Store
+*.xcuserstate

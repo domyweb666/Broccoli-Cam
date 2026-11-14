@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>口播相機｜產品需求與開發規格書</title>
+<style>
+:root{--bg:#f5f5f7;--paper:#fff;--ink:#1d1d1f;--muted:#6e6e73;--line:#e5e5ea;--accent:#8b5a71;--accent2:#d4a5b8;--soft:#f3e6eb;--green:#287a59;--yellow:#a87520;--navy:#20232b}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",sans-serif;line-height:1.7}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:1120px;margin:auto;padding:34px 22px 80px}.hero{background:linear-gradient(135deg,#fff 0%,#f3e6eb 100%);border:1px solid #eadde3;border-radius:28px;padding:48px 42px;margin-bottom:24px}
+.eyebrow{font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);font-weight:700}
+h1{font-size:clamp(32px,5vw,54px);line-height:1.15;letter-spacing:-.04em;margin:12px 0}
+h2{font-size:27px;letter-spacing:-.025em;margin:0 0 16px}h3{font-size:18px;margin:0 0 8px}
+p{margin:8px 0 14px}.lead{font-size:19px;max-width:780px;color:#444}
+.meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:24px}.pill{border:1px solid #e5d2dc;border-radius:99px;padding:5px 11px;font-size:12px;color:#684356;background:#fff}
+.layout{display:grid;grid-template-columns:245px minmax(0,1fr);gap:24px;align-items:start}
+nav{position:sticky;top:18px;background:#fff;border:1px solid var(--line);border-radius:18px;padding:18px}
+nav b{display:block;margin-bottom:8px}nav a{display:block;color:#555;font-size:13px;padding:5px 0}
+main{min-width:0}.section{background:var(--paper);border:1px solid var(--line);border-radius:20px;padding:28px;margin-bottom:18px}
+.kicker{font-size:11px;color:var(--accent);font-weight:800;letter-spacing:.12em;margin-bottom:7px}
+.callout{background:var(--soft);border-left:4px solid var(--accent);padding:15px 18px;border-radius:10px;margin:16px 0}
+.note{font-size:13px;color:var(--muted)}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.card{border:1px solid var(--line);border-radius:15px;padding:17px;background:#fff}.card.tint{background:#faf6f8}
+.tag{display:inline-block;font-size:11px;border-radius:99px;padding:3px 9px;background:#f0edf0;color:#555;margin-bottom:8px}.tag.green{background:#e7f3ed;color:#236447}.tag.gold{background:#fbf2df;color:#805d19}
+ul,ol{padding-left:22px}li{margin:5px 0}
+table{border-collapse:collapse;width:100%;font-size:14px;margin:12px 0}th,td{padding:11px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{background:#f7f7f9;font-weight:650}
+.mock{background:#17191e;border-radius:26px;padding:14px;color:white;max-width:370px;margin:12px auto;box-shadow:0 12px 35px #1d1d1f22}
+.mocktop{display:flex;justify-content:space-between;font-size:11px;color:#ddd;padding:3px 5px 10px}
+.preview{height:410px;border-radius:17px;position:relative;overflow:hidden;background:radial-gradient(circle at 50% 36%,#b9a99e,#625d5b 65%,#39383b)}
+.preview .person{position:absolute;width:150px;height:210px;left:50%;top:82px;transform:translateX(-50%);border-radius:75px 75px 32px 32px;background:linear-gradient(145deg,#d9bcae,#9d7c72);opacity:.8}
+.preview .face{position:absolute;width:92px;height:118px;left:50%;top:46px;transform:translateX(-50%);border-radius:48% 48% 44% 44%;background:linear-gradient(120deg,#e8c8b5,#b98e7e)}
+.preview .hair{position:absolute;width:100px;height:58px;left:50%;top:40px;transform:translateX(-50%);border-radius:60% 60% 20% 20%;background:#403a3a}
+.headguide{position:absolute;width:140px;height:190px;border:2px dashed #f5e8ed;border-radius:48% 48% 42% 42%;left:50%;top:28px;transform:translateX(-50%);opacity:.9}
+.script{position:absolute;left:16px;right:16px;top:12px;text-align:center;background:#1119;border-radius:12px;padding:10px 12px;font-size:15px;color:#fff}
+.controls{display:flex;align-items:center;justify-content:space-around;padding:14px 4px 4px}.rec{width:58px;height:58px;border:5px solid #fff;border-radius:50%;display:grid;place-items:center}.rec:after{content:"";width:32px;height:32px;background:#e64e55;border-radius:50%}
+.avatarbox{background:#2c2d33;border-radius:15px;padding:12px;display:flex;align-items:center;gap:13px;margin:10px 0}
+.avatar{width:86px;height:86px;border-radius:50%;background:radial-gradient(circle at 50% 35%,#f3d6c5 0 28%,#9e7770 29% 48%,#5a4c53 49%);position:relative;flex:none}
+.avatar:before{content:"";position:absolute;width:39px;height:12px;border-radius:50%;background:#493b3d;top:25px;left:24px}
+.avatar:after{content:"";position:absolute;width:27px;height:5px;border-bottom:2px solid #7a4f4b;border-radius:50%;top:52px;left:30px}
+.avatarlabel{font-size:12px;color:#ccc}
+.flow{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;margin:16px 0}
+.flow span{background:#f6f1f4;border:1px solid #eadde3;padding:9px 13px;border-radius:10px;font-size:13px;font-weight:600}
+.arrow{color:var(--accent);font-weight:800}
+.footer{color:var(--muted);font-size:12px;text-align:center;padding:24px}
+@media(max-width:850px){.layout{grid-template-columns:1fr}nav{position:static}.grid3{grid-template-columns:1fr}.hero{padding:32px 24px}.section{padding:21px}.grid2{grid-template-columns:1fr}}
+@media print{body{background:#fff}.wrap{max-width:none;padding:0}.layout{display:block}nav{display:none}.section,.hero{break-inside:avoid;box-shadow:none}.hero{border:0}.section{border:0;border-bottom:1px solid #ddd}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header class="hero">
+  <div class="eyebrow">Product brief · iOS · V1.1</div>
+  <h1>口播相機<br>產品需求與開發規格書</h1>
+  <p class="lead">給知識型、口播型新手創作者使用的極簡拍攝工具。讓不擅長拍片的人，也能自然地看著鏡頭，把想說的內容說完。</p>
+  <div class="callout"><strong>核心設計原則：</strong>複雜留給系統，簡單留給使用者。前台極簡，後台自動化；使用者不必理解攝影參數，只需要準備好內容並開始說話。</div>
+  <div class="meta"><span class="pill">目標客群：知識型／口播型創作者</span><span class="pill">平台：iOS 原生</span><span class="pill">技術：SwiftUI + AVFoundation</span><span class="pill">開發環境：Windows＋雲端 CI（無 Mac）</span><span class="pill">文件版本：V1.1</span></div>
+</header>
+<div class="layout">
+<nav><b>文件導覽</b>
+<a href="#changes">00｜V1.1 修訂摘要</a><a href="#summary">01｜產品摘要</a><a href="#audience">02｜目標客群與需求</a><a href="#principles">03｜設計原則</a><a href="#modes">04｜雙拍攝模式</a><a href="#ui">05｜第一版 UI</a><a href="#automation">06｜無感自動化</a><a href="#tech">07｜技術架構</a><a href="#flows">08｜使用流程</a><a href="#scope">09｜開發範圍與優先級</a><a href="#acceptance">10｜驗收標準</a><a href="#risks">11｜風險與注意事項</a><a href="#assets">12｜視覺參考</a><a href="#handoff">13｜Claude Code 執行指示</a>
+</nav>
+<main>
+<section class="section" id="changes"><div class="kicker">00 / V1.1 CHANGES</div><h2>V1.1 修訂摘要</h2><p>本版依可行性評估修訂。與 V1.0 衝突之處，以本版為準。</p><table><tr><th>項目</th><th>V1.0</th><th>V1.1</th><th>原因</th></tr><tr><td>臉部定位</td><td>Vision 分析預覽影格</td><td>AVCaptureMetadataOutput 的臉部中繼資料</td><td>相機本身就回報臉部矩形，不必另接影格輸出；效能與發熱風險較低</td></tr><tr><td>音訊監測</td><td>AVAudioSession＋AVAudioEngine</td><td>讀錄影音訊連線的 audioChannels 音量</td><td>避免兩套音訊管線同時搶麥克風</td></tr><tr><td>提詞位置</td><td>靠近前鏡頭，且不可遮住臉</td><td>固定在螢幕頂端，可蓋住預覽中的臉</td><td>原規格兩個要求互相矛盾；眼神不偏下才是產品要解決的問題</td></tr><tr><td>陪伴角色</td><td>風格化真人 3D 即時動畫</td><td>先用預錄短片切換，驗證有效再投資 3D</td><td>3D 素材成本高，且陪伴效果仍是未驗證的假設</td></tr><tr><td>驗證方式</td><td>模擬器或真機</td><td>只認真機；新增 App 內除錯資訊層</td><td>模擬器沒有相機；開發環境是 Windows，建置全走雲端 CI</td></tr><tr><td>開發節奏</td><td>逐階段小步交付</td><td>兩輪：P0 與臉部、收音一次做完；陪伴模式第二輪</td><td>每次真機迭代成本高，減少來回次數</td></tr></table></section>
+
+<section class="section" id="summary"><div class="kicker">01 / PRODUCT SUMMARY</div><h2>產品摘要</h2>
+<p>這不是一款功能繁多的專業相機，也不只是提詞器。它是一款<strong>新手口播拍攝助手</strong>：協助使用者完成構圖、提詞或面對鏡頭的心理準備，再以 iPhone 前鏡頭錄製影片。</p>
+<div class="grid3">
+<div class="card tint"><span class="tag">核心價值 01</span><h3>不會拍？幫你構圖</h3><p class="note">固定虛擬頭像框，搭配可選的臉部位置偵測。</p></div>
+<div class="card tint"><span class="tag">核心價值 02</span><h3>不會背？幫你提詞</h3><p class="note">整篇文字稿直接貼上，錄影時自然閱讀。</p></div>
+<div class="card tint"><span class="tag">核心價值 03</span><h3>怕鏡頭？陪你說話</h3><p class="note">虛擬聆聽者提供輕微、自然的非語言回饋。</p></div>
+</div>
+<div class="callout"><strong>產品承諾：</strong>不用背稿、不必懂構圖，也能更輕鬆地完成一支口播影片。</div>
+</section>
+
+<section class="section" id="audience"><div class="kicker">02 / AUDIENCE & NEEDS</div><h2>目標客群與未被滿足的需求</h2>
+<h3>主要客群</h3><p>有專業知識、想透過短影音分享內容或經營個人品牌，但沒有拍攝習慣或不擅長面對鏡頭的人。</p>
+<ul><li>講師、顧問、教練、老師。</li><li>醫療、法律、財務等專業知識分享者（需自行遵守各行業內容規範）。</li><li>寫作者、部落客、電子報作者，想把文章轉成口播。</li><li>創業者、個人品牌經營者。</li></ul>
+<h3>核心痛點</h3>
+<table><tr><th>痛點</th><th>產品回應</th></tr><tr><td>面對鏡頭不知道頭該放哪裡</td><td>固定頭像／肩膀構圖框、可選臉部定位提示</td></tr><tr><td>怕忘詞、眼神飄移</td><td>提詞文字固定在螢幕頂端（緊鄰前鏡頭）、速度可調、手動暫停</td></tr><tr><td>對著鏡頭感到尷尬或緊張</td><td>虛擬陪伴者模式，營造視訊對話感</td></tr><tr><td>不懂曝光、白平衡等設定</td><td>優先使用原生自動曝光、白平衡與對焦</td></tr><tr><td>拍錯就得整段重來</td><td>快速重錄；後續可評估分段錄影</td></tr><tr><td>不確定收音是否正常</td><td>錄影前簡單音訊輸入檢查與異常提示</td></tr></table>
+<p class="note">市場假設需透過訪談與實際使用測試驗證；不能僅憑短影音觀看人口推論付費意願。</p>
+</section>
+
+<section class="section" id="principles"><div class="kicker">03 / DESIGN PRINCIPLES</div><h2>產品設計原則</h2>
+<ol><li><strong>Camera-first：</strong>打開 App 優先進入拍攝主畫面。</li><li><strong>無感自動化：</strong>系統在背景處理可自動完成的工作，不要求使用者理解技術名詞。</li><li><strong>零學習成本：</strong>預設值合理，第一次使用不需要先閱讀教學。</li><li><strong>口播優先：</strong>提詞、構圖、收音與錄影穩定性優先於濾鏡、特效、剪輯。</li><li><strong>不干擾創作：</strong>不頻繁彈窗、不在錄影中插入不必要提示。</li><li><strong>保留使用者控制權：</strong>自動化是預設，但允許使用者關閉構圖框或調整必要設定。</li><li><strong>隱私優先：</strong>臉部位置分析盡可能在裝置端完成，不上傳相機畫面。</li></ol>
+<div class="callout">「無感自動化」不等於把所有功能藏起來，而是預設替使用者做好；只有遇到需要使用者採取行動的問題，才顯示簡短、可理解的提示。</div>
+</section>
+
+<section class="section" id="modes"><div class="kicker">04 / TWO RECORDING MODES</div><h2>雙拍攝模式</h2>
+<div class="grid2">
+<div class="card"><span class="tag green">模式 A｜提詞模式</span><h3>適合有稿、需要照著說的人</h3><ul><li>貼上完整文字稿，不強制逐句切卡。</li><li>可自動滾動，也可手動滑動。</li><li>調整文字大小、速度、透明度。</li><li>開始提詞前以構圖框對位；提詞開始後構圖框淡出。</li><li>錄影與提詞可獨立啟動／暫停。</li></ul></div>
+<div class="card"><span class="tag gold">模式 B｜陪伴模式</span><h3>適合知道要說什麼、但怕鏡頭的人</h3><ul><li>不需要輸入文字稿。</li><li>前鏡頭畫面搭配一位虛擬聆聽者。</li><li>人物位於靠近前鏡頭的位置，避免視線偏離太遠。</li><li>根據說話狀態觸發輕微點頭、眨眼與微笑。</li><li>不主動說話、不打斷使用者、不理解或評判內容。</li></ul></div>
+</div>
+<h3 style="margin-top:20px">陪伴角色：先用預錄短片驗證，再決定是否投資 3D</h3>
+<p><strong>V1 做法：</strong>預先製作同一位聆聽者的數段短片（待機 2–3 段、點頭、微笑），依說話狀態切換播放並交叉淡化。片段不含音軌。目的是用最低成本測出「有人在聽」是否真的讓使用者比較敢講。</p><p><strong>長期視覺方向（驗證有效後才做）：</strong>選擇自然比例、略經風格化的 3D 人物：接近真人但不追求照片級寫實；眼睛自然、表情溫暖、避免誇張卡通比例。目標是親切且不詭異，而非製作一個虛擬網紅。</p>
+<div class="avatarbox"><div class="avatar"></div><div><strong>虛擬聆聽者（示意）</strong><div class="avatarlabel">自然注視・輕微點頭・柔和微笑<br>角色動畫不進入最終錄影檔</div></div></div>
+<p class="note">陪伴效果是待驗證的產品假設。研究結果不能直接保證在手機自拍錄影情境中同樣有效，需以目標客群實測。</p>
+</section>
+
+<section class="section" id="ui"><div class="kicker">05 / FIRST VERSION UI</div><h2>第一版 UI 規劃</h2>
+<h3>畫面 1：拍攝主畫面</h3>
+<div class="mock"><div class="mocktop"><span>9:41</span><span>● ● ●</span></div><div class="preview"><div class="person"></div><div class="face"></div><div class="hair"></div><div class="headguide"></div><div class="script">今天想跟你分享一個觀念：<br>真正有效的知識管理，不是收藏更多資訊……</div></div><div class="controls"><span>稿件</span><span>設定</span><div class="rec"></div><span>模式</span></div></div>
+<ul><li>直式 9:16 前鏡頭預覽，盡量使用可用的高品質原生相機格式。</li><li>虛擬頭像框是 UI Overlay，不得燒錄進影片。</li><li>提詞文字固定在螢幕頂端的窄區塊，緊鄰前鏡頭；行寬收窄，減少眼球左右移動。大小、速度、透明度可調。</li><li>提詞文字可以蓋住預覽中的臉：讀稿時使用者不需要看自己，文字也不會進入影片。</li><li>有稿件時，構圖框只在開始提詞前顯示供對位，提詞開始後淡出；沒有稿件時不顯示提詞區塊。</li><li>主畫面僅保留稿件、模式、簡單設定與錄影控制。</li><li>錄影時顯示簡潔計時，不顯示專業相機參數。</li></ul>
+<h3>畫面 2：文字稿編輯</h3><ul><li>大面積文件式文字編輯器。</li><li>直接貼上整篇文字、可修改、可全選清空。</li><li>自動保存最後一次使用的稿件。</li><li>不做腳本資料庫、分類、雲端同步或 AI 生成。</li></ul>
+<h3>畫面 3：簡單設定</h3><ul><li>影片畫質：裝置支援時提供 1080p／4K。</li><li>幀率：裝置支援時提供 30／60 FPS。</li><li>提詞文字大小、速度、透明度。</li><li>頭像框顯示／隱藏與大小。</li><li>錄影倒數。</li></ul>
+<h3>畫面 4：錄影完成</h3><ul><li>影片預覽。</li><li>儲存到照片圖庫。</li><li>重新錄影。</li><li>返回拍攝畫面。</li></ul>
+<div class="callout"><strong>UI 原則：</strong>不設傳統底部分頁導覽。App 啟動後直接到相機，減少新手的選擇負擔。</div>
+</section>
+
+<section class="section" id="automation"><div class="kicker">06 / INVISIBLE AUTOMATION</div><h2>無感自動化規格</h2>
+<h3>A. 智慧構圖</h3><p>先顯示固定頭像／肩膀輪廓；在背景取得臉部位置，提供「位置大致正確」的視覺回饋。</p>
+<ul><li>使用 AVCaptureMetadataOutput 的臉部中繼資料（metadataObjectTypes 設為 .face），由相機管線直接回報臉部矩形；不另接影格輸出，也不使用 Vision。</li><li>用預覽層的座標轉換把臉部矩形換算成畫面座標，再與構圖區域比較。</li><li>回呼頻率由系統決定；UI 狀態更新節流到每秒約 2–3 次，避免提示閃爍。</li><li>只比較臉部 bounding box 與預設構圖區域，不辨識身份、不分析情緒。</li><li>偵測不到臉時保持中性狀態，不要頻繁跳出警告。</li><li>錄影中可停止更新構圖提示，優先確保錄影流暢。</li><li>臉部框只是近似構圖輔助，不等於完整頭部／肩膀姿態估計。</li></ul>
+<h3>B. 相機自動畫面</h3><ul><li>優先使用 AVFoundation 支援的連續自動曝光、自動白平衡、自動對焦。</li><li>不要一開始就自製 AI 曝光演算法，也不要持續覆寫原生自動控制。</li><li>不保證自製 App 與 Apple 相機 App 的影像處理完全一致。</li><li>若畫面明顯過暗，可提示使用者靠近光源；不要承諾相機參數能解決所有光線問題。</li><li>V1 不做美顏、磨皮、濾鏡商店或複雜色彩管線。</li></ul>
+<h3>C. 收音檢查</h3><ul><li>AVAudioSession 只負責類別、路由與中斷處理。音量直接讀錄影輸出音訊連線的 audioChannels（averagePowerLevel／peakHoldLevel），不另開 AVAudioEngine，避免兩套音訊管線搶麥克風。</li><li>以計時器每秒讀取約 10 次；錄影前與錄影中共用同一個來源。</li><li>若真機上未錄影時讀不到音量，改在同一個 capture session 加 AVCaptureAudioDataOutput 計算能量；仍不使用 AVAudioEngine。</li><li>顯示簡單的「收音正常」或「沒有偵測到聲音」提示。</li><li>處理藍牙、外接麥克風、音訊路由變更與中斷。</li><li>不把音量大小誤當成音質保證；V1 不做 AI 降噪或完整聲學診斷。</li></ul>
+<h3>D. 陪伴人物的反應</h3><ul><li>用收音檢查的同一個音量來源做能量門檻判斷說話／停頓，起始與結束各加延遲時間避免抖動；不需要語音轉文字或雲端 LLM。</li><li>說話中：維持聆聽，偶爾輕微點頭。</li><li>短暫停頓：保持眼神與自然表情，不急著反應。</li><li>較長停頓：自然等待，不催促。</li><li>待機片段準備 2–3 段，隨機輪播並交叉淡化，避免固定循環造成機械感。</li><li>限制點頭頻率，避免每句話都點頭。</li><li>角色不得發聲或打斷使用者；動畫只作為預覽 UI，不輸出到影片。</li></ul>
+</section>
+
+<section class="section" id="tech"><div class="kicker">07 / TECHNICAL ARCHITECTURE</div><h2>技術架構建議</h2>
+<table><tr><th>模組</th><th>建議技術</th><th>責任</th></tr>
+<tr><td>UI</td><td>SwiftUI</td><td>拍攝畫面、文字稿、設定、完成頁、Overlay</td></tr>
+<tr><td>相機</td><td>AVFoundation</td><td>前鏡頭、預覽、錄影、格式與 FPS</td></tr>
+<tr><td>錄影輸出</td><td>AVCaptureMovieFileOutput</td><td>優先採用原生錄影輸出，減少自建編碼管線</td></tr>
+<tr><td>臉部定位</td><td>AVCaptureMetadataOutput</td><td>相機內建的臉部矩形回報，不跑 Vision</td></tr>
+<tr><td>音訊</td><td>AVAudioSession＋錄影音訊連線的 audioChannels</td><td>錄音路由、中斷處理、音量讀取、說話偵測輸入</td></tr>
+<tr><td>陪伴角色</td><td>AVPlayer 播放無音軌預錄短片（V1）；Rive／3D 待驗證後評估</td><td>待機、點頭、微笑片段的切換與交叉淡化</td></tr>
+<tr><td>照片儲存</td><td>Photos framework</td><td>請求權限並儲存影片</td></tr>
+<tr><td>設定保存</td><td>UserDefaults</td><td>記住畫質、提詞設定、頭像框大小等</td></tr>
+<tr><td>除錯</td><td>App 內除錯資訊層</td><td>顯示實際格式、FPS、音訊路由、錯誤訊息，可複製回報</td></tr></table>
+<h3>建議程式模組</h3>
+<ul><li><code>CameraService</code>：AVCaptureSession、前鏡頭、錄影、格式、權限、中斷處理。</li><li><code>RecordingViewModel</code>：錄影狀態與流程協調。</li><li><code>TeleprompterView</code>／<code>TeleprompterService</code>：稿件顯示、滾動、暫停與位置。</li><li><code>ScriptEditorView</code>：完整文字貼上與編輯。</li><li><code>FramingGuideView</code>：固定構圖輪廓及狀態顯示。</li><li><code>FaceDetectionService</code>：接收 AVCaptureMetadataOutput 的臉部矩形並換算座標，不處理影格。</li><li><code>CompanionModeView</code>：預錄短片的播放與狀態切換。</li><li><code>SpeechActivityMonitor</code>：讀取錄影音訊連線的音量，輸出收音狀態與說話／停頓，不做語意理解。</li><li><code>VideoReviewView</code>：預覽、重拍、儲存。</li><li><code>SettingsStore</code>：保存使用者偏好。</li><li><code>DebugOverlayView</code>：隱藏手勢開啟的除錯資訊層。</li></ul>
+<div class="callout"><strong>重要實作提醒：</strong>AVCaptureSession、影格處理與錄影狀態應避免在主執行緒做重工作。臉部中繼資料的回呼處理不可阻塞錄影管線；必須在真機測試效能、掉幀、發熱與音訊同步。</div>
+</section>
+
+<section class="section" id="flows"><div class="kicker">08 / USER FLOWS</div><h2>主要使用流程</h2>
+<h3>提詞模式</h3><div class="flow"><span>開啟 App</span><b class="arrow">→</b><span>貼上稿件</span><b class="arrow">→</b><span>對準構圖框</span><b class="arrow">→</b><span>開始錄影</span><b class="arrow">→</b><span>提詞</span><b class="arrow">→</b><span>預覽／儲存</span></div>
+<h3>陪伴模式</h3><div class="flow"><span>開啟 App</span><b class="arrow">→</b><span>選陪伴模式</span><b class="arrow">→</b><span>虛擬人物就位</span><b class="arrow">→</b><span>開始錄影</span><b class="arrow">→</b><span>自然說話</span><b class="arrow">→</b><span>預覽／儲存</span></div>
+<p>兩種模式共用 CameraService、錄影、儲存與基本相機控制；僅提詞／陪伴 UI 與狀態管理不同。</p>
+</section>
+
+<section class="section" id="scope"><div class="kicker">09 / SCOPE & PRIORITY</div><h2>開發範圍與優先級</h2>
+<table><tr><th>優先級</th><th>功能</th><th>說明</th></tr>
+<tr><td><span class="tag green">P0</span></td><td>前鏡頭高畫質錄影、提詞、貼稿、固定頭像框、預覽／儲存、設定記憶</td><td>最小可用產品核心</td></tr>
+<tr><td><span class="tag green">P0</span></td><td>原生自動曝光／白平衡／對焦</td><td>先用 AVFoundation 能力，不自建複雜 AI</td></tr>
+<tr><td><span class="tag">P1</span></td><td>臉部位置偵測（AVCaptureMetadataOutput）、收音狀態檢查、App 內除錯資訊層</td><td>與 P0 同一輪完成；非阻塞、可降級</td></tr>
+<tr><td><span class="tag">P1</span></td><td>陪伴模式（第二輪）：一位聆聽者的預錄短片、說話偵測、片段切換</td><td>相機與提詞在真機驗證穩定後才開始</td></tr>
+<tr><td><span class="tag">P2</span></td><td>3D／Rive 即時角色、多角色、分段錄影、語音跟隨提詞</td><td>依測試需求再決定</td></tr>
+<tr><td><span class="tag">P3</span></td><td>AI 稿件生成、AI 口播教練、AI 剪輯、美顏、雲端服務</td><td>不屬於目前範圍</td></tr></table>
+<h3>明確不做（V1）</h3><ul><li>不做濾鏡商店、複雜美顏、AI 美顏。</li><li>不做影片剪輯、字幕、轉場、社群發布。</li><li>不做雲端腳本管理或帳號系統。</li><li>不做虛擬人物即時對話、語音回覆或內容理解。</li><li>不把構圖框或虛擬人物燒錄進最終影片。</li></ul>
+</section>
+
+<section class="section" id="acceptance"><div class="kicker">10 / ACCEPTANCE CRITERIA</div><h2>驗收標準</h2>
+<ol><li>首次開啟後，使用者能清楚理解如何授權相機與麥克風。</li><li>App 開啟後直接進入拍攝主畫面，不需先穿越多層選單。</li><li>使用者能貼上完整稿件，文字不會被強制拆成逐句卡片。</li><li>提詞可調整大小、速度與透明度；錄影與提詞狀態彼此獨立。</li><li>構圖框只顯示在預覽畫面，不會出現在輸出影片。</li><li>能以裝置支援的格式錄製直式前鏡頭影片並儲存至照片圖庫。</li><li>錄影期間無明顯掉幀、聲畫不同步或異常發熱；需在多款實機測試。</li><li>臉部偵測失敗時 App 仍可正常錄影，不可將辨識設為錄影必要條件。</li><li>陪伴模式的動畫不會進入輸出影片，也不會搶占或中斷錄音。</li><li>使用者能在不閱讀長篇教學的情況下完成第一次錄影。</li><li>提詞時視線落在螢幕頂端；回看影片不會明顯看出眼神偏下。</li><li>除錯資訊層可由隱藏手勢開啟，顯示實際錄影格式、FPS、音訊路由與最近一次錯誤，內容可複製。</li></ol>
+</section>
+
+<section class="section" id="risks"><div class="kicker">11 / RISKS & CONSIDERATIONS</div><h2>技術風險與注意事項</h2>
+<ul><li><strong>畫質：</strong>使用 Apple 原生相機硬體與 AVFoundation，但自製 App 不保證完全複製 Apple Camera App 的影像處理、HDR 或所有特殊功能。需明確測試支援機型與格式。</li><li><strong>4K：</strong>前鏡頭是否支援 4K、特定 FPS 與動態範圍依機型而異。UI 必須依實際可用格式呈現，不可硬編碼所有裝置都有 4K/60。</li><li><strong>直式影片：</strong>驗證方向 metadata、前鏡頭鏡像預覽與輸出方向，避免影片旋轉或左右方向錯誤。</li><li><strong>臉部偵測：</strong>臉部矩形不等於完整頭部輪廓；頭髮、帽子、側臉與光線會影響偵測。構圖提示應寬容，不要過度糾正。</li><li><strong>陪伴人物：</strong>動畫需克制。頻繁點頭、固定循環、錯誤時機的笑容可能造成反感。應提供關閉選項。預錄片段不得含音軌，避免播放時影響錄音工作階段。</li><li><strong>音訊：</strong>收音檢查與說話偵測共用錄影的音訊連線，不建立第二條音訊管線；仍需處理藍牙路由、來電、其他 App 音訊中斷等情況。</li><li><strong>開發環境：</strong>以 Windows 開發、沒有 Mac，建置與簽章全走雲端 CI，驗證只能在真機進行。每次迭代成本高，所以需要除錯資訊層把真機狀態帶回來。</li><li><strong>隱私：</strong>清楚說明臉部偵測與音訊活動分析用途；V1 不保存身份特徵、不上傳影像或語音內容。</li></ul>
+</section>
+
+<section class="section" id="assets"><div class="kicker">12 / VISUAL REFERENCES</div><h2>視覺參考與示範圖</h2>
+<p>以下是本報告內嵌的概念示意，供 Claude Code 理解畫面層級與功能關係。不是最終 UI 素材；正式開發應以 SwiftUI 原生元件重建。</p>
+<div class="grid2">
+<div class="card"><h3>提詞模式：構圖框＋稿件</h3><div style="background:#292b30;border-radius:14px;padding:12px;color:#fff"><div style="height:180px;border-radius:10px;background:linear-gradient(135deg,#84766e,#34363c);position:relative"><div style="position:absolute;width:90px;height:120px;border:2px dashed #f4e6ec;border-radius:48%;left:50%;top:24px;transform:translateX(-50%)"></div><div style="position:absolute;top:8px;left:10px;right:10px;background:#111a;padding:8px;border-radius:8px;text-align:center;font-size:12px">口播文字貼近頂端的前鏡頭</div></div></div><p class="note">構圖框、提詞文字都是預覽 Overlay。提詞開始後構圖框淡出。</p></div>
+<div class="card"><h3>陪伴模式：虛擬聆聽者</h3><div style="background:#292b30;border-radius:14px;padding:15px;color:#fff"><div style="display:flex;align-items:center;gap:12px"><div class="avatar"></div><div><b>虛擬聆聽者</b><div class="note" style="color:#ccc">正在聆聽你說話</div></div></div><div style="height:130px;margin-top:12px;border-radius:10px;background:linear-gradient(135deg,#81766e,#414047);display:grid;place-items:center;color:#ddd">前鏡頭預覽</div></div><p class="note">角色靠近前鏡頭，避免使用者視線偏移。</p></div>
+</div>
+<h3>建議視覺風格</h3><ul><li>整體：簡潔、低干擾、偏 Apple 原生相機的操作直覺。</li><li>拍攝畫面：深色控制層，將注意力留給人物與文字。</li><li>角色：V1 為預錄的聆聽者短片；長期方向為風格化真人 3D，溫暖、自然、非照片級寫實。</li><li>色彩：以中性色為主，使用柔和藕荷色作為品牌點綴；狀態色只在必要時出現。</li></ul>
+</section>
+
+<section class="section" id="handoff"><div class="kicker">13 / CLAUDE CODE HANDOFF</div><h2>交給 Claude Code 的執行指示</h2>
+<div class="callout"><strong>請先閱讀整份規格，再開始修改專案。開發分兩輪：第一輪一次完成 P0、臉部定位、收音檢查與除錯資訊層，交付後由使用者在真機整體測試並回報；第二輪才做陪伴模式。開發環境是 Windows，沒有 Mac 與 Xcode，建置與簽章全部走雲端 CI。</strong></div>
+<h3>任務順序</h3>
+<ol><li>檢查現有專案、Bundle ID、部署目標與雲端 CI 設定；沒有專案就建立，並先確認 CI 能產出可裝到真機的版本。</li><li>建立 CameraService，先完成前鏡頭預覽、錄影與相簿儲存。</li><li>處理直式方向、鏡像預覽、輸出方向與中斷；加入除錯資訊層，讓真機上的格式、FPS、音訊路由與錯誤可被看見並複製回報。</li><li>再加入文件式文字稿編輯與提詞 Overlay。</li><li>加入固定頭像框，確認 Overlay 不會被錄進影片。</li><li>加入 AVCaptureMetadataOutput 臉部定位與收音檢查。</li><li>第一輪到此為止，交付真機測試。<strong>第二輪：</strong>新增 CompanionModeView、說話偵測與預錄短片切換。</li></ol>
+<h3>實作規則</h3><ul><li>每次交付都要通過雲端 CI 建置並能裝到真機。模擬器沒有相機，不作為驗收依據。</li><li>不要為了架構過度抽象；但相機、提詞、構圖、陪伴動畫需保持模組分離。</li><li>不要假設所有 iPhone 都支援相同的錄影格式。</li><li>不要在主執行緒做相機設定、臉部回呼處理或音訊運算。</li><li>遇到規格與 iOS API 能力不一致時，先回報限制與替代方案，不要假裝已完成。</li><li>先交付可工作的 V1，再討論非必要功能。</li></ul>
+<h3>第一輪完成定義</h3><p>能在實機打開 App、看到前鏡頭、貼上文字稿、顯示提詞與構圖框、完成錄影，並將不含 UI Overlay 的影片存入照片圖庫；臉部定位提示與收音檢查可運作，除錯資訊層可開啟。</p>
+</section>
+<div class="footer">口播相機｜產品需求與開發規格書 · V1.1<br>本文件為產品與工程討論基準；技術細節以實際 iOS SDK、機型能力與真機測試結果為準。</div>
+</main>
+</div>
+</div>
+</body>
+</html>
