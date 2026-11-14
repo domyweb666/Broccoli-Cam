@@ -7,6 +7,8 @@ struct VideoReviewView: View {
     @EnvironmentObject private var camera: CameraService
     @Environment(\.dismiss) private var dismiss
     let video: RecordedVideo
+    /// 丟掉所有已錄的段落（分段錄影用）。
+    var onDiscardAll: () -> Void = {}
 
     private enum SaveState: Equatable {
         case idle
@@ -43,12 +45,13 @@ struct VideoReviewView: View {
                 HStack(spacing: 12) {
                     Button {
                         if saveState == .saved {
+                            onDiscardAll()
                             close()
                         } else {
                             confirmDiscard = true
                         }
                     } label: {
-                        Text(saveState == .saved ? "再錄一支" : "重新錄影")
+                        Text(saveState == .saved ? "再錄一支" : (video.isStitched ? "回去修改" : "重新錄影"))
                             .font(.headline)
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity, minHeight: 52)
@@ -79,9 +82,21 @@ struct VideoReviewView: View {
                 .padding(.bottom, 8)
             }
         }
-        .confirmationDialog("這支影片還沒儲存，確定要丟掉重錄？", isPresented: $confirmDiscard, titleVisibility: .visible) {
-            Button("丟掉並重錄", role: .destructive) {
-                close()
+        .confirmationDialog(video.isStitched ? "這支影片還沒儲存" : "這支影片還沒儲存，確定要丟掉重錄？",
+                            isPresented: $confirmDiscard, titleVisibility: .visible) {
+            if video.isStitched {
+                // 各段都還留著，回去只重錄想改的那一段。
+                Button("回去重錄其中一段") {
+                    close()
+                }
+                Button("全部丟掉重來", role: .destructive) {
+                    onDiscardAll()
+                    close()
+                }
+            } else {
+                Button("丟掉並重錄", role: .destructive) {
+                    close()
+                }
             }
             Button("取消", role: .cancel) {}
         }

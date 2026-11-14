@@ -4,9 +4,18 @@ import Combine
 struct RecordedVideo: Identifiable {
     let id = UUID()
     let url: URL
+    /// 是否由多段接成。接成的影片在完成頁可以回去重錄其中一段。
+    var isStitched = false
 }
 
-/// 錄影狀態與流程協調：倒數 → 錄影 → 完成頁。
+/// 一段錄好的影片，以及錄影當下量到的「有聲音」範圍（秒）。
+struct SegmentTake {
+    let url: URL
+    let firstSound: Double?
+    let lastSound: Double?
+}
+
+/// 錄影狀態與流程協調：倒數 → 錄影 → （分段：留用或重錄 → 接片）→ 完成頁。
 final class RecordingViewModel: ObservableObject {
     enum Phase: Equatable {
         case idle
@@ -20,27 +29,76 @@ final class RecordingViewModel: ObservableObject {
     @Published private(set) var elapsed: TimeInterval = 0
     @Published var review: RecordedVideo?
 
+    // 分段錄影
+    @Published private(set) var segments: [String] = []
+    @Published private(set) var currentIndex = 0
+    @Published private(set) var takes: [Int: SegmentTake] = [:]
+    /// 剛錄完、還沒決定留用或重錄的那一段。
+    @Published private(set) var pending: SegmentTake?
+    @Published private(set) var isMerging = false
+    @Published var mergeError: String?
+
     let prompter = TeleprompterModel()
 
+    /// 稿件或設定頁開著的時候，不回應音量鍵。
+    var hardwareEnabled = true
+
     private weak var camera: CameraService?
+    private weak var settings: SettingsStore?
     private var cancellables = Set<AnyCancellable>()
     private var countdownTimer: Timer?
     private var elapsedTimer: Timer?
     private var startDate: Date?
     private var autoPrompt = false
 
+    // 錄影中的聲音紀錄
+    private var firstSound: Double?
+    private var lastSound: Double?
+    private var wasSpeaking = false
+    private var heldByPause = false
+
+    /// 判定「有聲音」的門檻（dBFS），比說話偵測寬鬆，寧可少裁。
+    private let soundFloor: Float = -45
+    private let trimLead: Double = 0.5
+    private let trimTail: Double = 0.8
+
     var isBusy: Bool {
-        phase != .idle
+        phase != .idle || isMerging
     }
 
-    func attach(_ camera: CameraService) {
+    /// 稿件有兩段以上才進分段流程；否則行為和一鏡到底一樣。
+    var isSegmented: Bool {
+        segments.count > 1
+    }
+
+    /// 目前提詞要顯示的文字。
+    var currentText: String {
+        guard isSegmented, segments.indices.contains(currentIndex) else {
+            return segments.first ?? ""
+        }
+        return segments[currentIndex]
+    }
+
+    var allRecorded: Bool {
+        isSegmented && takes.count == segments.count
+    }
+
+    var currentHasTake: Bool {
+        takes[currentIndex] != nil
+    }
+
+    func attach(_ camera: CameraService, settings: SettingsStore) {
         guard self.camera == nil else { return }
         self.camera = camera
+        self.settings = settings
         camera.onRecordingFinished = { [weak self] url in
             self?.recordingFinished(url)
         }
         camera.onRecordingFailed = { [weak self] in
             self?.recordingFailed()
+        }
+        camera.onCaptureButton = { [weak self] in
+            self?.hardwareButtonPressed()
         }
         camera.$isRecording
             .removeDuplicates()
@@ -50,8 +108,21 @@ final class RecordingViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    // MARK: - 稿件
+
+    /// 稿件內容變了就重新切段；分段不同時，已錄的各段作廢。
+    func updateScript(_ script: String) {
+        let next = ScriptSegments.split(script)
+        guard next != segments else { return }
+        discardAllTakes()
+        segments = next
+    }
+
+    // MARK: - 錄影鈕
+
     /// 錄影鈕：待機 → 倒數／開始；倒數中 → 取消；錄影中 → 停止。
     func primaryTapped(countdown: Int, autoPrompt: Bool) {
+        guard !isMerging, pending == nil else { return }
         switch phase {
         case .idle:
             self.autoPrompt = autoPrompt
@@ -69,6 +140,24 @@ final class RecordingViewModel: ObservableObject {
         }
     }
 
+    /// 音量鍵或藍牙遙控器：等同錄影鈕；剛錄完一段時等同「留用」。
+    private func hardwareButtonPressed() {
+        guard hardwareEnabled, review == nil, !isMerging, let settings else { return }
+        if pending != nil {
+            acceptPending()
+        } else {
+            primaryTapped(
+                countdown: settings.countdown,
+                autoPrompt: settings.autoStartPrompter && settings.hasScript
+            )
+        }
+    }
+
+    func togglePrompter() {
+        heldByPause = false
+        prompter.toggle()
+    }
+
     /// App 進背景等情況：有在錄就收尾，倒數就取消。
     func interrupt() {
         switch phase {
@@ -80,6 +169,91 @@ final class RecordingViewModel: ObservableObject {
             break
         }
     }
+
+    // MARK: - 分段
+
+    /// 留用剛錄的這段，跳到下一個還沒錄的段落；全部錄完就接片。
+    func acceptPending() {
+        guard let take = pending else { return }
+        if let old = takes[currentIndex] {
+            try? FileManager.default.removeItem(at: old.url)
+        }
+        takes[currentIndex] = take
+        pending = nil
+        prompter.reset()
+        if let next = (0..<segments.count).first(where: { takes[$0] == nil }) {
+            currentIndex = next
+        } else {
+            mergeAll()
+        }
+    }
+
+    /// 丟掉剛錄的這段，留在同一段準備重錄。
+    func retakePending() {
+        guard let take = pending else { return }
+        try? FileManager.default.removeItem(at: take.url)
+        pending = nil
+        prompter.reset()
+    }
+
+    /// 切到前一段／後一段（要重錄某一段時用）。
+    func step(_ delta: Int) {
+        guard !isBusy, pending == nil, isSegmented else { return }
+        let target = min(segments.count - 1, max(0, currentIndex + delta))
+        guard target != currentIndex else { return }
+        currentIndex = target
+        prompter.reset()
+    }
+
+    /// 把各段照順序接成一支影片，完成後進完成頁。
+    func mergeAll() {
+        guard allRecorded, !isMerging, pending == nil else { return }
+        let trim = settings?.trimSilence ?? true
+        let clips: [VideoStitcher.Clip] = (0..<segments.count).compactMap { index in
+            guard let take = takes[index] else { return nil }
+            var start: Double?
+            var end: Double?
+            if trim, let first = take.firstSound, let last = take.lastSound {
+                start = max(0, first - trimLead)
+                end = last + trimTail
+            }
+            return VideoStitcher.Clip(url: take.url, start: start, end: end)
+        }
+        isMerging = true
+        camera?.log("開始接片：\(clips.count) 段，裁靜音 \(trim ? "開" : "關")")
+        Task {
+            do {
+                let url = try await VideoStitcher.stitch(clips)
+                await MainActor.run {
+                    self.isMerging = false
+                    self.camera?.log("接片完成")
+                    self.review = RecordedVideo(url: url, isStitched: true)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isMerging = false
+                    self.mergeError = error.localizedDescription
+                    self.camera?.log("接片失敗：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// 丟掉所有已錄的段落，回到第一段。
+    func discardAllTakes() {
+        for take in takes.values {
+            try? FileManager.default.removeItem(at: take.url)
+        }
+        if let take = pending {
+            try? FileManager.default.removeItem(at: take.url)
+        }
+        takes = [:]
+        pending = nil
+        currentIndex = 0
+        prompter.reset()
+    }
+
+    // MARK: - 倒數
 
     private func startCountdown(_ seconds: Int) {
         phase = .countdown(seconds)
@@ -112,6 +286,8 @@ final class RecordingViewModel: ObservableObject {
         phase = .idle
     }
 
+    // MARK: - 錄影
+
     private func beginRecording() {
         phase = .starting
         elapsed = 0
@@ -135,10 +311,13 @@ final class RecordingViewModel: ObservableObject {
             phase = .recording
             startDate = Date()
             elapsed = 0
+            firstSound = nil
+            lastSound = nil
+            wasSpeaking = false
+            heldByPause = false
             elapsedTimer?.invalidate()
-            let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-                guard let self, let start = self.startDate else { return }
-                self.elapsed = Date().timeIntervalSince(start)
+            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+                self?.recordingTick()
             }
             RunLoop.main.add(timer, forMode: .common)
             elapsedTimer = timer
@@ -157,9 +336,40 @@ final class RecordingViewModel: ObservableObject {
         }
     }
 
+    /// 錄影中每 0.1 秒：更新計時、記下有聲音的範圍、停頓時讓提詞等人。
+    private func recordingTick() {
+        guard let start = startDate else { return }
+        let time = Date().timeIntervalSince(start)
+        if Int(time) != Int(elapsed) {
+            elapsed = time
+        }
+        guard let meter = camera?.meter else { return }
+
+        if meter.level > soundFloor {
+            if firstSound == nil { firstSound = time }
+            lastSound = time
+        }
+
+        let speaking = meter.isSpeaking
+        if settings?.waitOnPause ?? false {
+            if wasSpeaking && !speaking && prompter.isPlaying {
+                prompter.pause()
+                heldByPause = true
+            } else if !wasSpeaking && speaking && heldByPause {
+                heldByPause = false
+                prompter.play()
+            }
+        }
+        wasSpeaking = speaking
+    }
+
     private func recordingFinished(_ url: URL) {
         phase = .idle
-        review = RecordedVideo(url: url)
+        if isSegmented {
+            pending = SegmentTake(url: url, firstSound: firstSound, lastSound: lastSound)
+        } else {
+            review = RecordedVideo(url: url)
+        }
     }
 
     private func recordingFailed() {

@@ -35,10 +35,13 @@ struct SettingsView: View {
                     LabeledSlider(title: "底色深淺", value: $settings.promptBackground, range: 0...0.9, step: 0.05,
                                   display: "\(Int(settings.promptBackground * 100))%")
                     Toggle("開始錄影時自動開始提詞", isOn: $settings.autoStartPrompter)
+                    Toggle("停頓時提詞等我", isOn: $settings.waitOnPause)
+                    LabeledSlider(title: "語速（估算時長用）", value: $settings.speechRate, range: 150...320, step: 10,
+                                  display: "\(Int(settings.speechRate)) 字／分")
                 } header: {
                     Text("提詞")
                 } footer: {
-                    Text("提詞文字只顯示在預覽上，不會錄進影片。")
+                    Text("提詞文字只顯示在預覽上，不會錄進影片。錄影中停下來不講話，提詞會暫停，開口再繼續。")
                 }
 
                 Section {
@@ -53,13 +56,18 @@ struct SettingsView: View {
                     Text("頭像框不會錄進影片。臉的位置只在這支手機上比對，不會上傳。")
                 }
 
-                Section("錄影") {
+                Section {
                     Picker("倒數", selection: $settings.countdown) {
                         Text("不倒數").tag(0)
                         Text("3 秒").tag(3)
                         Text("5 秒").tag(5)
                         Text("10 秒").tag(10)
                     }
+                    Toggle("接片時裁掉每段頭尾的空白", isOn: $settings.trimSilence)
+                } header: {
+                    Text("錄影")
+                } footer: {
+                    Text("稿件用空行分段後，可以一段一段錄，最後自動接成一支。音量鍵和藍牙自拍遙控器也可以開始、停止錄影。")
                 }
 
                 Section {

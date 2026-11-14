@@ -28,6 +28,8 @@ final class CameraService: NSObject, ObservableObject {
     var onRecordingFinished: ((URL) -> Void)?
     /// 錄影失敗（主執行緒回呼）。
     var onRecordingFailed: (() -> Void)?
+    /// 音量鍵或藍牙遙控器被按下（主執行緒回呼）。
+    var onCaptureButton: (() -> Void)?
 
     private let sessionQueue = DispatchQueue(label: "org.domyweb.broccolicam.session")
     private let metadataQueue = DispatchQueue(label: "org.domyweb.broccolicam.metadata")

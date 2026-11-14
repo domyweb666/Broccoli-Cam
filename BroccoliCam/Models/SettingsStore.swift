@@ -36,6 +36,13 @@ final class SettingsStore: ObservableObject {
     /// 錄影倒數秒數：0／3／5／10
     @Published var countdown: Int { didSet { defaults.set(countdown, forKey: "countdown") } }
 
+    /// 語速（字／分鐘），用來估算稿件時長
+    @Published var speechRate: Double { didSet { defaults.set(speechRate, forKey: "speechRate") } }
+    /// 錄影中停頓時，提詞自動暫停，開口再繼續
+    @Published var waitOnPause: Bool { didSet { defaults.set(waitOnPause, forKey: "waitOnPause") } }
+    /// 接片時裁掉每段頭尾沒有聲音的部分
+    @Published var trimSilence: Bool { didSet { defaults.set(trimSilence, forKey: "trimSilence") } }
+
     @Published var showDebug: Bool { didSet { defaults.set(showDebug, forKey: "showDebug") } }
 
     init() {
@@ -51,10 +58,18 @@ final class SettingsStore: ObservableObject {
         showGuide = (d.object(forKey: "showGuide") as? Bool) ?? true
         guideScale = (d.object(forKey: "guideScale") as? Double) ?? 1.0
         countdown = (d.object(forKey: "countdown") as? Int) ?? 3
+        speechRate = (d.object(forKey: "speechRate") as? Double) ?? 220
+        waitOnPause = (d.object(forKey: "waitOnPause") as? Bool) ?? true
+        trimSilence = (d.object(forKey: "trimSilence") as? Bool) ?? true
         showDebug = (d.object(forKey: "showDebug") as? Bool) ?? false
     }
 
     var hasScript: Bool {
         !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 稿件依空行切出的各段。
+    var segments: [String] {
+        ScriptSegments.split(script)
     }
 }

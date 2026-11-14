@@ -8,6 +8,19 @@ struct ScriptEditorView: View {
     @FocusState private var focused: Bool
     @State private var confirmClear = false
 
+    /// 字數、預估時長、段數。
+    private var summary: String {
+        let count = ScriptSegments.spokenCount(settings.script)
+        guard count > 0 else { return "0 字" }
+        let seconds = ScriptSegments.estimatedSeconds(settings.script, charsPerMinute: settings.speechRate)
+        var text = "\(count) 字 · 約 \(ScriptSegments.formatDuration(seconds))"
+        let segments = settings.segments.count
+        if segments > 1 {
+            text += " · \(segments) 段"
+        }
+        return text
+    }
+
     var body: some View {
         NavigationStack {
             ZStack(alignment: .topLeading) {
@@ -19,7 +32,7 @@ struct ScriptEditorView: View {
                     .padding(.horizontal, 12)
 
                 if settings.script.isEmpty {
-                    Text("把整篇稿子貼在這裡。\n不需要分段切卡，錄影時會在鏡頭旁邊自動往上捲。")
+                    Text("把整篇稿子貼在這裡。\n段落之間空一行，就能一段一段錄，講錯只要重錄那一段。")
                         .font(.system(size: 19))
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 17)
@@ -52,7 +65,7 @@ struct ScriptEditorView: View {
                     }
                 }
                 ToolbarItem(placement: .bottomBar) {
-                    Text("\(settings.script.count) 字")
+                    Text(summary)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
