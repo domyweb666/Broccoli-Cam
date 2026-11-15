@@ -40,6 +40,15 @@ struct ScriptEditorView: View {
                         .allowsHitTesting(false)
                 }
             }
+            // 字數、預估時長、段數放在稿件上方：底部工具列太窄，文字會被截成「14…」。
+            .safeAreaInset(edge: .top, spacing: 0) {
+                Text(summary)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 17)
+                    .padding(.vertical, 6)
+            }
             .navigationTitle("稿件")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -63,11 +72,6 @@ struct ScriptEditorView: View {
                     } label: {
                         Label("貼上並取代", systemImage: "doc.on.clipboard")
                     }
-                }
-                ToolbarItem(placement: .bottomBar) {
-                    Text(summary)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
                 }
             }
             .confirmationDialog("清空整篇稿件？", isPresented: $confirmClear, titleVisibility: .visible) {
