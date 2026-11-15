@@ -118,6 +118,7 @@ final class CameraService: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 self.isSessionRunning = running
                 self.applyPreviewRotation()
+                self.schedulePreviewRotationRetries()
                 if running { self.meter.start() }
             }
         }
@@ -144,10 +145,44 @@ final class CameraService: NSObject, ObservableObject {
         applyPreviewRotation()
     }
 
-    private func applyPreviewRotation() {
-        guard let connection = previewLayer?.connection else { return }
+    /// 把預覽轉成直式。請在主執行緒呼叫。
+    /// 預覽層的連線要等 session 設定完才會出現，所以會被多處重複呼叫：
+    /// 掛上預覽層、session 啟動後、預覽 view 重新排版、中斷結束。
+    func applyPreviewRotation() {
+        guard let connection = previewLayer?.connection else {
+            notePreviewRotation("預覽連線還沒建立")
+            return
+        }
+        Self.makePortrait(connection)
+        notePreviewRotation("預覽旋轉=\(Int(connection.videoRotationAngle))")
+    }
+
+    /// session 剛啟動的頭幾秒再補套幾次，避免連線建立得比較晚而漏掉。
+    private func schedulePreviewRotationRetries() {
+        for delay in [0.3, 1.0, 2.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.applyPreviewRotation()
+            }
+        }
+    }
+
+    private var lastPreviewRotationNote = ""
+
+    /// 狀態有變才寫進紀錄，避免洗版。
+    private func notePreviewRotation(_ text: String) {
+        guard text != lastPreviewRotationNote else { return }
+        lastPreviewRotationNote = text
+        log(text)
+    }
+
+    /// 把連線設成直式：優先用旋轉角度，不支援時退回舊的方向設定。
+    private static func makePortrait(_ connection: AVCaptureConnection) {
         if connection.isVideoRotationAngleSupported(90) {
-            connection.videoRotationAngle = 90
+            if connection.videoRotationAngle != 90 {
+                connection.videoRotationAngle = 90
+            }
+        } else if connection.isVideoOrientationSupported {
+            connection.videoOrientation = .portrait
         }
     }
 
@@ -316,9 +351,7 @@ final class CameraService: NSObject, ObservableObject {
 
     private func updateConnections() {
         guard let connection = movieOutput.connection(with: .video) else { return }
-        if connection.isVideoRotationAngleSupported(90) {
-            connection.videoRotationAngle = 90
-        }
+        Self.makePortrait(connection)
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
             connection.isVideoMirrored = mirrorOutput
@@ -454,6 +487,11 @@ final class CameraService: NSObject, ObservableObject {
         lines.append("格式 \(activeFormatText)")
         if let connection = movieOutput.connection(with: .video) {
             lines.append("輸出 旋轉=\(Int(connection.videoRotationAngle)) 鏡像=\(connection.isVideoMirrored ? "是" : "否")")
+        }
+        if let connection = previewLayer?.connection {
+            lines.append("預覽 旋轉=\(Int(connection.videoRotationAngle)) 支援90=\(connection.isVideoRotationAngleSupported(90) ? "是" : "否")")
+        } else {
+            lines.append("預覽 沒有連線")
         }
         lines.append("音訊路由 \(meter.route)")
         let mic: String

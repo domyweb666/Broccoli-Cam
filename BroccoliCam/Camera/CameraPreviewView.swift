@@ -15,6 +15,14 @@ struct CameraPreviewView: UIViewRepresentable {
             // layerClass 已指定，轉型必定成功。
             layer as! AVCaptureVideoPreviewLayer
         }
+
+        /// 每次排版都重新確認預覽是直式。
+        var onLayout: (() -> Void)?
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            onLayout?()
+        }
     }
 
     func makeUIView(context: Context) -> PreviewUIView {
@@ -23,6 +31,9 @@ struct CameraPreviewView: UIViewRepresentable {
         view.previewLayer.session = camera.session
         view.previewLayer.videoGravity = .resizeAspect
         camera.attachPreviewLayer(view.previewLayer)
+        view.onLayout = { [weak camera] in
+            camera?.applyPreviewRotation()
+        }
         // 音量鍵、藍牙自拍遙控器當錄影鍵用。iOS 17.2 以上才有，舊版本就只有螢幕上的按鈕。
         if #available(iOS 17.2, *) {
             let interaction = AVCaptureEventInteraction { [weak camera] event in
