@@ -80,10 +80,28 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/keys"
           KEY_PATH="$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8"
-          if printf '%s' "$ASC_KEY_P8" | grep -q "BEGIN PRIVATE KEY"; then
-            printf '%s\n' "$ASC_KEY_P8" > "$KEY_PATH"
-          else
-            printf '%s' "$ASC_KEY_P8" | base64 --decode > "$KEY_PATH"
+          # secret 可能是：.p8 原文、整個檔案的 base64、或只有中間那段。
+          # 也可能帶 BOM、CRLF，或換行被貼成空白。一律拆出金鑰本體再重組成標準 PEM。
+          RAW=$(printf '%s' "$ASC_KEY_P8" | tr -d '\r')
+          RAW="${RAW#$'\xEF\xBB\xBF'}"
+          if ! printf '%s' "$RAW" | grep -q "BEGIN PRIVATE KEY"; then
+            DECODED=$(printf '%s' "$RAW" | tr -d ' \t\n' | base64 --decode 2>/dev/null | tr -d '\r\0' || true)
+            if printf '%s' "$DECODED" | grep -q "BEGIN PRIVATE KEY"; then
+              RAW="$DECODED"
+            fi
+          fi
+          BODY=$(printf '%s' "$RAW" \
+            | sed -e 's/-----BEGIN PRIVATE KEY-----//' -e 's/-----END PRIVATE KEY-----//' \
+            | tr -d ' \t\n')
+          {
+            echo "-----BEGIN PRIVATE KEY-----"
+            printf '%s\n' "$BODY" | fold -w 64
+            echo "-----END PRIVATE KEY-----"
+          } > "$KEY_PATH"
+          echo "金鑰本體 ${#BODY} 個字元（正常的 .p8 約 200 個）"
+          if ! openssl pkey -in "$KEY_PATH" -noout 2>/dev/null; then
+            echo "::error::ASC_KEY_P8 的內容不是有效的 .p8 金鑰。請用 .p8 檔案重新設定這個 secret。"
+            exit 1
           fi
           echo "KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 
