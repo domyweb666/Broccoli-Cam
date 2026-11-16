@@ -12,7 +12,15 @@ struct RecordingView: View {
     @State private var showScript = false
     @State private var showSettings = false
 
+    // body 拆成三層（版面、狀態監聽、彈出視窗），一整串寫在一起編譯器會算不完。
     var body: some View {
+        presented
+            .statusBarHidden(true)
+            .persistentSystemOverlays(.hidden)
+    }
+
+    /// 版面：預覽、控制列、橫放時的側邊列。
+    private var layout: some View {
         GeometryReader { geo in
             let previewHeight = min(geo.size.width * 16 / 9, geo.size.height)
             let previewWidth = previewHeight * 9 / 16
@@ -48,17 +56,7 @@ struct RecordingView: View {
                 .padding(.bottom, 6)
 
                 if uiAngle != 0 {
-                    // 橫放：計時、收音、分段列轉 90 度，沿著使用者看到的下緣排，避開提詞那一側。
-                    let topInset = previewHeight * 0.40 + 20
-                    let length = max(200, min(previewHeight - topInset - 110, 440))
-                    let thickness: CGFloat = viewModel.isSegmented ? 150 : 44
-                    statusAndSegments
-                        .frame(width: length)
-                        .rotationEffect(.degrees(uiAngle))
-                        .frame(width: thickness, height: length)
-                        .padding(.top, topInset)
-                        .padding(.horizontal, 4)
-                        .frame(maxWidth: .infinity, alignment: uiAngle > 0 ? .leading : .trailing)
+                    sideStrip(previewHeight: previewHeight)
                 }
 
                 if settings.showDebug {
@@ -68,6 +66,47 @@ struct RecordingView: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
+    }
+
+    /// 橫放：計時、收音、分段列轉 90 度，沿著使用者看到的下緣排，避開提詞那一側。
+    private func sideStrip(previewHeight: CGFloat) -> some View {
+        let topInset: CGFloat = previewHeight * 0.40 + 20
+        let length: CGFloat = max(200, min(previewHeight - topInset - 110, 440))
+        let thickness: CGFloat = viewModel.isSegmented ? 150 : 44
+        let edge: Alignment = uiAngle > 0 ? .leading : .trailing
+        return statusAndSegments
+            .frame(width: length)
+            .rotationEffect(.degrees(uiAngle))
+            .frame(width: thickness, height: length)
+            .padding(.top, topInset)
+            .padding(.horizontal, 4)
+            .frame(maxWidth: .infinity, alignment: edge)
+    }
+
+    /// 狀態監聽：設定、方向、前後景變了要做的事。
+    private var observed: some View {
+        cameraObserved
+            .onChange(of: orientation.angle) { _, _ in
+                viewModel.deviceAngle = deviceAngle
+            }
+            .onChange(of: settings.autoLandscape) { _, _ in
+                viewModel.deviceAngle = deviceAngle
+            }
+            .onChange(of: settings.companionMode) { _, _ in
+                viewModel.updateScript(settings.activeScript)
+                viewModel.prompter.reset()
+                updateCompanion()
+            }
+            .onChange(of: settings.speed) { _, speed in
+                viewModel.prompter.speed = CGFloat(speed)
+            }
+            .onChange(of: showScript) { _, _ in updateHardwareEnabled() }
+            .onChange(of: showSettings) { _, _ in updateHardwareEnabled() }
+    }
+
+    /// 和相機有關的監聽。
+    private var cameraObserved: some View {
+        layout
         .onAppear {
             viewModel.attach(camera, settings: settings)
             viewModel.updateScript(settings.activeScript)
@@ -80,17 +119,6 @@ struct RecordingView: View {
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             companion.stop()
-        }
-        .onChange(of: orientation.angle) { _, _ in
-            viewModel.deviceAngle = deviceAngle
-        }
-        .onChange(of: settings.autoLandscape) { _, _ in
-            viewModel.deviceAngle = deviceAngle
-        }
-        .onChange(of: settings.companionMode) { _, _ in
-            viewModel.updateScript(settings.activeScript)
-            viewModel.prompter.reset()
-            updateCompanion()
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -114,9 +142,6 @@ struct RecordingView: View {
         .onChange(of: settings.fps) { _, _ in startCamera() }
         .onChange(of: settings.mirrorOutput) { _, _ in startCamera() }
         .onChange(of: settings.voiceFollow) { _, _ in startCamera() }
-        .onChange(of: settings.speed) { _, speed in
-            viewModel.prompter.speed = CGFloat(speed)
-        }
         .onChange(of: camera.availableFPS) { _, map in
             // 第一次取得裝置能力後，修正存下來但此裝置不支援的設定。
             if map[settings.resolution] == nil {
@@ -125,8 +150,11 @@ struct RecordingView: View {
                 settings.fps = list.first ?? 30
             }
         }
-        .onChange(of: showScript) { _, _ in updateHardwareEnabled() }
-        .onChange(of: showSettings) { _, _ in updateHardwareEnabled() }
+    }
+
+    /// 彈出視窗：提示、稿件、設定、完成頁。
+    private var presented: some View {
+        observed
         .alert("接片沒有成功", isPresented: mergeErrorShown) {
             Button("好") {}
         } message: {
@@ -153,8 +181,6 @@ struct RecordingView: View {
                 viewModel.discardAllTakes()
             })
         }
-        .statusBarHidden(true)
-        .persistentSystemOverlays(.hidden)
     }
 
     /// 計時、收音狀態和分段列。直放時在控制列上方，橫放時轉 90 度放到側邊。
