@@ -26,7 +26,17 @@
 - 稿件頁顯示字數、預估時長、段數；錄影計時旁顯示這一段的預估時長
 - 音量鍵、藍牙自拍遙控器可以開始／停止錄影，剛錄完一段時等同「留用」（iOS 17.2 以上）
 
-還沒做：語音跟隨提詞、SRT 字幕、陪伴模式、橫式錄影。規劃見 [`docs/需求缺口與功能規劃.md`](docs/需求缺口與功能規劃.md)。
+## 第三輪（尚未真機驗證）
+
+- 語音跟隨提詞：設定裡打開「提詞跟著我的聲音走」，錄影時唸到哪，提詞就捲到哪。預設關閉。講了約 6 秒還對不上稿子，會自動改回固定速度
+- 字幕檔：完成頁按「產生字幕檔（SRT）」，用稿子對影片的聲音，字用稿子裡的，辨識只負責找時間。做好後跳出分享選單，可以存到檔案或傳到剪輯 App
+- 字幕每行最多字數可以在設定調（預設 14 字）
+- 手機不能辨識中文時，有稿子仍會給字幕檔，時間照字數平均排；沒有稿子就直接用聽到的字
+- 稿件頁列出每一段的預估時長，分段列也顯示這一段要講多久
+
+語音辨識用 Apple 的 Speech 框架，語言固定 zh-TW。手機支援裝置端辨識就不連網；不支援時聲音會送到 Apple 辨識。
+
+還沒做：陪伴模式、橫式錄影。規劃見 [`docs/需求缺口與功能規劃.md`](docs/需求缺口與功能規劃.md)。
 
 ## 專案結構
 
@@ -35,8 +45,9 @@ BroccoliCam/
   App/        進入點、權限說明頁
   Camera/     CameraService（session、格式、錄影、中斷）、預覽
   Services/   RecordingViewModel、TeleprompterModel、FaceDetectionService、
-              SpeechActivityMonitor、PhotoSaver
-  Models/     SettingsStore
+              SpeechActivityMonitor、PhotoSaver、VideoStitcher、
+              SpeechFollower（語音跟隨）、SubtitleMaker（字幕）
+  Models/     SettingsStore、ScriptSegments、SpokenKeys、SubtitleLines
   Views/      拍攝主畫面、提詞、頭像框、稿件、設定、完成頁、除錯層
 project.yml   XcodeGen 專案定義（.xcodeproj 不進版控，由 CI 產生）
 ```
@@ -77,3 +88,6 @@ Build 編號用 Actions 的 run number，版本號在 `project.yml` 的 `MARKETI
 - 停頓等人的反應時間（目前安靜 0.7 秒後暫停）會不會太敏感或太遲鈍。
 - 音量鍵是否能觸發錄影，按下時會不會跳出系統音量條。
 - 藍牙耳機麥克風：目前沿用系統自動音訊設定，預設用手機內建麥克風；有線與 USB 麥克風由系統自動切換。
+- 語音跟隨：掛上語音分流（`AVCaptureAudioDataOutput`）之後，錄出來的影片聲音是否正常；除錯資訊的「語音分流 收到 N 包」在錄影中會不會增加；提詞跟得上跟不上。
+- 這支手機的 zh-TW 是否支援裝置端辨識（除錯紀錄會寫「裝置端」或「連網」）。
+- 字幕檔的時間準不準，匯入剪映／CapCut 後有沒有對上嘴型。

@@ -6,6 +6,8 @@ struct RecordedVideo: Identifiable {
     let url: URL
     /// 是否由多段接成。接成的影片在完成頁可以回去重錄其中一段。
     var isStitched = false
+    /// 這支影片照著唸的稿子，產生字幕用。沒有稿子就是空字串。
+    var script = ""
 }
 
 /// 一段錄好的影片，以及錄影當下量到的「有聲音」範圍（秒）。
@@ -39,6 +41,7 @@ final class RecordingViewModel: ObservableObject {
     @Published var mergeError: String?
 
     let prompter = TeleprompterModel()
+    private let follower = SpeechFollower()
 
     /// 稿件或設定頁開著的時候，不回應音量鍵。
     var hardwareEnabled = true
@@ -56,6 +59,8 @@ final class RecordingViewModel: ObservableObject {
     private var lastSound: Double?
     private var wasSpeaking = false
     private var heldByPause = false
+    /// 語音跟隨開著的時候，累計「有在講話」的次數（每次 0.1 秒）。
+    private var followSpeakingTicks = 0
 
     /// 判定「有聲音」的門檻（dBFS），比說話偵測寬鬆，寧可少裁。
     private let soundFloor: Float = -45
@@ -99,6 +104,13 @@ final class RecordingViewModel: ObservableObject {
         }
         camera.onCaptureButton = { [weak self] in
             self?.hardwareButtonPressed()
+        }
+        follower.onProgress = { [weak self] offset in
+            guard let self else { return }
+            self.prompter.follow(utf16Offset: offset, in: self.currentText)
+        }
+        follower.onLog = { [weak camera] message in
+            camera?.log(message)
         }
         camera.$isRecording
             .removeDuplicates()
@@ -227,7 +239,8 @@ final class RecordingViewModel: ObservableObject {
                 await MainActor.run {
                     self.isMerging = false
                     self.camera?.log("接片完成")
-                    self.review = RecordedVideo(url: url, isStitched: true)
+                    self.review = RecordedVideo(url: url, isStitched: true,
+                                                script: self.segments.joined(separator: "\n"))
                 }
             } catch {
                 await MainActor.run {
@@ -322,12 +335,14 @@ final class RecordingViewModel: ObservableObject {
             RunLoop.main.add(timer, forMode: .common)
             elapsedTimer = timer
             if autoPrompt {
+                startFollowingIfWanted()
                 prompter.play()
             }
         } else {
             elapsedTimer?.invalidate()
             elapsedTimer = nil
             startDate = nil
+            stopFollowing()
             prompter.pause()
             // 被系統中斷而停止時，等檔案回呼。
             if phase == .recording {
@@ -351,7 +366,15 @@ final class RecordingViewModel: ObservableObject {
         }
 
         let speaking = meter.isSpeaking
-        if settings?.waitOnPause ?? false {
+        if prompter.isFollowing {
+            // 跟著聲音走的時候不用「停頓等人」，沒唸就不會動。
+            // 講了一陣子卻一個字都沒對上，代表辨識沒作用，退回固定速度。
+            if speaking { followSpeakingTicks += 1 }
+            if followSpeakingTicks > 60 && follower.matchCount == 0 {
+                camera?.log("語音跟隨沒有對上稿子，改回固定速度")
+                stopFollowing()
+            }
+        } else if settings?.waitOnPause ?? false {
             if wasSpeaking && !speaking && prompter.isPlaying {
                 prompter.pause()
                 heldByPause = true
@@ -368,8 +391,30 @@ final class RecordingViewModel: ObservableObject {
         if isSegmented {
             pending = SegmentTake(url: url, firstSound: firstSound, lastSound: lastSound)
         } else {
-            review = RecordedVideo(url: url)
+            review = RecordedVideo(url: url, script: segments.first ?? "")
         }
+    }
+
+    // MARK: - 語音跟隨
+
+    /// 設定有開、有授權、辨識可用，提詞就改成跟著聲音走；任何一項不成立就維持固定速度。
+    private func startFollowingIfWanted() {
+        followSpeakingTicks = 0
+        guard settings?.voiceFollow ?? false, let camera else { return }
+        guard follower.start(text: currentText) else {
+            camera.log("語音跟隨無法啟動，使用固定速度")
+            return
+        }
+        camera.audioSampleHandler = { [weak follower] buffer in
+            follower?.append(buffer)
+        }
+        prompter.setFollowing(true)
+    }
+
+    private func stopFollowing() {
+        camera?.audioSampleHandler = nil
+        follower.stop()
+        prompter.setFollowing(false)
     }
 
     private func recordingFailed() {

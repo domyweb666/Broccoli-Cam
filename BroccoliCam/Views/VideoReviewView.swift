@@ -5,6 +5,7 @@ import AVFoundation
 /// 錄影完成：預覽、儲存到照片圖庫、重新錄影、返回。
 struct VideoReviewView: View {
     @EnvironmentObject private var camera: CameraService
+    @EnvironmentObject private var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
     let video: RecordedVideo
     /// 丟掉所有已錄的段落（分段錄影用）。
@@ -20,6 +21,15 @@ struct VideoReviewView: View {
     @State private var player: AVPlayer?
     @State private var saveState: SaveState = .idle
     @State private var confirmDiscard = false
+    @State private var subtitleState: SubtitleState = .idle
+    @State private var sharedSubtitle: SharedFile?
+
+    private enum SubtitleState: Equatable {
+        case idle
+        case working
+        case done(String)
+        case failed(String)
+    }
 
     var body: some View {
         ZStack {
@@ -41,6 +51,8 @@ struct VideoReviewView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
                 }
+
+                subtitleRow
 
                 HStack(spacing: 12) {
                     Button {
@@ -119,7 +131,85 @@ struct VideoReviewView: View {
             player = nil
             try? FileManager.default.removeItem(at: video.url)
         }
+        .sheet(item: $sharedSubtitle) { file in
+            ShareSheet(items: [file.url])
+        }
         .statusBarHidden(true)
+    }
+
+    /// 字幕檔：用稿子對這支影片的聲音，做出 SRT，再交給分享選單（存到檔案、AirDrop、傳到剪輯 App）。
+    @ViewBuilder
+    private var subtitleRow: some View {
+        VStack(spacing: 6) {
+            Button {
+                makeSubtitles()
+            } label: {
+                HStack(spacing: 8) {
+                    if subtitleState == .working {
+                        ProgressView().tint(.white)
+                        Text("正在對字幕…")
+                    } else {
+                        Image(systemName: "captions.bubble")
+                        Text("產生字幕檔（SRT）")
+                    }
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, minHeight: 46)
+                .background(.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .disabled(subtitleState == .working)
+
+            switch subtitleState {
+            case .done(let note):
+                Text(note)
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+            case .failed(let message):
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.yellow)
+                    .multilineTextAlignment(.center)
+            default:
+                EmptyView()
+            }
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private func makeSubtitles() {
+        subtitleState = .working
+        player?.pause()
+        let url = video.url
+        let script = video.script
+        let maxChars = Int(settings.subtitleMaxChars)
+        Task {
+            do {
+                let result = try await SubtitleMaker.make(videoURL: url, script: script, maxChars: maxChars) { message in
+                    camera.log(message)
+                }
+                await MainActor.run {
+                    let note: String
+                    if script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        note = "沒有稿子，字幕是直接聽出來的，可能有錯字。共 \(result.cueCount) 句。"
+                    } else if !result.recognized {
+                        note = "這支手機現在不能辨識中文，時間是照字數平均排的，匯入後請自己調。共 \(result.cueCount) 句。"
+                    } else if result.coverage < 0.3 {
+                        note = "聲音和稿子對不太上，時間是照字數平均排的，匯入後請自己調。共 \(result.cueCount) 句。"
+                    } else {
+                        note = "共 \(result.cueCount) 句，字用的是你的稿子。"
+                    }
+                    subtitleState = .done(note)
+                    sharedSubtitle = SharedFile(url: result.url)
+                }
+            } catch {
+                await MainActor.run {
+                    subtitleState = .failed(error.localizedDescription)
+                    camera.log("字幕失敗：\(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     private func save() {
@@ -140,4 +230,21 @@ struct VideoReviewView: View {
         player?.pause()
         dismiss()
     }
+}
+
+/// 要交給分享選單的檔案。
+private struct SharedFile: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+/// 系統分享選單。
+private struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }

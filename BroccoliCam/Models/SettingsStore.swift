@@ -43,6 +43,11 @@ final class SettingsStore: ObservableObject {
     /// 接片時裁掉每段頭尾沒有聲音的部分
     @Published var trimSilence: Bool { didSet { defaults.set(trimSilence, forKey: "trimSilence") } }
 
+    /// 提詞跟著聲音走（語音辨識）。還沒在真機驗過，預設關。
+    @Published var voiceFollow: Bool { didSet { defaults.set(voiceFollow, forKey: "voiceFollow") } }
+    /// 字幕每行最多幾個字
+    @Published var subtitleMaxChars: Double { didSet { defaults.set(subtitleMaxChars, forKey: "subtitleMaxChars") } }
+
     @Published var showDebug: Bool { didSet { defaults.set(showDebug, forKey: "showDebug") } }
 
     init() {
@@ -61,6 +66,8 @@ final class SettingsStore: ObservableObject {
         speechRate = (d.object(forKey: "speechRate") as? Double) ?? 220
         waitOnPause = (d.object(forKey: "waitOnPause") as? Bool) ?? true
         trimSilence = (d.object(forKey: "trimSilence") as? Bool) ?? true
+        voiceFollow = (d.object(forKey: "voiceFollow") as? Bool) ?? false
+        subtitleMaxChars = (d.object(forKey: "subtitleMaxChars") as? Double) ?? 14
         showDebug = (d.object(forKey: "showDebug") as? Bool) ?? false
     }
 

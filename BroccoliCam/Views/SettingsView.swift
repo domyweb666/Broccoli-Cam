@@ -5,6 +5,7 @@ struct SettingsView: View {
     @EnvironmentObject private var settings: SettingsStore
     @EnvironmentObject private var camera: CameraService
     @Environment(\.dismiss) private var dismiss
+    @State private var speechDenied = false
 
     private var fpsOptions: [Int] {
         camera.availableFPS[settings.resolution] ?? [30]
@@ -45,6 +46,23 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle("提詞跟著我的聲音走", isOn: $settings.voiceFollow)
+                } header: {
+                    Text("語音跟隨（試用）")
+                } footer: {
+                    Text("打開後，錄影時你唸到哪，提詞就捲到哪，停下來它也停。需要語音辨識的權限。聽不清楚的時候會自動改回固定速度。這個功能還在試，錄出來的聲音有問題就先關掉。")
+                }
+
+                Section {
+                    LabeledSlider(title: "每行最多字數", value: $settings.subtitleMaxChars, range: 8...20, step: 1,
+                                  display: "\(Int(settings.subtitleMaxChars)) 字")
+                } header: {
+                    Text("字幕")
+                } footer: {
+                    Text("錄完在完成頁按「產生字幕檔」，會用你的稿子對影片的聲音，做出 SRT 檔，可以匯入剪映、CapCut、Premiere。直式短影音建議 12 到 14 字。")
+                }
+
+                Section {
                     Toggle("顯示頭像框", isOn: $settings.showGuide)
                     if settings.showGuide {
                         LabeledSlider(title: "頭像框大小", value: $settings.guideScale, range: 0.7...1.4, step: 0.05,
@@ -80,6 +98,20 @@ struct SettingsView: View {
             }
             .navigationTitle("設定")
             .navigationBarTitleDisplayMode(.inline)
+            .onChange(of: settings.voiceFollow) { _, on in
+                guard on, !SpeechFollower.isAuthorized else { return }
+                SpeechFollower.requestAuthorization { granted in
+                    if !granted {
+                        settings.voiceFollow = false
+                        speechDenied = true
+                    }
+                }
+            }
+            .alert("沒有語音辨識的權限", isPresented: $speechDenied) {
+                Button("好") {}
+            } message: {
+                Text("請到「設定 → 花椰菜相機」打開「語音辨識」，再回來打開這個開關。")
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("完成") {

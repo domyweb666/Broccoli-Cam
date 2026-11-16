@@ -41,9 +41,15 @@ struct TeleprompterView: View {
                 }
                 .onAppear {
                     model.viewportHeight = geo.size.height
+                    model.layoutWidth = max(0, geo.size.width - 28)
+                    model.fontSize = fontSize
                 }
-                .onChange(of: geo.size.height) { _, height in
-                    model.viewportHeight = height
+                .onChange(of: geo.size) { _, size in
+                    model.viewportHeight = size.height
+                    model.layoutWidth = max(0, size.width - 28)
+                }
+                .onChange(of: fontSize) { _, value in
+                    model.fontSize = value
                 }
         }
         .background(Color.black.opacity(backgroundOpacity))

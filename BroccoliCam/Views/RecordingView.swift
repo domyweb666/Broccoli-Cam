@@ -81,6 +81,7 @@ struct RecordingView: View {
         }
         .onChange(of: settings.fps) { _, _ in startCamera() }
         .onChange(of: settings.mirrorOutput) { _, _ in startCamera() }
+        .onChange(of: settings.voiceFollow) { _, _ in startCamera() }
         .onChange(of: settings.speed) { _, speed in
             viewModel.prompter.speed = CGFloat(speed)
         }
@@ -139,7 +140,8 @@ struct RecordingView: View {
     }
 
     private func startCamera() {
-        camera.start(resolution: settings.resolution, fps: settings.fps, mirrorOutput: settings.mirrorOutput)
+        camera.start(resolution: settings.resolution, fps: settings.fps, mirrorOutput: settings.mirrorOutput,
+                     speechTap: settings.voiceFollow)
     }
 }
 
@@ -355,7 +357,14 @@ private struct ControlBar: View {
 
 /// 分段錄影時顯示在控制列上方：目前第幾段、切換段落、剛錄完時選留用或重錄。
 private struct SegmentBar: View {
+    @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var viewModel: RecordingViewModel
+
+    /// 這一段預估要講多久。
+    private var estimateText: String {
+        let seconds = ScriptSegments.estimatedSeconds(viewModel.currentText, charsPerMinute: settings.speechRate)
+        return "約 " + ScriptSegments.formatDuration(seconds)
+    }
 
     private var canStep: Bool {
         !viewModel.isBusy && viewModel.pending == nil
@@ -392,6 +401,10 @@ private struct SegmentBar: View {
                 HStack(spacing: 6) {
                     Text("第 \(viewModel.currentIndex + 1)／\(viewModel.segments.count) 段")
                         .font(.subheadline.weight(.semibold))
+                    Text(estimateText)
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.7))
+                        .monospacedDigit()
                     if viewModel.currentHasTake && viewModel.pending == nil {
                         Image(systemName: "checkmark.circle.fill")
                             .font(.subheadline)

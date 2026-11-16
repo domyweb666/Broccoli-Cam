@@ -21,6 +21,16 @@ struct ScriptEditorView: View {
         return text
     }
 
+    /// 每一段各自要講多久（兩段以上才顯示）。
+    private var segmentDurations: [String] {
+        let segments = settings.segments
+        guard segments.count > 1 else { return [] }
+        return segments.map {
+            ScriptSegments.formatDuration(
+                ScriptSegments.estimatedSeconds($0, charsPerMinute: settings.speechRate))
+        }
+    }
+
     var body: some View {
         NavigationStack {
             ZStack(alignment: .topLeading) {
@@ -42,12 +52,29 @@ struct ScriptEditorView: View {
             }
             // 字數、預估時長、段數放在稿件上方：底部工具列太窄，文字會被截成「14…」。
             .safeAreaInset(edge: .top, spacing: 0) {
-                Text(summary)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 17)
-                    .padding(.vertical, 6)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(summary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    if !segmentDurations.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 6) {
+                                ForEach(Array(segmentDurations.enumerated()), id: \.offset) { index, duration in
+                                    Text("第 \(index + 1) 段 \(duration)")
+                                        .font(.caption)
+                                        .monospacedDigit()
+                                        .foregroundStyle(.secondary)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.secondary.opacity(0.12), in: Capsule())
+                                }
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 17)
+                .padding(.vertical, 6)
             }
             .navigationTitle("稿件")
             .navigationBarTitleDisplayMode(.inline)

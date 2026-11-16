@@ -31,10 +31,31 @@ final class CameraService: NSObject, ObservableObject {
     /// 音量鍵或藍牙遙控器被按下（主執行緒回呼）。
     var onCaptureButton: (() -> Void)?
 
+    /// 語音跟隨要聽的音訊。在音訊佇列上被呼叫，設定與讀取都有鎖。
+    var audioSampleHandler: ((CMSampleBuffer) -> Void)? {
+        get {
+            audioTapLock.lock()
+            defer { audioTapLock.unlock() }
+            return storedAudioSampleHandler
+        }
+        set {
+            audioTapLock.lock()
+            storedAudioSampleHandler = newValue
+            audioTapLock.unlock()
+        }
+    }
+
     private let sessionQueue = DispatchQueue(label: "org.domyweb.broccolicam.session")
     private let metadataQueue = DispatchQueue(label: "org.domyweb.broccolicam.metadata")
     private let movieOutput = AVCaptureMovieFileOutput()
     private let metadataOutput = AVCaptureMetadataOutput()
+    /// 語音跟隨用的音訊分流。只有設定打開時才掛上去，沒開就和原本的錄影管線完全一樣。
+    private let audioDataOutput = AVCaptureAudioDataOutput()
+    private let audioQueue = DispatchQueue(label: "org.domyweb.broccolicam.audio")
+    private let audioTapLock = NSLock()
+    private var storedAudioSampleHandler: ((CMSampleBuffer) -> Void)?
+    private var audioTapCount = 0
+    private var audioTapAttached = false
     private var videoDevice: AVCaptureDevice?
     private var isConfigured = false
     private var desiredResolution: VideoResolution = .hd1080
@@ -104,7 +125,7 @@ final class CameraService: NSObject, ObservableObject {
     // MARK: - Session 生命週期
 
     /// 啟動（或以新設定重新套用）相機。錄影中呼叫只會更新設定值，不會改格式。
-    func start(resolution: VideoResolution, fps: Int, mirrorOutput: Bool) {
+    func start(resolution: VideoResolution, fps: Int, mirrorOutput: Bool, speechTap: Bool = false) {
         let angle = currentCaptureAngle()
         sessionQueue.async {
             self.captureRotationAngle = angle
@@ -116,6 +137,7 @@ final class CameraService: NSObject, ObservableObject {
             }
             guard self.isConfigured else { return }
             if !self.movieOutput.isRecording {
+                self.applySpeechTap(speechTap)
                 self.applyFormat()
                 self.updateConnections()
             }
@@ -283,6 +305,28 @@ final class CameraService: NSObject, ObservableObject {
         isConfigured = true
         computeCapabilities(camera)
         log("相機設定完成")
+    }
+
+    /// 掛上或拿掉語音跟隨用的音訊分流。請在 sessionQueue 呼叫，錄影中不要動。
+    private func applySpeechTap(_ wanted: Bool) {
+        guard wanted != audioTapAttached else { return }
+        session.beginConfiguration()
+        if wanted {
+            if session.canAddOutput(audioDataOutput) {
+                session.addOutput(audioDataOutput)
+                audioDataOutput.setSampleBufferDelegate(self, queue: audioQueue)
+                audioTapAttached = true
+                log("語音分流已掛上")
+            } else {
+                log("無法加入語音分流輸出")
+            }
+        } else {
+            audioDataOutput.setSampleBufferDelegate(nil, queue: nil)
+            session.removeOutput(audioDataOutput)
+            audioTapAttached = false
+            log("語音分流已拿掉")
+        }
+        session.commitConfiguration()
     }
 
     private func computeCapabilities(_ device: AVCaptureDevice) {
@@ -532,6 +576,10 @@ final class CameraService: NSObject, ObservableObject {
         } else {
             lines.append("協調器 未建立")
         }
+        audioTapLock.lock()
+        let tapCount = audioTapCount
+        audioTapLock.unlock()
+        lines.append("語音分流 收到 \(tapCount) 包")
         lines.append("音訊路由 \(meter.route)")
         let mic: String
         switch meter.micStatus {
@@ -619,6 +667,20 @@ extension CameraService: AVCaptureFileOutputRecordingDelegate {
                 self.onRecordingFailed?()
             }
         }
+    }
+}
+
+// MARK: - 語音分流
+
+extension CameraService: AVCaptureAudioDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        audioTapLock.lock()
+        audioTapCount += 1
+        let handler = storedAudioSampleHandler
+        audioTapLock.unlock()
+        handler?(sampleBuffer)
     }
 }
 
