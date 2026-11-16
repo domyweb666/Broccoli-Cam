@@ -42,6 +42,12 @@ final class CameraService: NSObject, ObservableObject {
     private var mirrorOutput = false
     private var lastFaceUpdate: CFTimeInterval = 0
     private weak var previewLayer: AVCaptureVideoPreviewLayer?
+    /// 依裝置問出正確的旋轉角度。iPhone 17 的前鏡頭感光元件裝的方向和舊機型差 90 度，
+    /// 不能寫死 90 度。只在主執行緒建立與讀取。
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var rotationObservation: NSKeyValueObservation?
+    /// 錄影要用的角度，主執行緒更新、sessionQueue 讀取。
+    private var captureRotationAngle: CGFloat = 90
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -99,7 +105,9 @@ final class CameraService: NSObject, ObservableObject {
 
     /// 啟動（或以新設定重新套用）相機。錄影中呼叫只會更新設定值，不會改格式。
     func start(resolution: VideoResolution, fps: Int, mirrorOutput: Bool) {
+        let angle = currentCaptureAngle()
         sessionQueue.async {
+            self.captureRotationAngle = angle
             self.desiredResolution = resolution
             self.desiredFPS = fps
             self.mirrorOutput = mirrorOutput
@@ -117,6 +125,7 @@ final class CameraService: NSObject, ObservableObject {
             let running = self.session.isRunning
             DispatchQueue.main.async {
                 self.isSessionRunning = running
+                self.setUpRotationCoordinator()
                 self.applyPreviewRotation()
                 self.schedulePreviewRotationRetries()
                 if running { self.meter.start() }
@@ -142,7 +151,33 @@ final class CameraService: NSObject, ObservableObject {
 
     func attachPreviewLayer(_ layer: AVCaptureVideoPreviewLayer) {
         previewLayer = layer
+        rotationCoordinator = nil
+        setUpRotationCoordinator()
         applyPreviewRotation()
+    }
+
+    /// 相機和預覽層都就緒後建立 RotationCoordinator，角度變了就重新套用。請在主執行緒呼叫。
+    private func setUpRotationCoordinator() {
+        guard rotationCoordinator == nil, let device = videoDevice, let layer = previewLayer else { return }
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: layer)
+        rotationCoordinator = coordinator
+        rotationObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelPreview, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.applyPreviewRotation()
+            }
+        }
+        log("旋轉協調器 預覽=\(Int(coordinator.videoRotationAngleForHorizonLevelPreview)) 錄影=\(Int(coordinator.videoRotationAngleForHorizonLevelCapture))")
+    }
+
+    /// 預覽應該轉幾度。沒有協調器時退回舊機型的 90 度。
+    private func currentPreviewAngle() -> CGFloat {
+        rotationCoordinator?.videoRotationAngleForHorizonLevelPreview ?? 90
+    }
+
+    /// 錄影應該轉幾度。App 鎖直式，所以用預覽的角度，不跟著手機傾斜改變。
+    private func currentCaptureAngle() -> CGFloat {
+        guard let coordinator = rotationCoordinator else { return 90 }
+        return coordinator.videoRotationAngleForHorizonLevelPreview
     }
 
     /// 把預覽轉成直式。請在主執行緒呼叫。
@@ -153,7 +188,7 @@ final class CameraService: NSObject, ObservableObject {
             notePreviewRotation("預覽連線還沒建立")
             return
         }
-        Self.makePortrait(connection)
+        Self.apply(currentPreviewAngle(), to: connection)
         notePreviewRotation("預覽旋轉=\(Int(connection.videoRotationAngle))")
     }
 
@@ -175,14 +210,11 @@ final class CameraService: NSObject, ObservableObject {
         log(text)
     }
 
-    /// 把連線設成直式：優先用旋轉角度，不支援時退回舊的方向設定。
-    private static func makePortrait(_ connection: AVCaptureConnection) {
-        if connection.isVideoRotationAngleSupported(90) {
-            if connection.videoRotationAngle != 90 {
-                connection.videoRotationAngle = 90
-            }
-        } else if connection.isVideoOrientationSupported {
-            connection.videoOrientation = .portrait
+    /// 把連線轉到指定角度；不支援時不動。
+    private static func apply(_ angle: CGFloat, to connection: AVCaptureConnection) {
+        guard connection.isVideoRotationAngleSupported(angle) else { return }
+        if connection.videoRotationAngle != angle {
+            connection.videoRotationAngle = angle
         }
     }
 
@@ -351,7 +383,7 @@ final class CameraService: NSObject, ObservableObject {
 
     private func updateConnections() {
         guard let connection = movieOutput.connection(with: .video) else { return }
-        Self.makePortrait(connection)
+        Self.apply(captureRotationAngle, to: connection)
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
             connection.isVideoMirrored = mirrorOutput
@@ -361,7 +393,9 @@ final class CameraService: NSObject, ObservableObject {
     // MARK: - 錄影
 
     func startRecording() {
+        let angle = currentCaptureAngle()
         sessionQueue.async {
+            self.captureRotationAngle = angle
             guard self.isConfigured, self.session.isRunning else {
                 self.log("相機尚未就緒，無法錄影")
                 DispatchQueue.main.async { self.onRecordingFailed?() }
@@ -492,6 +526,11 @@ final class CameraService: NSObject, ObservableObject {
             lines.append("預覽 旋轉=\(Int(connection.videoRotationAngle)) 支援90=\(connection.isVideoRotationAngleSupported(90) ? "是" : "否")")
         } else {
             lines.append("預覽 沒有連線")
+        }
+        if let coordinator = rotationCoordinator {
+            lines.append("協調器 預覽=\(Int(coordinator.videoRotationAngleForHorizonLevelPreview)) 錄影=\(Int(coordinator.videoRotationAngleForHorizonLevelCapture))")
+        } else {
+            lines.append("協調器 未建立")
         }
         lines.append("音訊路由 \(meter.route)")
         let mic: String
