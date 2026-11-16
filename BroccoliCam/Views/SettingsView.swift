@@ -14,6 +14,18 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Picker("模式", selection: $settings.companionMode) {
+                        Text("提詞").tag(false)
+                        Text("陪伴").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                } header: {
+                    Text("模式")
+                } footer: {
+                    Text("提詞：照著稿子唸。陪伴：不看稿，鏡頭旁邊有一位聆聽者，你講話時它會點頭，適合知道要說什麼、但對著鏡頭會緊張的時候。聆聽者不會錄進影片。")
+                }
+
                 Section("影片") {
                     Picker("畫質", selection: $settings.resolution) {
                         ForEach(camera.availableResolutions) { resolution in
@@ -82,10 +94,11 @@ struct SettingsView: View {
                         Text("10 秒").tag(10)
                     }
                     Toggle("接片時裁掉每段頭尾的空白", isOn: $settings.trimSilence)
+                    Toggle("手機橫放時錄橫式影片", isOn: $settings.autoLandscape)
                 } header: {
                     Text("錄影")
                 } footer: {
-                    Text("稿件用空行分段後，可以一段一段錄，最後自動接成一支。音量鍵和藍牙自拍遙控器也可以開始、停止錄影。")
+                    Text("稿件用空行分段後，可以一段一段錄，最後自動接成一支。音量鍵和藍牙自拍遙控器也可以開始、停止錄影。手機橫著架，錄出來就是 16:9 的橫式影片，畫面上的字會跟著轉過來。")
                 }
 
                 Section {

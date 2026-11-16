@@ -202,6 +202,12 @@ final class CameraService: NSObject, ObservableObject {
         return coordinator.videoRotationAngleForHorizonLevelPreview
     }
 
+    /// 手機橫放時錄影應該轉幾度：跟著手機實際的擺法（重力方向）。
+    private func currentLandscapeAngle() -> CGFloat {
+        guard let coordinator = rotationCoordinator else { return 90 }
+        return coordinator.videoRotationAngleForHorizonLevelCapture
+    }
+
     /// 把預覽轉成直式。請在主執行緒呼叫。
     /// 預覽層的連線要等 session 設定完才會出現，所以會被多處重複呼叫：
     /// 掛上預覽層、session 啟動後、預覽 view 重新排版、中斷結束。
@@ -436,8 +442,12 @@ final class CameraService: NSObject, ObservableObject {
 
     // MARK: - 錄影
 
-    func startRecording() {
-        let angle = currentCaptureAngle()
+    /// landscape：手機橫放，要錄成橫式 16:9。角度交給 RotationCoordinator 依手機實際的擺法決定。
+    func startRecording(landscape: Bool = false) {
+        let angle = landscape ? currentLandscapeAngle() : currentCaptureAngle()
+        if landscape {
+            log("橫式錄影 角度=\(Int(angle))")
+        }
         sessionQueue.async {
             self.captureRotationAngle = angle
             guard self.isConfigured, self.session.isRunning else {

@@ -38,7 +38,7 @@ struct VideoReviewView: View {
             VStack(spacing: 14) {
                 if let player {
                     VideoPlayer(player: player)
-                        .aspectRatio(9 / 16, contentMode: .fit)
+                        .aspectRatio(video.isLandscape ? 16 / 9 : 9 / 16, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 } else {
                     Spacer()

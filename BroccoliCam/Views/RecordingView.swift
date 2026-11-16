@@ -6,6 +6,8 @@ struct RecordingView: View {
     @EnvironmentObject private var settings: SettingsStore
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel = RecordingViewModel()
+    @StateObject private var orientation = OrientationMonitor()
+    @StateObject private var companion = CompanionModel()
 
     @State private var showScript = false
     @State private var showSettings = false
@@ -20,9 +22,11 @@ struct RecordingView: View {
 
                 PreviewStack(
                     prompter: viewModel.prompter,
+                    companion: companion,
                     phase: viewModel.phase,
                     text: viewModel.currentText,
                     isMerging: viewModel.isMerging,
+                    angle: uiAngle,
                     size: CGSize(width: previewWidth, height: previewHeight)
                 )
                 .frame(width: previewWidth, height: previewHeight)
@@ -30,18 +34,32 @@ struct RecordingView: View {
 
                 VStack(spacing: 10) {
                     Spacer()
-                    StatusRow(phase: viewModel.phase, elapsed: viewModel.elapsed, estimate: estimate)
-                    if viewModel.isSegmented {
-                        SegmentBar(viewModel: viewModel)
+                    if uiAngle == 0 {
+                        statusAndSegments
                     }
                     ControlBar(
                         viewModel: viewModel,
                         prompter: viewModel.prompter,
+                        angle: uiAngle,
                         showScript: $showScript,
                         showSettings: $showSettings
                     )
                 }
                 .padding(.bottom, 6)
+
+                if uiAngle != 0 {
+                    // 橫放：計時、收音、分段列轉 90 度，沿著使用者看到的下緣排，避開提詞那一側。
+                    let topInset = previewHeight * 0.40 + 20
+                    let length = max(200, min(previewHeight - topInset - 110, 440))
+                    let thickness: CGFloat = viewModel.isSegmented ? 150 : 44
+                    statusAndSegments
+                        .frame(width: length)
+                        .rotationEffect(.degrees(uiAngle))
+                        .frame(width: thickness, height: length)
+                        .padding(.top, topInset)
+                        .padding(.horizontal, 4)
+                        .frame(maxWidth: .infinity, alignment: uiAngle > 0 ? .leading : .trailing)
+                }
 
                 if settings.showDebug {
                     DebugOverlayView()
@@ -52,13 +70,27 @@ struct RecordingView: View {
         }
         .onAppear {
             viewModel.attach(camera, settings: settings)
-            viewModel.updateScript(settings.script)
+            viewModel.updateScript(settings.activeScript)
             viewModel.prompter.speed = CGFloat(settings.speed)
+            viewModel.deviceAngle = deviceAngle
             UIApplication.shared.isIdleTimerDisabled = true
             startCamera()
+            updateCompanion()
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
+            companion.stop()
+        }
+        .onChange(of: orientation.angle) { _, _ in
+            viewModel.deviceAngle = deviceAngle
+        }
+        .onChange(of: settings.autoLandscape) { _, _ in
+            viewModel.deviceAngle = deviceAngle
+        }
+        .onChange(of: settings.companionMode) { _, _ in
+            viewModel.updateScript(settings.activeScript)
+            viewModel.prompter.reset()
+            updateCompanion()
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -100,8 +132,13 @@ struct RecordingView: View {
         } message: {
             Text(viewModel.mergeError ?? "")
         }
+        .alert("手機的擺法和前面不一樣", isPresented: orientationErrorShown) {
+            Button("好") {}
+        } message: {
+            Text(viewModel.orientationError ?? "")
+        }
         .sheet(isPresented: $showScript, onDismiss: {
-            viewModel.updateScript(settings.script)
+            viewModel.updateScript(settings.activeScript)
             viewModel.prompter.reset()
         }) {
             ScriptEditorView()
@@ -120,9 +157,48 @@ struct RecordingView: View {
         .persistentSystemOverlays(.hidden)
     }
 
+    /// 計時、收音狀態和分段列。直放時在控制列上方，橫放時轉 90 度放到側邊。
+    @ViewBuilder
+    private var statusAndSegments: some View {
+        VStack(spacing: 10) {
+            StatusRow(phase: viewModel.phase, elapsed: viewModel.elapsed, estimate: estimate,
+                      canSwitchMode: !viewModel.isBusy && viewModel.pending == nil)
+            if viewModel.isSegmented {
+                SegmentBar(viewModel: viewModel)
+            }
+        }
+    }
+
+    /// 手機現在的擺法。關掉「橫放時錄橫式」就一律當直放。
+    private var deviceAngle: Double {
+        settings.autoLandscape ? orientation.angle : 0
+    }
+
+    /// 介面元件要轉幾度。開始倒數之後就固定，不跟著手機晃動。
+    private var uiAngle: Double {
+        viewModel.phase == .idle ? deviceAngle : viewModel.lockedAngle
+    }
+
+    private var orientationErrorShown: Binding<Bool> {
+        Binding(
+            get: { viewModel.orientationError != nil },
+            set: { shown in
+                if !shown { viewModel.orientationError = nil }
+            }
+        )
+    }
+
+    private func updateCompanion() {
+        if settings.companionMode {
+            companion.start(meter: camera.meter)
+        } else {
+            companion.stop()
+        }
+    }
+
     /// 目前這段（或整篇）稿件預估要講多久；沒有稿件時不顯示。
     private var estimate: TimeInterval? {
-        guard settings.hasScript else { return nil }
+        guard settings.usesPrompter else { return nil }
         return ScriptSegments.estimatedSeconds(viewModel.currentText, charsPerMinute: settings.speechRate)
     }
 
@@ -151,15 +227,18 @@ private struct PreviewStack: View {
     @EnvironmentObject private var camera: CameraService
     @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var prompter: TeleprompterModel
+    let companion: CompanionModel
     let phase: RecordingViewModel.Phase
     let text: String
     let isMerging: Bool
+    /// 橫放時字和圖示要轉的角度（±90）；直放是 0。
+    let angle: Double
     let size: CGSize
 
     /// 有稿件時，構圖框只在開始提詞前顯示供對位；提詞開始後淡出。
     private var showGuide: Bool {
         guard settings.showGuide else { return false }
-        if settings.hasScript && (prompter.isPlaying || prompter.offset > 0) { return false }
+        if settings.usesPrompter && (prompter.isPlaying || prompter.offset > 0) { return false }
         return true
     }
 
@@ -168,20 +247,32 @@ private struct PreviewStack: View {
             CameraPreviewView(camera: camera)
 
             if showGuide {
-                FramingGuideView(faces: camera.faces, scale: CGFloat(settings.guideScale))
+                FramingGuideView(faces: camera.faces, scale: CGFloat(settings.guideScale), angle: angle)
+                    .turned(angle, width: size.width, height: size.height)
                     .transition(.opacity)
             }
 
-            if settings.hasScript {
+            if settings.usesPrompter {
+                // 橫放時提詞變成鏡頭旁邊的一直欄，欄寬放大一點，一行才放得下夠多字。
+                let bandWidth = size.width * 0.84
+                let bandHeight = size.height * (angle == 0 ? 0.32 : 0.40)
                 TeleprompterView(
                     model: prompter,
                     text: text,
                     fontSize: CGFloat(settings.fontSize),
                     backgroundOpacity: settings.promptBackground
                 )
-                .frame(width: size.width * 0.84, height: size.height * 0.32)
+                .turned(angle, width: bandWidth, height: bandHeight)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .padding(.top, 8)
+            }
+
+            if settings.companionMode {
+                let side = min(size.width * 0.34, 150)
+                CompanionView(model: companion)
+                    .turned(angle, width: side, height: side)
+                    .padding(.top, 12)
+                    .transition(.opacity)
             }
 
             if case .countdown(let remaining) = phase {
@@ -189,6 +280,7 @@ private struct PreviewStack: View {
                     .font(.system(size: 120, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
                     .shadow(color: .black.opacity(0.5), radius: 8)
+                    .rotationEffect(.degrees(angle))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
@@ -203,6 +295,7 @@ private struct PreviewStack: View {
                 }
                 .padding(22)
                 .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .rotationEffect(.degrees(angle))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
@@ -213,6 +306,7 @@ private struct PreviewStack: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                     .background(.black.opacity(0.7), in: Capsule())
+                    .rotationEffect(.degrees(angle))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -228,6 +322,8 @@ private struct StatusRow: View {
     let phase: RecordingViewModel.Phase
     let elapsed: TimeInterval
     let estimate: TimeInterval?
+    /// 待機時才能切換提詞／陪伴。
+    let canSwitchMode: Bool
 
     private var timeText: String {
         let now = Self.format(elapsed)
@@ -255,6 +351,27 @@ private struct StatusRow: View {
                 .onLongPressGesture(minimumDuration: 1.0) {
                     settings.showDebug.toggle()
                 }
+
+            if canSwitchMode {
+                Button {
+                    settings.companionMode.toggle()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: settings.companionMode ? "person.wave.2.fill" : "text.alignleft")
+                            .font(.caption)
+                        Text(settings.companionMode ? "陪伴" : "提詞")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(settings.companionMode ? Color.black : Color.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(settings.companionMode ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Color.black.opacity(0.55)),
+                                in: Capsule())
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(settings.companionMode ? "切換到提詞模式" : "切換到陪伴模式")
+            }
         }
     }
 
@@ -306,41 +423,42 @@ private struct ControlBar: View {
     @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var viewModel: RecordingViewModel
     @ObservedObject var prompter: TeleprompterModel
+    let angle: Double
     @Binding var showScript: Bool
     @Binding var showSettings: Bool
 
     var body: some View {
         HStack(spacing: 0) {
-            BarButton(title: "稿件", systemImage: "doc.text") {
+            BarButton(title: "稿件", systemImage: "doc.text", angle: angle) {
                 showScript = true
             }
-            .disabled(viewModel.isBusy)
-            .opacity(viewModel.isBusy ? 0.35 : 1)
+            .disabled(viewModel.isBusy || settings.companionMode)
+            .opacity(settings.companionMode ? 0 : (viewModel.isBusy ? 0.35 : 1))
 
             BarButton(title: prompter.isPlaying ? "暫停" : "提詞",
-                      systemImage: prompter.isPlaying ? "pause.fill" : "play.fill") {
+                      systemImage: prompter.isPlaying ? "pause.fill" : "play.fill", angle: angle) {
                 viewModel.togglePrompter()
             }
-            .opacity(settings.hasScript ? 1 : 0)
-            .disabled(!settings.hasScript)
+            .opacity(settings.usesPrompter ? 1 : 0)
+            .disabled(!settings.usesPrompter)
 
             RecordButton(phase: viewModel.phase) {
                 viewModel.primaryTapped(
                     countdown: settings.countdown,
-                    autoPrompt: settings.autoStartPrompter && settings.hasScript
+                    autoPrompt: settings.autoStartPrompter && settings.usesPrompter
                 )
             }
             .frame(maxWidth: .infinity)
             .disabled(viewModel.pending != nil || viewModel.isMerging)
             .opacity(viewModel.pending != nil || viewModel.isMerging ? 0.35 : 1)
 
-            BarButton(title: "回開頭", systemImage: "arrow.counterclockwise") {
+            BarButton(title: "回開頭", systemImage: "arrow.counterclockwise", angle: angle) {
                 prompter.reset()
             }
-            .opacity(settings.hasScript ? 1 : 0)
-            .disabled(!settings.hasScript)
+            .opacity(settings.usesPrompter ? 1 : 0)
+            .disabled(!settings.usesPrompter)
 
-            BarButton(title: "設定", systemImage: "slider.horizontal.3") {
+            BarButton(title: "設定", systemImage: "slider.horizontal.3", angle: angle) {
                 showSettings = true
             }
             .disabled(viewModel.isBusy)
@@ -432,6 +550,8 @@ private struct SegmentBar: View {
                     } label: {
                         Text("重錄這段")
                             .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity, minHeight: 46)
                             .background(.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -441,6 +561,8 @@ private struct SegmentBar: View {
                     } label: {
                         Text(isLastMissing ? "留用並接成一支" : "留用，下一段")
                             .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
                             .foregroundStyle(.black)
                             .frame(maxWidth: .infinity, minHeight: 46)
                             .background(Theme.accent, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -469,6 +591,7 @@ private struct SegmentBar: View {
 private struct BarButton: View {
     let title: String
     let systemImage: String
+    var angle: Double = 0
     let action: () -> Void
 
     var body: some View {
@@ -480,6 +603,8 @@ private struct BarButton: View {
                 Text(title)
                     .font(.caption2)
             }
+            .rotationEffect(.degrees(angle))
+            .animation(.easeInOut(duration: 0.25), value: angle)
             .foregroundStyle(.white)
             .frame(maxWidth: .infinity, minHeight: 52)
             .contentShape(Rectangle())

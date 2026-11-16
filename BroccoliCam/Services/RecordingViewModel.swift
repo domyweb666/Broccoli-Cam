@@ -8,6 +8,8 @@ struct RecordedVideo: Identifiable {
     var isStitched = false
     /// 這支影片照著唸的稿子，產生字幕用。沒有稿子就是空字串。
     var script = ""
+    /// 是不是橫式 16:9。
+    var isLandscape = false
 }
 
 /// 一段錄好的影片，以及錄影當下量到的「有聲音」範圍（秒）。
@@ -39,6 +41,15 @@ final class RecordingViewModel: ObservableObject {
     @Published private(set) var pending: SegmentTake?
     @Published private(set) var isMerging = false
     @Published var mergeError: String?
+    /// 這一段的手機擺法和前面幾段不一樣時的提示。
+    @Published var orientationError: String?
+    /// 按下錄影那一刻介面轉的角度，錄影中不跟著手機晃動改變。
+    @Published private(set) var lockedAngle: Double = 0
+
+    /// 手機現在的擺法（0 直放、±90 橫放），由畫面隨時更新。
+    var deviceAngle: Double = 0
+    /// 已經錄好的段落是橫的還是直的。還沒有任何一段時是 nil。
+    private var takesLandscape: Bool?
 
     let prompter = TeleprompterModel()
     private let follower = SpeechFollower()
@@ -137,6 +148,14 @@ final class RecordingViewModel: ObservableObject {
         guard !isMerging, pending == nil else { return }
         switch phase {
         case .idle:
+            lockedAngle = deviceAngle
+            // 分段錄影：每一段的擺法要一樣，不然接起來會有一段是倒的。
+            if isSegmented, !takes.isEmpty, let first = takesLandscape, first != (lockedAngle != 0) {
+                orientationError = first
+                    ? "前面幾段是橫著錄的，請把手機橫放再錄這一段。"
+                    : "前面幾段是直著錄的，請把手機直放再錄這一段。"
+                return
+            }
             self.autoPrompt = autoPrompt
             if countdown > 0 {
                 startCountdown(countdown)
@@ -160,7 +179,7 @@ final class RecordingViewModel: ObservableObject {
         } else {
             primaryTapped(
                 countdown: settings.countdown,
-                autoPrompt: settings.autoStartPrompter && settings.hasScript
+                autoPrompt: settings.autoStartPrompter && settings.usesPrompter
             )
         }
     }
@@ -191,6 +210,7 @@ final class RecordingViewModel: ObservableObject {
             try? FileManager.default.removeItem(at: old.url)
         }
         takes[currentIndex] = take
+        takesLandscape = lockedAngle != 0
         pending = nil
         prompter.reset()
         if let next = (0..<segments.count).first(where: { takes[$0] == nil }) {
@@ -240,7 +260,8 @@ final class RecordingViewModel: ObservableObject {
                     self.isMerging = false
                     self.camera?.log("接片完成")
                     self.review = RecordedVideo(url: url, isStitched: true,
-                                                script: self.segments.joined(separator: "\n"))
+                                                script: self.segments.joined(separator: "\n"),
+                                                isLandscape: self.takesLandscape ?? false)
                 }
             } catch {
                 await MainActor.run {
@@ -261,6 +282,7 @@ final class RecordingViewModel: ObservableObject {
             try? FileManager.default.removeItem(at: take.url)
         }
         takes = [:]
+        takesLandscape = nil
         pending = nil
         currentIndex = 0
         prompter.reset()
@@ -304,7 +326,7 @@ final class RecordingViewModel: ObservableObject {
     private func beginRecording() {
         phase = .starting
         elapsed = 0
-        camera?.startRecording()
+        camera?.startRecording(landscape: lockedAngle != 0)
         // 3 秒內沒有真的開始錄，就回到待機，不要卡住。
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let self, self.phase == .starting else { return }
@@ -391,7 +413,7 @@ final class RecordingViewModel: ObservableObject {
         if isSegmented {
             pending = SegmentTake(url: url, firstSound: firstSound, lastSound: lastSound)
         } else {
-            review = RecordedVideo(url: url, script: segments.first ?? "")
+            review = RecordedVideo(url: url, script: segments.first ?? "", isLandscape: lockedAngle != 0)
         }
     }
 

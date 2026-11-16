@@ -5,10 +5,13 @@ import SwiftUI
 struct FramingGuideView: View {
     @ObservedObject var faces: FaceDetectionService
     let scale: CGFloat
+    /// 橫放時這個 view 會被轉 90 度（±90）；直放是 0。
+    var angle: Double = 0
 
     /// 頭部輪廓在預覽座標中的位置。臉部比對也用同一個矩形。
+    /// 用短邊算大小，橫式畫面裡的頭像框才不會大到超出去。
     static func headRect(in size: CGSize, scale: CGFloat) -> CGRect {
-        let width = size.width * 0.40 * scale
+        let width = min(size.width, size.height) * 0.40 * scale
         let height = width * 1.32
         let centerY = size.height * 0.36
         return CGRect(x: (size.width - width) / 2, y: centerY - height / 2, width: width, height: height)
@@ -17,7 +20,7 @@ struct FramingGuideView: View {
     var body: some View {
         GeometryReader { geo in
             let head = Self.headRect(in: geo.size, scale: scale)
-            let status = FaceDetectionService.status(face: faces.faceRect, guide: head)
+            let status = FaceDetectionService.status(face: turnedFace(in: geo.size), guide: head)
             let color: Color = status == .good ? Theme.good : Color.white.opacity(0.85)
 
             ZStack {
@@ -34,6 +37,20 @@ struct FramingGuideView: View {
             .animation(.easeInOut(duration: 0.25), value: status == .good)
         }
         .allowsHitTesting(false)
+    }
+
+    /// 臉的位置是用「直放的螢幕」座標回報的。橫放時這個 view 被轉了 90 度，要換算成 view 自己的座標才能比。
+    private func turnedFace(in size: CGSize) -> CGRect? {
+        guard let face = faces.faceRect else { return nil }
+        if angle > 0 {
+            // 螢幕寬 = size.height
+            return CGRect(x: face.minY, y: size.height - face.maxX, width: face.height, height: face.width)
+        }
+        if angle < 0 {
+            // 螢幕高 = size.width
+            return CGRect(x: size.width - face.maxY, y: face.minX, width: face.height, height: face.width)
+        }
+        return face
     }
 }
 

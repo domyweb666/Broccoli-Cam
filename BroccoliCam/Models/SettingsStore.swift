@@ -48,6 +48,11 @@ final class SettingsStore: ObservableObject {
     /// 字幕每行最多幾個字
     @Published var subtitleMaxChars: Double { didSet { defaults.set(subtitleMaxChars, forKey: "subtitleMaxChars") } }
 
+    /// 陪伴模式：不看稿，畫面上有一位聆聽者。關閉就是提詞模式。
+    @Published var companionMode: Bool { didSet { defaults.set(companionMode, forKey: "companionMode") } }
+    /// 手機橫放時錄橫式 16:9
+    @Published var autoLandscape: Bool { didSet { defaults.set(autoLandscape, forKey: "autoLandscape") } }
+
     @Published var showDebug: Bool { didSet { defaults.set(showDebug, forKey: "showDebug") } }
 
     init() {
@@ -68,11 +73,23 @@ final class SettingsStore: ObservableObject {
         trimSilence = (d.object(forKey: "trimSilence") as? Bool) ?? true
         voiceFollow = (d.object(forKey: "voiceFollow") as? Bool) ?? false
         subtitleMaxChars = (d.object(forKey: "subtitleMaxChars") as? Double) ?? 14
+        companionMode = (d.object(forKey: "companionMode") as? Bool) ?? false
+        autoLandscape = (d.object(forKey: "autoLandscape") as? Bool) ?? true
         showDebug = (d.object(forKey: "showDebug") as? Bool) ?? false
     }
 
     var hasScript: Bool {
         !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 現在要不要顯示提詞：有稿子，而且不是陪伴模式。
+    var usesPrompter: Bool {
+        hasScript && !companionMode
+    }
+
+    /// 錄影流程實際要用的稿子。陪伴模式不看稿。
+    var activeScript: String {
+        companionMode ? "" : script
     }
 
     /// 稿件依空行切出的各段。

@@ -36,7 +36,15 @@
 
 語音辨識用 Apple 的 Speech 框架，語言固定 zh-TW。手機支援裝置端辨識就不連網；不支援時聲音會送到 Apple 辨識。
 
-還沒做：陪伴模式、橫式錄影。規劃見 [`docs/需求缺口與功能規劃.md`](docs/需求缺口與功能規劃.md)。
+## 第四輪（尚未真機驗證）
+
+- 陪伴模式：主畫面收音圖示旁的「提詞／陪伴」可以切換，設定頁最上面也有。陪伴模式不看稿，鏡頭旁邊有一位聆聽者，講話時偶爾點頭，講完一段有時微笑，平常會眨眼。聆聽者不會錄進影片
+- 聆聽者目前是畫出來的花椰菜，因為還沒有真人聆聽短片。時機寫在 `CompanionModel`，長相在 `CompanionView`，之後換成預錄短片只要換後者
+- 橫式錄影：手機橫著架，錄出來就是 16:9。介面仍鎖直式，橫放時提詞、頭像框、按鈕圖示、計時各自轉 90 度（和系統相機同一種做法）。可在設定關閉
+- 橫放時提詞變成鏡頭旁邊的一直欄
+- 分段錄影時每一段的擺法要一樣，不一樣會跳提示，不讓錄
+
+規劃見 [`docs/需求缺口與功能規劃.md`](docs/需求缺口與功能規劃.md)。規格書提到的真人或 3D 聆聽者還沒做，要先有素材。
 
 ## 專案結構
 
@@ -46,7 +54,8 @@ BroccoliCam/
   Camera/     CameraService（session、格式、錄影、中斷）、預覽
   Services/   RecordingViewModel、TeleprompterModel、FaceDetectionService、
               SpeechActivityMonitor、PhotoSaver、VideoStitcher、
-              SpeechFollower（語音跟隨）、SubtitleMaker（字幕）
+              SpeechFollower（語音跟隨）、SubtitleMaker（字幕）、
+              CompanionModel（聆聽者的時機）、OrientationMonitor（直放／橫放）
   Models/     SettingsStore、ScriptSegments、SpokenKeys、SubtitleLines
   Views/      拍攝主畫面、提詞、頭像框、稿件、設定、完成頁、除錯層
 project.yml   XcodeGen 專案定義（.xcodeproj 不進版控，由 CI 產生）
@@ -91,3 +100,8 @@ Build 編號用 Actions 的 run number，版本號在 `project.yml` 的 `MARKETI
 - 語音跟隨：掛上語音分流（`AVCaptureAudioDataOutput`）之後，錄出來的影片聲音是否正常；除錯資訊的「語音分流 收到 N 包」在錄影中會不會增加；提詞跟得上跟不上。
 - 這支手機的 zh-TW 是否支援裝置端辨識（除錯紀錄會寫「裝置端」或「連網」）。
 - 字幕檔的時間準不準，匯入剪映／CapCut 後有沒有對上嘴型。
+- 橫式錄影：手機橫放錄出來的影片是不是正的 16:9（兩個橫放方向都要試）、左右有沒有反、鏡像開關在橫式下對不對。
+- 橫放時介面的字有沒有轉到正的方向，計時那一條會不會擋到臉。
+- 陪伴模式：還沒按錄影時聆聽者會不會動（要看未錄影時讀不讀得到音量）；點頭的頻率會不會太煩。
+
+模擬器測橫式介面：`defaults write org.domyweb.broccolicam debugForceAngle -float 90`（或 -90）後重開 App，介面會當成橫放。真機上不要設這個值。
