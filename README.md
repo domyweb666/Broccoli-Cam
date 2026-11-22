@@ -38,13 +38,19 @@
 
 ## 第四輪（尚未真機驗證）
 
-- 陪伴模式：主畫面收音圖示旁的「提詞／陪伴」可以切換，設定頁最上面也有。陪伴模式不看稿，鏡頭旁邊有一位聆聽者，講話時偶爾點頭，講完一段有時微笑，平常會眨眼。聆聽者不會錄進影片
-- 聆聽者目前是畫出來的花椰菜，因為還沒有真人聆聽短片。時機寫在 `CompanionModel`，長相在 `CompanionView`，之後換成預錄短片只要換後者
+- 陪伴模式：主畫面收音圖示旁的「提詞／陪伴」可以切換，設定頁最上面也有。陪伴模式不看稿，鏡頭旁邊有一位聆聽者，講話時偶爾點頭。聆聽者不會錄進影片
 - 橫式錄影：手機橫著架，錄出來就是 16:9。介面仍鎖直式，橫放時提詞、頭像框、按鈕圖示、計時各自轉 90 度（和系統相機同一種做法）。可在設定關閉
 - 橫放時提詞變成鏡頭旁邊的一直欄
 - 分段錄影時每一段的擺法要一樣，不一樣會跳提示，不讓錄
 
-規劃見 [`docs/需求缺口與功能規劃.md`](docs/需求缺口與功能規劃.md)。規格書提到的真人或 3D 聆聽者還沒做，要先有素材。
+規劃見 [`docs/需求缺口與功能規劃.md`](docs/需求缺口與功能規劃.md)。
+
+## 第五輪（尚未真機驗證）
+
+- 聆聽者換成 AI 產的預錄短片：一位風格化 3D 的女性，9:16，待機 3 支、點頭 2 支，沒有微笑（微笑會干擾，只要顯得專心）。待機片隨機輪播，你講話時偶爾淡入點頭片，播完淡回待機。片子沒有音軌，播放器也靜音
+- 每支片的第一格和最後一格都是同一張定格圖，切換時看不出接縫。素材怎麼做的、提示詞、驗收方式寫在 [`docs/聆聽者短片分鏡.md`](docs/聆聽者短片分鏡.md)，轉檔用 `tools/companion_clips.py`
+- 聆聽者擺法四選一，在「設定 → 模式 → 聆聽者擺法」切換：圓形頭像、頂部小窗、上下分割、視訊通話（預設）。橫放時上下分割和視訊通話改用頂部小窗
+- 片子放在 `BroccoliCam/Resources/Companion/`，播放邏輯在 `CompanionClipPlayer`，點頭時機仍在 `CompanionModel`
 
 ## 專案結構
 
@@ -55,7 +61,8 @@ BroccoliCam/
   Services/   RecordingViewModel、TeleprompterModel、FaceDetectionService、
               SpeechActivityMonitor、PhotoSaver、VideoStitcher、
               SpeechFollower（語音跟隨）、SubtitleMaker（字幕）、
-              CompanionModel（聆聽者的時機）、OrientationMonitor（直放／橫放）
+              CompanionModel（聆聽者點頭的時機）、CompanionClipPlayer（播聆聽者短片）、
+              OrientationMonitor（直放／橫放）
   Models/     SettingsStore、ScriptSegments、SpokenKeys、SubtitleLines
   Views/      拍攝主畫面、提詞、頭像框、稿件、設定、完成頁、除錯層
 project.yml   XcodeGen 專案定義（.xcodeproj 不進版控，由 CI 產生）
@@ -102,6 +109,8 @@ Build 編號用 Actions 的 run number，版本號在 `project.yml` 的 `MARKETI
 - 字幕檔的時間準不準，匯入剪映／CapCut 後有沒有對上嘴型。
 - 橫式錄影：手機橫放錄出來的影片是不是正的 16:9（兩個橫放方向都要試）、左右有沒有反、鏡像開關在橫式下對不對。
 - 橫放時介面的字有沒有轉到正的方向，計時那一條會不會擋到臉。
-- 陪伴模式：還沒按錄影時聆聽者會不會動（要看未錄影時讀不讀得到音量）；點頭的頻率會不會太煩。
+- 陪伴模式：還沒按錄影時聆聽者會不會點頭（要看未錄影時讀不讀得到音量）；點頭的頻率會不會太煩。
+- 聆聽者短片：播放時錄出來的聲音正不正常（播放器靜音、片子沒有音軌，理論上不碰錄音）；片段切換時有沒有閃一下；四種擺法切換時自己的預覽會不會黑掉或轉錯方向；4K／60 加上播片會不會更燙。
+- 視訊通話擺法：右下角自己的小窗會不會被分段列擋到。上下分割時下半的自己是裁過的，看到的比錄到的少一點。
 
 模擬器測橫式介面：`defaults write org.domyweb.broccolicam debugForceAngle -float 90`（或 -90）後重開 App，介面會當成橫放。真機上不要設這個值。

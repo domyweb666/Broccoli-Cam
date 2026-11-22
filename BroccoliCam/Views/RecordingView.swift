@@ -8,6 +8,7 @@ struct RecordingView: View {
     @StateObject private var viewModel = RecordingViewModel()
     @StateObject private var orientation = OrientationMonitor()
     @StateObject private var companion = CompanionModel()
+    @StateObject private var clipPlayer = CompanionClipPlayer()
 
     @State private var showScript = false
     @State private var showSettings = false
@@ -30,12 +31,13 @@ struct RecordingView: View {
 
                 PreviewStack(
                     prompter: viewModel.prompter,
-                    companion: companion,
+                    clipPlayer: clipPlayer,
                     phase: viewModel.phase,
                     text: viewModel.currentText,
                     isMerging: viewModel.isMerging,
                     angle: uiAngle,
-                    size: CGSize(width: previewWidth, height: previewHeight)
+                    size: CGSize(width: previewWidth, height: previewHeight),
+                    bottomInset: controlsOverlap(screenHeight: geo.size.height, previewHeight: previewHeight)
                 )
                 .frame(width: previewWidth, height: previewHeight)
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -119,11 +121,13 @@ struct RecordingView: View {
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             companion.stop()
+            clipPlayer.stop()
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
                 if viewModel.review == nil { startCamera() }
+                clipPlayer.resume()
             case .background:
                 viewModel.interrupt()
                 camera.stop()
@@ -217,9 +221,17 @@ struct RecordingView: View {
     private func updateCompanion() {
         if settings.companionMode {
             companion.start(meter: camera.meter)
+            clipPlayer.start(model: companion)
         } else {
             companion.stop()
+            clipPlayer.stop()
         }
+    }
+
+    /// 底下的狀態列、分段列、控制列蓋進預覽區多少。視訊通話的自己小窗要放在這之上。
+    private func controlsOverlap(screenHeight: CGFloat, previewHeight: CGFloat) -> CGFloat {
+        let controls: CGFloat = 130 + (viewModel.isSegmented ? 110 : 0)
+        return max(0, controls - (screenHeight - previewHeight))
     }
 
     /// 目前這段（或整篇）稿件預估要講多久；沒有稿件時不顯示。
@@ -253,24 +265,47 @@ private struct PreviewStack: View {
     @EnvironmentObject private var camera: CameraService
     @EnvironmentObject private var settings: SettingsStore
     @ObservedObject var prompter: TeleprompterModel
-    let companion: CompanionModel
+    let clipPlayer: CompanionClipPlayer
     let phase: RecordingViewModel.Phase
     let text: String
     let isMerging: Bool
     /// 橫放時字和圖示要轉的角度（±90）；直放是 0。
     let angle: Double
     let size: CGSize
+    /// 控制列蓋進預覽區的高度，視訊通話的自己小窗放在這之上。
+    let bottomInset: CGFloat
+
+    /// 陪伴模式下聆聽者的擺法；提詞模式是 nil。
+    /// 橫放時「上下分割」「視訊通話」改用頂部小窗：鏡頭在側邊，分割和滿版都對不上視線。
+    private var layout: CompanionLayout? {
+        guard settings.companionMode else { return nil }
+        let chosen = settings.companionLayout
+        if angle != 0 && (chosen == .split || chosen == .fullCall) {
+            return .topCard
+        }
+        return chosen
+    }
+
+    /// 圓形頭像和頂部小窗：聆聽者是疊在自己畫面上的小圖。
+    private var showsSmallCompanion: Bool {
+        layout == .circle || layout == .topCard
+    }
+
+    /// 自己的畫面是不是佔滿預覽區。分割和視訊通話時自己的畫面變小，構圖框就不顯示。
+    private var cameraIsFull: Bool {
+        layout != .split && layout != .fullCall
+    }
 
     /// 有稿件時，構圖框只在開始提詞前顯示供對位；提詞開始後淡出。
     private var showGuide: Bool {
-        guard settings.showGuide else { return false }
+        guard settings.showGuide, cameraIsFull else { return false }
         if settings.usesPrompter && (prompter.isPlaying || prompter.offset > 0) { return false }
         return true
     }
 
     var body: some View {
         ZStack(alignment: .top) {
-            CameraPreviewView(camera: camera)
+            stage
 
             if showGuide {
                 FramingGuideView(faces: camera.faces, scale: CGFloat(settings.guideScale), angle: angle)
@@ -293,10 +328,8 @@ private struct PreviewStack: View {
                 .padding(.top, 8)
             }
 
-            if settings.companionMode {
-                let side = min(size.width * 0.34, 150)
-                CompanionView(model: companion)
-                    .turned(angle, width: side, height: side)
+            if showsSmallCompanion {
+                smallCompanion
                     .padding(.top, 12)
                     .transition(.opacity)
             }
@@ -337,6 +370,59 @@ private struct PreviewStack: View {
             }
         }
         .animation(.easeInOut(duration: 0.3), value: showGuide)
+    }
+
+    /// 最底層：自己的前鏡頭畫面，分割和視訊通話時再加上滿版的聆聽者。
+    @ViewBuilder
+    private var stage: some View {
+        switch layout {
+        case .split?:
+            VStack(spacing: 0) {
+                CompanionView(player: clipPlayer)
+                    .frame(width: size.width, height: size.height * 0.5)
+                CameraPreviewView(camera: camera, fill: true)
+                    .frame(width: size.width, height: size.height * 0.5)
+                    .clipShape(UnevenRoundedRectangle(topLeadingRadius: 18, topTrailingRadius: 18, style: .continuous))
+            }
+        case .fullCall?:
+            ZStack(alignment: .bottomTrailing) {
+                CompanionView(player: clipPlayer)
+                    .frame(width: size.width, height: size.height)
+                selfWindow
+            }
+        default:
+            CameraPreviewView(camera: camera)
+        }
+    }
+
+    /// 視訊通話時，自己的畫面縮成右下角的 9:16 小窗。
+    private var selfWindow: some View {
+        let width = size.width * 0.28
+        return CameraPreviewView(camera: camera)
+            .frame(width: width, height: width * 16 / 9)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(.white.opacity(0.3), lineWidth: 1)
+            )
+            .padding(.trailing, 12)
+            .padding(.bottom, bottomInset + 12)
+    }
+
+    /// 圓形頭像和頂部小窗：鏡頭正下方的小聆聽者。橫放時整個轉過來。
+    private var smallCompanion: some View {
+        let isCircle = layout == .circle
+        let width: CGFloat = isCircle ? min(size.width * 0.34, 150) : min(size.width * 0.30, 128)
+        let height: CGFloat = isCircle ? width : width * 16 / 9
+        let shape: AnyShape = isCircle
+            ? AnyShape(Circle())
+            : AnyShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        let sideways = angle != 0
+        return CompanionView(player: clipPlayer, faceZoom: isCircle)
+            .frame(width: width, height: height)
+            .clipShape(shape)
+            .overlay(shape.stroke(.white.opacity(0.2), lineWidth: 1))
+            .turned(angle, width: sideways ? height : width, height: sideways ? width : height)
     }
 }
 

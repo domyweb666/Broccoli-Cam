@@ -20,10 +20,17 @@ struct SettingsView: View {
                         Text("陪伴").tag(true)
                     }
                     .pickerStyle(.segmented)
+                    if settings.companionMode {
+                        Picker("聆聽者擺法", selection: $settings.companionLayout) {
+                            ForEach(CompanionLayout.allCases) { layout in
+                                Text(layout.label).tag(layout)
+                            }
+                        }
+                    }
                 } header: {
                     Text("模式")
                 } footer: {
-                    Text("提詞：照著稿子唸。陪伴：不看稿，鏡頭旁邊有一位聆聽者，你講話時它會點頭，適合知道要說什麼、但對著鏡頭會緊張的時候。聆聽者不會錄進影片。")
+                    Text("提詞：照著稿子唸。陪伴：不看稿，對面有一位聆聽者專心聽你講，你講話時她會點頭，適合知道要說什麼、但對著鏡頭會緊張的時候。聆聽者不會錄進影片。\n\n聆聽者擺法：圓形頭像和頂部小窗放在鏡頭正下方；上下分割是她在上半、你在下半；視訊通話是她滿版、你縮在右下角。手機橫放時，上下分割和視訊通話會改用頂部小窗。")
                 }
 
                 Section("影片") {

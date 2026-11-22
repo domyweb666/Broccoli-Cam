@@ -8,3 +8,7 @@ DerivedData/
 # 沒選上的聆聽者候選圖，只留在本機
 docs/聆聽者定格圖/未選/
 __pycache__/
+# 聆聽者原始短片（Higgsfield 下載），轉好的在上一層
+docs/聆聽者短片/原始/
+# 轉好的短片和 App 資源重複，以 BroccoliCam/Resources/Companion 為準；串接預覽只留本機
+docs/聆聽者短片/*.mp4

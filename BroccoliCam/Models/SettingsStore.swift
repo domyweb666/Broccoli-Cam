@@ -11,6 +11,29 @@ enum VideoResolution: String, CaseIterable, Identifiable {
     var height: Int32 { self == .uhd4k ? 2160 : 1080 }
 }
 
+/// 陪伴模式裡聆聽者放在哪裡。四種都做，多米在真機上切著比。
+enum CompanionLayout: String, CaseIterable, Identifiable {
+    /// 鏡頭下方一個小圓（原本的做法）
+    case circle
+    /// 鏡頭下方一張 9:16 小卡
+    case topCard
+    /// 聆聽者上半，自己的畫面下半
+    case split
+    /// 聆聽者滿版，自己縮在角落（像視訊通話）
+    case fullCall
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .circle: return "圓形頭像"
+        case .topCard: return "頂部小窗"
+        case .split: return "上下分割"
+        case .fullCall: return "視訊通話"
+        }
+    }
+}
+
 /// 使用者偏好。全部存在 UserDefaults，改了就寫入。
 final class SettingsStore: ObservableObject {
     private let defaults = UserDefaults.standard
@@ -50,6 +73,8 @@ final class SettingsStore: ObservableObject {
 
     /// 陪伴模式：不看稿，畫面上有一位聆聽者。關閉就是提詞模式。
     @Published var companionMode: Bool { didSet { defaults.set(companionMode, forKey: "companionMode") } }
+    /// 陪伴模式的聆聽者擺法
+    @Published var companionLayout: CompanionLayout { didSet { defaults.set(companionLayout.rawValue, forKey: "companionLayout") } }
     /// 手機橫放時錄橫式 16:9
     @Published var autoLandscape: Bool { didSet { defaults.set(autoLandscape, forKey: "autoLandscape") } }
 
@@ -74,6 +99,7 @@ final class SettingsStore: ObservableObject {
         voiceFollow = (d.object(forKey: "voiceFollow") as? Bool) ?? false
         subtitleMaxChars = (d.object(forKey: "subtitleMaxChars") as? Double) ?? 14
         companionMode = (d.object(forKey: "companionMode") as? Bool) ?? false
+        companionLayout = CompanionLayout(rawValue: d.string(forKey: "companionLayout") ?? "") ?? .fullCall
         autoLandscape = (d.object(forKey: "autoLandscape") as? Bool) ?? true
         showDebug = (d.object(forKey: "showDebug") as? Bool) ?? false
     }
