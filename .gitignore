@@ -7,3 +7,4 @@ DerivedData/
 
 # 沒選上的聆聽者候選圖，只留在本機
 docs/聆聽者定格圖/未選/
+__pycache__/
