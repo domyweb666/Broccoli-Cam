@@ -10,6 +10,7 @@ enum FramingStatus {
 
 /// 接收 AVCaptureMetadataOutput 回報的臉部矩形（已換算成預覽畫面座標）。
 /// 只比較位置與大小，不辨識身份、不分析情緒、不處理影格。
+/// 開防抖時看到的畫面外圍被裁掉一圈，但這裡的座標還是沒裁的，會差幾個百分點，構圖判斷容得下。
 final class FaceDetectionService: ObservableObject {
     @Published private(set) var faceRect: CGRect?
 

@@ -2,7 +2,7 @@ import Foundation
 import AVFoundation
 
 /// 收音狀態與說話／停頓偵測。
-/// 音量來源是錄影輸出音訊連線的 audioChannels（由 CameraService 提供），
+/// 音量來源是相機音訊分流的 RMS（由 CameraService 提供），
 /// 不另開 AVAudioEngine，避免兩套音訊管線搶麥克風。不做語意理解。
 final class SpeechActivityMonitor: ObservableObject {
     enum MicStatus {
@@ -16,7 +16,7 @@ final class SpeechActivityMonitor: ObservableObject {
     @Published private(set) var isSpeaking = false
     @Published private(set) var route = "—"
 
-    /// 回傳目前平均音量（dB）；沒有音訊連線時回傳 nil。
+    /// 回傳目前平均音量（dBFS）；半秒沒收到音訊時回傳 nil。
     var levelProvider: (() -> Float?)?
 
     private var timer: Timer?

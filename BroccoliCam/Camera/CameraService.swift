@@ -3,6 +3,7 @@ import UIKit
 
 /// 前鏡頭、預覽、錄影、格式、權限、中斷處理。
 /// 所有 session 操作都在 sessionQueue，不在主執行緒做重工作。
+/// 影格走 FramePipeline（逐格處理、預覽），寫檔走 FrameRecorder。
 final class CameraService: NSObject, ObservableObject {
     enum Authorization {
         case unknown
@@ -15,6 +16,8 @@ final class CameraService: NSObject, ObservableObject {
     @Published private(set) var isRecording = false
     @Published private(set) var availableResolutions: [VideoResolution] = [.hd1080]
     @Published private(set) var availableFPS: [VideoResolution: [Int]] = [.hd1080: [30]]
+    /// 目前格式支援的防抖強度，一定含 .off。
+    @Published private(set) var availableStabilizations: [StabilizationLevel] = [.off]
     @Published private(set) var activeFormatText = "—"
     @Published private(set) var interruptionText: String?
     @Published private(set) var lastError: String?
@@ -23,6 +26,11 @@ final class CameraService: NSObject, ObservableObject {
     let session = AVCaptureSession()
     let faces = FaceDetectionService()
     let meter = SpeechActivityMonitor()
+
+    /// 這次錄影的第一格畫面，比 isRecording 變成 true 早了幾秒。
+    /// 開防抖時影格會晚幾百毫秒才送到，用錄影時間推算影片裡的位置時要加上這個值。
+    /// 在 isRecording 變成 true 之前就會更新（主執行緒）。
+    private(set) var recordingLag: TimeInterval = 0
 
     /// 錄影檔完成（主執行緒回呼）。
     var onRecordingFinished: ((URL) -> Void)?
@@ -47,28 +55,56 @@ final class CameraService: NSObject, ObservableObject {
 
     private let sessionQueue = DispatchQueue(label: "org.domyweb.broccolicam.session")
     private let metadataQueue = DispatchQueue(label: "org.domyweb.broccolicam.metadata")
-    private let movieOutput = AVCaptureMovieFileOutput()
+    private let analysisQueue = DispatchQueue(label: "org.domyweb.broccolicam.analysis", qos: .userInitiated)
+    private let pipeline = FramePipeline()
+    private let videoDataOutput = AVCaptureVideoDataOutput()
     private let metadataOutput = AVCaptureMetadataOutput()
-    /// 語音跟隨用的音訊分流。只有設定打開時才掛上去，沒開就和原本的錄影管線完全一樣。
+    /// 音訊一律從這裡出來：錄影、音量、語音跟隨三家共用。
     private let audioDataOutput = AVCaptureAudioDataOutput()
     private let audioQueue = DispatchQueue(label: "org.domyweb.broccolicam.audio")
+    private let audioLevel = AudioLevelTap()
     private let audioTapLock = NSLock()
     private var storedAudioSampleHandler: ((CMSampleBuffer) -> Void)?
-    private var audioTapCount = 0
-    private var audioTapAttached = false
+    private var audioPacketCount = 0
     private var videoDevice: AVCaptureDevice?
     private var isConfigured = false
     private var desiredResolution: VideoResolution = .hd1080
     private var desiredFPS = 30
+    private var desiredStabilization: StabilizationLevel = .off
     private var mirrorOutput = false
+    /// 目前格式實際的幀率，sessionQueue 讀寫。
+    private var activeFPS = 30
+
+    // 畫面優化。lookLock 保護這一組。
+    private let lookLock = NSLock()
+    private var look = LookParams.neutral
+    private var lookEnabled = false
+    /// 一鍵優化時把測光移到的位置（裝置座標）。nil 是中央。
+    private var meteringPoint: CGPoint?
+    private var isOptimizing = false
+    private var exposureApplyQueued = false
+
+    // 主執行緒用
+    private var metalPreviewOn = false
+    private var onMetalPreview: ((Bool) -> Void)?
+    /// 錄影期間向系統多要一點背景時間，來電或切走時檔案才收得完。
+    private var recordingTask: UIBackgroundTaskIdentifier = .invalid
+    private var lastFaceUIUpdate: CFTimeInterval = 0
+
+    /// metadataQueue 用
     private var lastFaceUpdate: CFTimeInterval = 0
     private weak var previewLayer: AVCaptureVideoPreviewLayer?
     /// 依裝置問出正確的旋轉角度。iPhone 17 的前鏡頭感光元件裝的方向和舊機型差 90 度，
     /// 不能寫死 90 度。只在主執行緒建立與讀取。
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private var rotationObservation: NSKeyValueObservation?
-    /// 錄影要用的角度，主執行緒更新、sessionQueue 讀取。
+    private var captureObservation: NSKeyValueObservation?
+    /// 影格連線的角度（一律是直式），sessionQueue 讀寫。
     private var captureRotationAngle: CGFloat = 90
+    /// 上次交給 sessionQueue 的角度，主執行緒用。
+    private var lastSentAngle: CGFloat = 90
+    /// 最近一次手機橫放時，錄影角度和直式差幾度（±90）。主執行緒用。
+    private var lastLandscapeTurn: Int?
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -79,7 +115,7 @@ final class CameraService: NSObject, ObservableObject {
     override init() {
         super.init()
         meter.levelProvider = { [weak self] in
-            self?.currentAudioLevel()
+            self?.audioLevel.current()
         }
         let nc = NotificationCenter.default
         nc.addObserver(self, selector: #selector(sessionWasInterrupted(_:)),
@@ -90,6 +126,14 @@ final class CameraService: NSObject, ObservableObject {
                        name: AVCaptureSession.runtimeErrorNotification, object: session)
         nc.addObserver(self, selector: #selector(audioRouteChanged(_:)),
                        name: AVAudioSession.routeChangeNotification, object: nil)
+        nc.addObserver(self, selector: #selector(appEnteredBackground(_:)),
+                       name: UIApplication.didEnterBackgroundNotification, object: nil)
+        nc.addObserver(self, selector: #selector(appWillEnterForeground(_:)),
+                       name: UIApplication.willEnterForegroundNotification, object: nil)
+        // 要先讀過一次溫度狀態，系統才會發通知。
+        updateThermalLimit()
+        nc.addObserver(self, selector: #selector(thermalStateChanged(_:)),
+                       name: ProcessInfo.thermalStateDidChangeNotification, object: nil)
         refreshAuthorization()
     }
 
@@ -124,22 +168,28 @@ final class CameraService: NSObject, ObservableObject {
 
     // MARK: - Session 生命週期
 
-    /// 啟動（或以新設定重新套用）相機。錄影中呼叫只會更新設定值，不會改格式。
-    func start(resolution: VideoResolution, fps: Int, mirrorOutput: Bool, speechTap: Bool = false) {
+    /// 啟動（或以新設定重新套用）相機。錄影中呼叫只會更新設定值，不會改格式。請在主執行緒呼叫。
+    func start(resolution: VideoResolution, fps: Int, mirrorOutput: Bool,
+               stabilization: StabilizationLevel = .off) {
         let angle = currentCaptureAngle()
+        lastSentAngle = angle
         sessionQueue.async {
-            self.captureRotationAngle = angle
             self.desiredResolution = resolution
             self.desiredFPS = fps
             self.mirrorOutput = mirrorOutput
+            self.desiredStabilization = stabilization
             if !self.isConfigured {
                 self.configureSession()
             }
             guard self.isConfigured else { return }
-            if !self.movieOutput.isRecording {
-                self.applySpeechTap(speechTap)
+            if !self.pipeline.isRecording {
+                self.captureRotationAngle = angle
+                self.session.beginConfiguration()
                 self.applyFormat()
                 self.updateConnections()
+                self.session.commitConfiguration()
+                // 換格式會把曝光補償和測光點洗掉，補回來。
+                self.applyLookToDevice()
             }
             if !self.session.isRunning {
                 self.session.startRunning()
@@ -150,6 +200,7 @@ final class CameraService: NSObject, ObservableObject {
                 self.setUpRotationCoordinator()
                 self.applyPreviewRotation()
                 self.schedulePreviewRotationRetries()
+                self.refreshMetalPreview()
                 if running { self.meter.start() }
             }
         }
@@ -157,9 +208,8 @@ final class CameraService: NSObject, ObservableObject {
 
     func stop() {
         sessionQueue.async {
-            if self.movieOutput.isRecording {
-                self.movieOutput.stopRecording()
-            }
+            // 先把檔案收好，再停相機。
+            self.finishRecordingNow()
             if self.session.isRunning {
                 self.session.stopRunning()
             }
@@ -168,6 +218,29 @@ final class CameraService: NSObject, ObservableObject {
                 self.meter.stop()
                 self.faces.update(nil)
             }
+        }
+    }
+
+    // MARK: - 預覽
+
+    /// 給預覽 view 掛圖層用。
+    var previewRenderer: MetalPreviewRenderer { pipeline.renderer }
+
+    /// 預覽 view 登記：需要（或不再需要）疊上處理過的畫面時會被呼叫。請在主執行緒呼叫。
+    func attachMetalPreview(_ handler: @escaping (Bool) -> Void) {
+        onMetalPreview = handler
+        metalPreviewOn = pipeline.needsMetalPreview
+        handler(metalPreviewOn)
+    }
+
+    /// 有逐格處理或有開防抖才疊上處理過的畫面，不然直接看原生預覽。
+    private func refreshMetalPreview() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let needed = self.pipeline.needsMetalPreview
+            guard needed != self.metalPreviewOn else { return }
+            self.metalPreviewOn = needed
+            self.onMetalPreview?(needed)
         }
     }
 
@@ -188,6 +261,11 @@ final class CameraService: NSObject, ObservableObject {
                 self?.applyPreviewRotation()
             }
         }
+        captureObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.new]) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.noteLandscapeTurn()
+            }
+        }
         log("旋轉協調器 預覽=\(Int(coordinator.videoRotationAngleForHorizonLevelPreview)) 錄影=\(Int(coordinator.videoRotationAngleForHorizonLevelCapture))")
     }
 
@@ -196,7 +274,7 @@ final class CameraService: NSObject, ObservableObject {
         rotationCoordinator?.videoRotationAngleForHorizonLevelPreview ?? 90
     }
 
-    /// 錄影應該轉幾度。App 鎖直式，所以用預覽的角度，不跟著手機傾斜改變。
+    /// 影格應該轉幾度。App 鎖直式，所以用預覽的角度，不跟著手機傾斜改變。
     private func currentCaptureAngle() -> CGFloat {
         guard let coordinator = rotationCoordinator else { return 90 }
         return coordinator.videoRotationAngleForHorizonLevelPreview
@@ -208,16 +286,56 @@ final class CameraService: NSObject, ObservableObject {
         return coordinator.videoRotationAngleForHorizonLevelCapture
     }
 
+    /// 橫式錄影時，直式影格還要再順時針轉幾度：+90、-90，或 0（問不到）。請在主執行緒呼叫。
+    ///
+    /// videoRotationAngle 是「感光元件的畫面要順時針轉幾度」。直式影格 = 轉了直式角度，
+    /// 橫式成品 = 轉橫式角度，所以差值就是還要再轉的角度。
+    /// 舊機型直式 90、橫式 180／0；iPhone 17 直式 0、橫式 90／270，差值都是 +90／-90。
+    private func currentLandscapeTurn() -> Int {
+        noteLandscapeTurn()
+        // 手機快要平放時重力判斷和 UIDevice 的方向會不一致，用最近一次橫放的方向。
+        return lastLandscapeTurn ?? 0
+    }
+
+    /// 現在是橫放的話，記下差幾度。
+    private func noteLandscapeTurn() {
+        let turn = Self.normalizedTurn(currentLandscapeAngle() - currentCaptureAngle())
+        if turn == 90 || turn == -90 {
+            lastLandscapeTurn = turn
+        }
+    }
+
+    /// 收成 -90、0、90、180。
+    private static func normalizedTurn(_ degrees: CGFloat) -> Int {
+        let quarter = Int((degrees / 90).rounded())
+        let steps = ((quarter % 4) + 4) % 4
+        return steps == 3 ? -90 : steps * 90
+    }
+
     /// 把預覽轉成直式。請在主執行緒呼叫。
     /// 預覽層的連線要等 session 設定完才會出現，所以會被多處重複呼叫：
     /// 掛上預覽層、session 啟動後、預覽 view 重新排版、中斷結束。
     func applyPreviewRotation() {
+        syncCaptureAngle()
         guard let connection = previewLayer?.connection else {
             notePreviewRotation("預覽連線還沒建立")
             return
         }
         Self.apply(currentPreviewAngle(), to: connection)
         notePreviewRotation("預覽旋轉=\(Int(connection.videoRotationAngle))")
+    }
+
+    /// 影格連線的角度跟著預覽走。RotationCoordinator 要等預覽層和相機都好了才問得到，
+    /// 第一次啟動時可能先用了預設的 90 度，這裡補正。
+    private func syncCaptureAngle() {
+        let angle = currentCaptureAngle()
+        guard angle != lastSentAngle else { return }
+        lastSentAngle = angle
+        sessionQueue.async {
+            guard self.isConfigured, !self.pipeline.isRecording else { return }
+            self.captureRotationAngle = angle
+            self.updateConnections()
+        }
     }
 
     /// session 剛啟動的頭幾秒再補套幾次，避免連線建立得比較晚而漏掉。
@@ -250,6 +368,8 @@ final class CameraService: NSObject, ObservableObject {
 
     private func configureSession() {
         session.beginConfiguration()
+        // 全程 709 SDR，不要被系統切到廣色域。
+        session.automaticallyConfiguresCaptureDeviceForWideColor = false
 
         guard let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
             session.commitConfiguration()
@@ -286,15 +406,28 @@ final class CameraService: NSObject, ObservableObject {
             log("找不到麥克風")
         }
 
-        if session.canAddOutput(movieOutput) {
-            session.addOutput(movieOutput)
+        if session.canAddOutput(videoDataOutput) {
+            session.addOutput(videoDataOutput)
         } else {
             session.commitConfiguration()
-            fail("無法加入錄影輸出")
+            fail("無法加入影格輸出")
             return
         }
+        // 影格大小要跟格式一樣，不要被縮成預覽大小。
+        videoDataOutput.automaticallyConfiguresOutputBufferDimensions = false
+        videoDataOutput.deliversPreviewSizedOutputBuffers = false
+        videoDataOutput.alwaysDiscardsLateVideoFrames = true
+        choosePixelFormat()
+        videoDataOutput.setSampleBufferDelegate(pipeline, queue: pipeline.videoQueue)
 
-        // 臉部定位：相機內建的臉部中繼資料，不另接影格輸出。失敗時 App 仍可錄影。
+        if session.canAddOutput(audioDataOutput) {
+            session.addOutput(audioDataOutput)
+            audioDataOutput.setSampleBufferDelegate(self, queue: audioQueue)
+        } else {
+            log("無法加入音訊輸出，只能錄畫面")
+        }
+
+        // 臉部定位：相機內建的臉部中繼資料，不自己跑辨識。失敗時 App 仍可錄影。
         if session.canAddOutput(metadataOutput) {
             session.addOutput(metadataOutput)
             metadataOutput.setMetadataObjectsDelegate(self, queue: metadataQueue)
@@ -313,26 +446,16 @@ final class CameraService: NSObject, ObservableObject {
         log("相機設定完成")
     }
 
-    /// 掛上或拿掉語音跟隨用的音訊分流。請在 sessionQueue 呼叫，錄影中不要動。
-    private func applySpeechTap(_ wanted: Bool) {
-        guard wanted != audioTapAttached else { return }
-        session.beginConfiguration()
-        if wanted {
-            if session.canAddOutput(audioDataOutput) {
-                session.addOutput(audioDataOutput)
-                audioDataOutput.setSampleBufferDelegate(self, queue: audioQueue)
-                audioTapAttached = true
-                log("語音分流已掛上")
-            } else {
-                log("無法加入語音分流輸出")
-            }
-        } else {
-            audioDataOutput.setSampleBufferDelegate(nil, queue: nil)
-            session.removeOutput(audioDataOutput)
-            audioTapAttached = false
-            log("語音分流已拿掉")
-        }
-        session.commitConfiguration()
+    /// 影格用 420v（和編碼器要的一樣，不用轉檔）。沒有就退而求其次。
+    private func choosePixelFormat() {
+        let available: [OSType] = videoDataOutput.availableVideoPixelFormatTypes
+        let wanted: [OSType] = [
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelFormatType_32BGRA
+        ]
+        guard let type = wanted.first(where: { available.contains($0) }) ?? available.first else { return }
+        videoDataOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: type)]
     }
 
     private func computeCapabilities(_ device: AVCaptureDevice) {
@@ -395,11 +518,17 @@ final class CameraService: NSObject, ObservableObject {
                 break
             }
         }
+        // 格式由我們指定，不要讓 session 的 preset 又改回去。
+        let preset: AVCaptureSession.Preset = chosen == nil ? .high : .inputPriority
+        if session.sessionPreset != preset, session.canSetSessionPreset(preset) {
+            session.sessionPreset = preset
+        }
         do {
             try device.lockForConfiguration()
             if let (format, fps) = chosen {
                 if device.activeFormat != format {
                     device.activeFormat = format
+                    pipeline.forgetFrameSize()
                 }
                 let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
                 device.activeVideoMinFrameDuration = duration
@@ -415,6 +544,9 @@ final class CameraService: NSObject, ObservableObject {
             if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
                 device.whiteBalanceMode = .continuousAutoWhiteBalance
             }
+            if device.activeColorSpace != .sRGB, device.activeFormat.supportedColorSpaces.contains(.sRGB) {
+                device.activeColorSpace = .sRGB
+            }
             device.unlockForConfiguration()
         } catch {
             log("格式設定失敗：\(error.localizedDescription)")
@@ -424,6 +556,7 @@ final class CameraService: NSObject, ObservableObject {
         let dims = CMVideoFormatDescriptionGetDimensions(active.formatDescription)
         let fourCC = Self.fourCCString(CMFormatDescriptionGetMediaSubType(active.formatDescription))
         let actualFPS = chosen?.1 ?? Int(maxFrameRate(active))
+        activeFPS = max(1, actualFPS)
         let text = "\(dims.width)x\(dims.height) @\(actualFPS)fps \(fourCC)（要求 \(desiredResolution.label)/\(desiredFPS)）"
         DispatchQueue.main.async {
             self.activeFormatText = text
@@ -431,59 +564,452 @@ final class CameraService: NSObject, ObservableObject {
         log("格式 \(text)")
     }
 
+    /// 影格連線的方向、鏡像、防抖。值沒變就不動，改了會讓畫面斷一下。錄影中不要呼叫。
     private func updateConnections() {
-        guard let connection = movieOutput.connection(with: .video) else { return }
+        guard let connection = videoDataOutput.connection(with: .video) else { return }
         Self.apply(captureRotationAngle, to: connection)
         if connection.isVideoMirroringSupported {
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = mirrorOutput
+            if connection.isVideoMirrored != mirrorOutput {
+                connection.isVideoMirrored = mirrorOutput
+            }
         }
+        pipeline.setMirrored(connection.isVideoMirrored)
+        applyStabilization(to: connection)
+    }
+
+    // MARK: - 防抖
+
+    /// 設防抖並更新支援清單。設定裡選的強度這個格式不支援，就往下退。
+    private func applyStabilization(to connection: AVCaptureConnection) {
+        let standard = stabilizationMode(.standard, connection: connection)
+        let strong = stabilizationMode(.strong, connection: connection)
+        var levels: [StabilizationLevel] = [.off]
+        if standard != nil { levels.append(.standard) }
+        if strong != nil { levels.append(.strong) }
+
+        let mode: AVCaptureVideoStabilizationMode
+        switch desiredStabilization {
+        case .off: mode = .off
+        case .standard: mode = standard ?? .off
+        case .strong: mode = strong ?? standard ?? .off
+        }
+        if connection.isVideoStabilizationSupported, connection.preferredVideoStabilizationMode != mode {
+            connection.preferredVideoStabilizationMode = mode
+            log("防抖 \(Self.stabilizationText(mode))")
+        }
+        pipeline.setStabilized(mode != .off)
+        refreshMetalPreview()
+        DispatchQueue.main.async {
+            if self.availableStabilizations != levels {
+                self.availableStabilizations = levels
+            }
+        }
+    }
+
+    /// 這個強度在目前格式上要用哪一種模式，不支援回 nil。
+    private func stabilizationMode(_ level: StabilizationLevel,
+                                   connection: AVCaptureConnection) -> AVCaptureVideoStabilizationMode? {
+        guard connection.isVideoStabilizationSupported, let format = videoDevice?.activeFormat else { return nil }
+        let candidates: [AVCaptureVideoStabilizationMode]
+        switch level {
+        case .off: candidates = [.off]
+        case .standard: candidates = [.standard]
+        case .strong: candidates = [.cinematicExtended, .cinematic]
+        }
+        return candidates.first { format.isVideoStabilizationModeSupported($0) }
+    }
+
+    private static func stabilizationText(_ mode: AVCaptureVideoStabilizationMode) -> String {
+        if mode == .off { return "關" }
+        if mode == .standard { return "標準" }
+        if mode == .cinematic { return "電影" }
+        if mode == .cinematicExtended { return "電影加強" }
+        if mode == .auto { return "自動" }
+        return "代碼 \(mode.rawValue)"
     }
 
     // MARK: - 錄影
 
-    /// landscape：手機橫放，要錄成橫式 16:9。角度交給 RotationCoordinator 依手機實際的擺法決定。
+    /// 影格時間用的時鐘。
+    private func captureTime() -> CMTime {
+        CMClockGetTime(session.synchronizationClock ?? CMClockGetHostTimeClock())
+    }
+
+    /// landscape：手機橫放，要錄成橫式 16:9。角度交給 RotationCoordinator 依手機實際的擺法決定。請在主執行緒呼叫。
     func startRecording(landscape: Bool = false) {
-        let angle = landscape ? currentLandscapeAngle() : currentCaptureAngle()
+        let turn = landscape ? currentLandscapeTurn() : 0
         if landscape {
-            log("橫式錄影 角度=\(Int(angle))")
+            log("橫式錄影 再轉 \(turn) 度")
         }
         sessionQueue.async {
-            self.captureRotationAngle = angle
-            guard self.isConfigured, self.session.isRunning else {
+            guard self.isConfigured, self.session.isRunning, !self.session.isInterrupted else {
                 self.log("相機尚未就緒，無法錄影")
                 DispatchQueue.main.async { self.onRecordingFailed?() }
                 return
             }
-            guard !self.movieOutput.isRecording else { return }
-            self.updateConnections()
-            if let connection = self.movieOutput.connection(with: .video),
-               self.movieOutput.availableVideoCodecTypes.contains(.hevc) {
-                self.movieOutput.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: connection)
+            guard !self.pipeline.isRecording else { return }
+            do {
+                let recorder = try self.makeRecorder(turn: turn)
+                self.pipeline.setRecorder(recorder)
+                recorder.start(at: self.captureTime())
+            } catch {
+                let text = "無法開始錄影：\(error.localizedDescription)"
+                self.fail(text)
+                DispatchQueue.main.async { self.onRecordingFailed?() }
             }
-            let name = "broccoli-\(Int(Date().timeIntervalSince1970)).mov"
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-            try? FileManager.default.removeItem(at: url)
-            self.movieOutput.startRecording(to: url, recordingDelegate: self)
         }
     }
 
     func stopRecording() {
+        // 按下去的那一刻就是結尾，晚到的影格（防抖）還會收到這個時間為止。
+        let time = captureTime()
         sessionQueue.async {
-            if self.movieOutput.isRecording {
-                self.movieOutput.stopRecording()
+            self.pipeline.recorder?.stop(at: time)
+        }
+    }
+
+    /// 馬上把手上的檔案收好（中斷、進背景、相機要停）。任何執行緒都能呼叫；沒在錄就沒事。
+    private func finishRecordingNow() {
+        guard let recorder = pipeline.recorder, recorder.isActive else { return }
+        log("錄影提前收尾")
+        recorder.finishNow(at: captureTime())
+    }
+
+    /// 建立寫檔器。成品是正的影格，不靠 transform：直式 1080×1920，橫式 1920×1080。
+    ///
+    /// 鏡像時的轉向：影格 = 先轉直式角度、再左右鏡像。要的成品 = 先轉橫式角度、再左右鏡像。
+    /// 鏡像前後夾住一個旋轉，等於反方向的旋轉（M·R(θ)·M = R(-θ)），所以鏡像時再轉的方向要反過來。
+    private func makeRecorder(turn: Int) throws -> FrameRecorder {
+        let finalTurn = pipeline.isMirrored ? -turn : turn
+        let upright = pipeline.frameSize ?? expectedFrameSize()
+        let sideways = abs(finalTurn) == 90
+        let width = Int(sideways ? upright.height : upright.width)
+        let height = Int(sideways ? upright.width : upright.height)
+
+        let name = "broccoli-\(Int(Date().timeIntervalSince1970 * 1000)).mov"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try? FileManager.default.removeItem(at: url)
+
+        let recorder = try FrameRecorder(
+            url: url, width: width, height: height, turn: finalTurn,
+            videoSettings: videoSettings(width: width, height: height),
+            audioSettings: audioSettings(),
+            frameDuration: CMTime(value: 1, timescale: CMTimeScale(activeFPS)),
+            // 畫面流程那邊 3 秒沒開始就放棄，這裡要比它早。
+            startTimeout: 2.6,
+            // 加強防抖的影格會晚更久才到。
+            tailTimeout: desiredStabilization == .strong ? 2.0 : 1.0
+        )
+        recorder.onStarted = { [weak self] time in
+            self?.recordingStarted(firstFrame: time)
+        }
+        recorder.onEnded = { [weak self, weak recorder] outcome in
+            guard let self else { return }
+            if let recorder {
+                self.logCounts(of: recorder)
+                self.pipeline.clearRecorder(recorder)
+            }
+            self.recordingEnded(outcome)
+        }
+        log("準備錄影 \(width)x\(height) 音軌\(recorder.hasAudio ? "有" : "無")")
+        return recorder
+    }
+
+    /// 還沒收到影格時，用格式推估直式大小。
+    private func expectedFrameSize() -> CGSize {
+        guard let format = videoDevice?.activeFormat else { return CGSize(width: 1080, height: 1920) }
+        let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+        return CGSize(width: CGFloat(min(dims.width, dims.height)), height: CGFloat(max(dims.width, dims.height)))
+    }
+
+    private func videoSettings(width: Int, height: Int) -> [String: Any] {
+        let codecs = videoDataOutput.availableVideoCodecTypesForAssetWriter(writingTo: .mov)
+        let codec: AVVideoCodecType = codecs.contains(.hevc) ? .hevc : .h264
+        var settings: [String: Any] = [:]
+        if codecs.contains(codec) {
+            settings = videoDataOutput.recommendedVideoSettings(forVideoCodecType: codec,
+                                                                assetWriterOutputFileType: .mov) ?? [:]
+        }
+        settings[AVVideoCodecKey] = codec
+        settings[AVVideoWidthKey] = width
+        settings[AVVideoHeightKey] = height
+        return settings
+    }
+
+    /// 沒有麥克風就回 nil，只錄畫面。
+    private func audioSettings() -> [String: Any]? {
+        guard audioDataOutput.connection(with: .audio) != nil else { return nil }
+        if let recommended = audioDataOutput.recommendedAudioSettingsForAssetWriter(writingTo: .mov) {
+            return recommended
+        }
+        return [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 44100,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 128_000
+        ]
+    }
+
+    /// 第一格寫進去了。在寫檔器的鎖裡面被呼叫，只能丟到主執行緒。
+    private func recordingStarted(firstFrame: CMTime) {
+        let lag: Double = (captureTime() - firstFrame).seconds
+        log("開始錄影")
+        DispatchQueue.main.async {
+            self.recordingLag = lag.isFinite ? max(0, lag) : 0
+            self.beginRecordingTask()
+            self.isRecording = true
+        }
+    }
+
+    private func logCounts(of recorder: FrameRecorder) {
+        let counts = recorder.currentCounts
+        log("寫檔 \(counts.frames) 格，來不及 \(counts.notReady)，算圖失敗 \(counts.renderFailed)，聲音丟 \(counts.audioDropped)")
+    }
+
+    private func recordingEnded(_ outcome: FrameRecorder.Outcome) {
+        switch outcome {
+        case .finished(let url, let note):
+            if let note {
+                log("錄影結束時有錯誤：\(note)")
+            } else {
+                log("錄影完成")
+            }
+            DispatchQueue.main.async {
+                self.isRecording = false
+                if let note { self.lastError = note }
+                self.onRecordingFinished?(url)
+                self.endRecordingTask()
+            }
+        case .failed(let message):
+            log("錄影失敗：\(message)")
+            DispatchQueue.main.async {
+                self.isRecording = false
+                self.lastError = message
+                self.onRecordingFailed?()
+                self.endRecordingTask()
             }
         }
     }
 
-    // MARK: - 音量
+    /// 在前景不計時，進了背景才會用到。
+    private func beginRecordingTask() {
+        DispatchQueue.main.async {
+            guard self.recordingTask == .invalid else { return }
+            self.recordingTask = UIApplication.shared.beginBackgroundTask(withName: "broccoli-recording") { [weak self] in
+                self?.endRecordingTask()
+            }
+        }
+    }
 
-    /// 錄影輸出音訊連線的平均音量（dB）。沒有連線時回傳 nil。
-    private func currentAudioLevel() -> Float? {
-        guard let connection = movieOutput.connection(with: .audio) else { return nil }
-        let channels = connection.audioChannels
-        guard !channels.isEmpty else { return nil }
-        return channels.map { $0.averagePowerLevel }.max()
+    private func endRecordingTask() {
+        DispatchQueue.main.async {
+            guard self.recordingTask != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(self.recordingTask)
+            self.recordingTask = .invalid
+        }
+    }
+
+    // MARK: - 畫面優化
+
+    /// 任何時候都能呼叫，錄影中也即時生效。
+    /// 關掉或全是 0 時，曝光補償歸零、測光回中央。
+    func setLook(_ params: LookParams, enabled: Bool) {
+        let neutral = !enabled || params == LookParams.neutral
+        lookLock.lock()
+        look = params
+        lookEnabled = enabled
+        if neutral && !isOptimizing { meteringPoint = nil }
+        lookLock.unlock()
+        pipeline.setLook(params, enabled: enabled)
+        refreshMetalPreview()
+        queueExposureUpdate()
+    }
+
+    /// 按住比對用：只略過逐格處理，不動曝光補償。
+    func setLookBypassed(_ on: Bool) {
+        pipeline.setBypassed(on)
+    }
+
+    /// 拉滑桿時一秒會來很多次，排隊中就不重複排。
+    private func queueExposureUpdate() {
+        lookLock.lock()
+        let queued = exposureApplyQueued
+        exposureApplyQueued = true
+        lookLock.unlock()
+        guard !queued else { return }
+        sessionQueue.async {
+            self.lookLock.lock()
+            self.exposureApplyQueued = false
+            self.lookLock.unlock()
+            self.applyLookToDevice()
+        }
+    }
+
+    /// 把曝光補償和測光位置套到相機。請在 sessionQueue 呼叫。
+    /// 一鍵優化進行中由優化流程控制曝光，這裡先不動，結束後會再套一次。
+    private func applyLookToDevice() {
+        lookLock.lock()
+        let optimizing = isOptimizing
+        let active = lookEnabled && look != LookParams.neutral
+        let bias = active ? look.exposure : 0
+        let point: CGPoint? = active ? meteringPoint : nil
+        lookLock.unlock()
+        guard !optimizing else { return }
+        applyExposure(bias: bias, point: point)
+    }
+
+    /// 請在 sessionQueue 呼叫。沒變就不鎖裝置。
+    private func applyExposure(bias: Double, point: CGPoint?) {
+        guard let device = videoDevice else { return }
+        let target: Float = min(max(Float(bias), device.minExposureTargetBias), device.maxExposureTargetBias)
+        let center = CGPoint(x: 0.5, y: 0.5)
+        let spot: CGPoint = point ?? center
+        let biasChanged = abs(device.exposureTargetBias - target) > 0.01
+        let exposureMoves = device.isExposurePointOfInterestSupported
+            && device.isExposureModeSupported(.continuousAutoExposure)
+            && Self.isFar(device.exposurePointOfInterest, spot)
+        let focusMoves = device.isFocusPointOfInterestSupported
+            && device.isFocusModeSupported(.continuousAutoFocus)
+            && Self.isFar(device.focusPointOfInterest, spot)
+        guard biasChanged || exposureMoves || focusMoves else { return }
+        do {
+            try device.lockForConfiguration()
+            // 位置要再設一次模式才會生效。
+            if exposureMoves {
+                device.exposurePointOfInterest = spot
+                device.exposureMode = .continuousAutoExposure
+            }
+            if focusMoves {
+                device.focusPointOfInterest = spot
+                device.focusMode = .continuousAutoFocus
+            }
+            if biasChanged {
+                device.setExposureTargetBias(target, completionHandler: nil)
+            }
+            device.unlockForConfiguration()
+        } catch {
+            log("曝光設定失敗：\(error.localizedDescription)")
+        }
+    }
+
+    private static func isFar(_ a: CGPoint, _ b: CGPoint) -> Bool {
+        abs(a.x - b.x) > 0.01 || abs(a.y - b.y) > 0.01
+    }
+
+    /// 一鍵優化：對臉測光、等曝光穩定、分析，回傳參數。主執行緒呼叫、主執行緒回呼。
+    /// 不套用，由呼叫端 setLook；smooth 由呼叫端補回。nil 代表沒有畫面可分析。
+    func optimizeLook(completion: @escaping (LookResult?) -> Void) {
+        lookLock.lock()
+        let busy = isOptimizing
+        if !busy { isOptimizing = true }
+        lookLock.unlock()
+        guard !busy else {
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
+        guard isSessionRunning, pipeline.hasRecentFrame else {
+            finishOptimizing()
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
+        // 臉在裝置座標的位置，用預覽層換算，方向、鏡像、機型差異都包含在裡面。
+        var point: CGPoint?
+        if let layer = previewLayer, let face = faces.faceRect {
+            let converted = layer.captureDevicePointConverted(fromLayerPoint: CGPoint(x: face.midX, y: face.midY))
+            if converted.x.isFinite, converted.y.isFinite {
+                point = CGPoint(x: min(max(converted.x, 0), 1), y: min(max(converted.y, 0), 1))
+            }
+        }
+        analysisQueue.async {
+            let result = self.runOptimization(point: point)
+            DispatchQueue.main.async {
+                if let result {
+                    self.log(String(format: "一鍵優化 臉=%@ 曝光=%.2f 色溫=%.0f 色調=%.0f 太暗=%@",
+                                    result.hasFace ? "有" : "無", result.params.exposure,
+                                    result.params.temperature, result.params.tint,
+                                    result.stillTooDark ? "是" : "否"))
+                } else {
+                    self.log("一鍵優化沒有畫面可分析")
+                }
+                self.lookLock.lock()
+                self.isOptimizing = false
+                self.lookLock.unlock()
+                // 呼叫端通常會在這裡面 setLook，那就直接接上剛剛的曝光，不會跳一下。
+                completion(result)
+                // 萬一呼叫端沒有採用，過一下把相機拉回目前存著的設定。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    self.queueExposureUpdate()
+                }
+            }
+        }
+    }
+
+    private func finishOptimizing() {
+        lookLock.lock()
+        isOptimizing = false
+        lookLock.unlock()
+    }
+
+    /// 在 analysisQueue 跑，中間會等影格、等曝光穩定。只讀原始影格，逐格處理不影響分析。
+    private func runOptimization(point: CGPoint?) -> LookResult? {
+        guard let device = sessionQueue.sync(execute: { self.videoDevice }),
+              let first = pipeline.grabSample(after: nil, timeout: 1.5),
+              let start = LookAnalyzer.measure(first) else { return nil }
+
+        // 第一次：測光移到臉上，順便把曝光推過去。
+        var exposure = LookAnalyzer.exposureBias(current: Double(device.exposureTargetBias), reading: start)
+        guard var reading = settle(device, exposure: exposure, point: point) else { return nil }
+        // 測光點換了，亮度會跟著變，差得多就再修一次。
+        let refined = LookAnalyzer.exposureBias(current: exposure, reading: reading)
+        if abs(refined - exposure) >= 0.2, let again = settle(device, exposure: refined, point: point) {
+            exposure = refined
+            reading = again
+        }
+
+        let size = pipeline.frameSize ?? CGSize(width: 1080, height: 1920)
+        let context = LookContext(
+            exposure: exposure,
+            iso: Double(device.iso),
+            maxISO: Double(device.activeFormat.maxISO),
+            exposureOffset: Double(device.exposureTargetOffset),
+            shortSide: Int(min(size.width, size.height))
+        )
+        lookLock.lock()
+        meteringPoint = point
+        lookLock.unlock()
+        return LookResult(params: LookAnalyzer.params(reading: reading, context: context),
+                          hasFace: reading.hasFace,
+                          stillTooDark: LookAnalyzer.isStillTooDark(reading: reading, context: context))
+    }
+
+    /// 套曝光，等穩定（最多 1.2 秒），再量一次。
+    private func settle(_ device: AVCaptureDevice, exposure: Double, point: CGPoint?) -> LookReading? {
+        sessionQueue.sync {
+            self.applyExposure(bias: exposure, point: point)
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+        var waited: TimeInterval = 0.3
+        while waited < 1.2, device.isAdjustingExposure {
+            Thread.sleep(forTimeInterval: 0.05)
+            waited += 0.05
+        }
+        guard let sample = pipeline.grabSample(after: captureTime(), timeout: 1.5) else { return nil }
+        return LookAnalyzer.measure(sample)
+    }
+
+    /// 除錯層用的一行。
+    private func lookText() -> String {
+        lookLock.lock()
+        let params = look
+        let on = lookEnabled
+        lookLock.unlock()
+        guard on else { return "優化 關" }
+        let bias: Float = videoDevice?.exposureTargetBias ?? 0
+        return String(format: "優化 曝光%.2f(實際%.2f) 溫%.0f 調%.0f 亮%.0f 暗%.0f 對%.0f 飽%.0f 噪%.0f 銳%.0f 膚%.0f",
+                      params.exposure, Double(bias), params.temperature, params.tint,
+                      params.highlights, params.shadows, params.contrast, params.vibrance,
+                      params.denoise, params.sharpen, params.smooth)
     }
 
     // MARK: - 通知
@@ -504,6 +1030,8 @@ final class CameraService: NSObject, ObservableObject {
             }
         }
         log(text)
+        // 中斷後不會再有影格，手上的檔案先收好。
+        finishRecordingNow()
         DispatchQueue.main.async {
             self.interruptionText = text
         }
@@ -521,6 +1049,7 @@ final class CameraService: NSObject, ObservableObject {
         let error = note.userInfo?[AVCaptureSessionErrorKey] as? AVError
         let text = "執行期錯誤：\(error?.localizedDescription ?? "未知")"
         log(text)
+        finishRecordingNow()
         DispatchQueue.main.async {
             self.lastError = text
         }
@@ -541,6 +1070,30 @@ final class CameraService: NSObject, ObservableObject {
         DispatchQueue.main.async {
             self.meter.refreshRoute()
             self.log("音訊路由變更：\(self.meter.route)")
+        }
+    }
+
+    @objc private func appEnteredBackground(_ note: Notification) {
+        // 背景不能用 GPU，也不會再有影格。
+        pipeline.setGPUAllowed(false)
+        finishRecordingNow()
+    }
+
+    @objc private func appWillEnterForeground(_ note: Notification) {
+        pipeline.setGPUAllowed(true)
+    }
+
+    @objc private func thermalStateChanged(_ note: Notification) {
+        updateThermalLimit()
+    }
+
+    /// 過熱就先不做降噪和柔膚，其他參數照舊。
+    private func updateThermalLimit() {
+        let state = ProcessInfo.processInfo.thermalState
+        let hot = state == .serious || state == .critical
+        pipeline.setHeavySkipped(hot)
+        if hot && pipeline.usesHeavyFilters {
+            log("手機過熱，先略過降噪和柔膚")
         }
     }
 
@@ -573,9 +1126,19 @@ final class CameraService: NSObject, ObservableObject {
         lines.append("裝置 \(Self.machineIdentifier) · iOS \(UIDevice.current.systemVersion)")
         lines.append("Session \(session.isRunning ? "執行中" : "已停止") · 錄影 \(isRecording ? "是" : "否")")
         lines.append("格式 \(activeFormatText)")
-        if let connection = movieOutput.connection(with: .video) {
-            lines.append("輸出 旋轉=\(Int(connection.videoRotationAngle)) 鏡像=\(connection.isVideoMirrored ? "是" : "否")")
+        if let connection = videoDataOutput.connection(with: .video) {
+            let size = pipeline.frameSize ?? .zero
+            lines.append("影格 \(Int(size.width))x\(Int(size.height)) 旋轉=\(Int(connection.videoRotationAngle)) 鏡像=\(connection.isVideoMirrored ? "是" : "否")")
+            lines.append("防抖 要求=\(Self.stabilizationText(connection.preferredVideoStabilizationMode)) 實際=\(Self.stabilizationText(connection.activeVideoStabilizationMode))")
         }
+        let frames = pipeline.currentCounts
+        let preview = pipeline.renderer.counts
+        lines.append("影格 收到 \(frames.frames) 丟 \(frames.late) · 預覽 \(metalPreviewOn ? "處理過" : "原生") 畫 \(preview.drawn) 略過 \(preview.skipped)")
+        if let recorder = pipeline.recorder {
+            let written = recorder.currentCounts
+            lines.append("寫檔 \(written.frames) 格 來不及 \(written.notReady) 算圖失敗 \(written.renderFailed) 聲音丟 \(written.audioDropped) · 音軌\(recorder.hasAudio ? "有" : "無")")
+        }
+        lines.append(lookText())
         if let connection = previewLayer?.connection {
             lines.append("預覽 旋轉=\(Int(connection.videoRotationAngle)) 支援90=\(connection.isVideoRotationAngleSupported(90) ? "是" : "否")")
         } else {
@@ -587,9 +1150,9 @@ final class CameraService: NSObject, ObservableObject {
             lines.append("協調器 未建立")
         }
         audioTapLock.lock()
-        let tapCount = audioTapCount
+        let packets = audioPacketCount
         audioTapLock.unlock()
-        lines.append("語音分流 收到 \(tapCount) 包")
+        lines.append("音訊 收到 \(packets) 包")
         lines.append("音訊路由 \(meter.route)")
         let mic: String
         switch meter.micStatus {
@@ -639,55 +1202,16 @@ final class CameraService: NSObject, ObservableObject {
     }
 }
 
-// MARK: - 錄影回呼
-
-extension CameraService: AVCaptureFileOutputRecordingDelegate {
-    func fileOutput(_ output: AVCaptureFileOutput,
-                    didStartRecordingTo fileURL: URL,
-                    from connections: [AVCaptureConnection]) {
-        log("開始錄影")
-        DispatchQueue.main.async {
-            self.isRecording = true
-        }
-    }
-
-    func fileOutput(_ output: AVCaptureFileOutput,
-                    didFinishRecordingTo outputFileURL: URL,
-                    from connections: [AVCaptureConnection],
-                    error: Error?) {
-        var usable = true
-        var message: String?
-        if let error = error as NSError? {
-            // 被中斷時檔案仍可能是完整可用的。
-            usable = (error.userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool) ?? false
-            message = "錄影結束時有錯誤：\(error.localizedDescription)"
-        }
-        if let message {
-            log(message)
-        } else {
-            log("錄影完成")
-        }
-        DispatchQueue.main.async {
-            self.isRecording = false
-            if usable {
-                self.onRecordingFinished?(outputFileURL)
-            } else {
-                self.lastError = message
-                try? FileManager.default.removeItem(at: outputFileURL)
-                self.onRecordingFailed?()
-            }
-        }
-    }
-}
-
-// MARK: - 語音分流
+// MARK: - 音訊
 
 extension CameraService: AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        audioLevel.consume(sampleBuffer)
+        pipeline.recorder?.appendAudio(sampleBuffer)
         audioTapLock.lock()
-        audioTapCount += 1
+        audioPacketCount += 1
         let handler = storedAudioSampleHandler
         audioTapLock.unlock()
         handler?(sampleBuffer)
@@ -700,9 +1224,9 @@ extension CameraService: AVCaptureMetadataOutputObjectsDelegate {
     func metadataOutput(_ output: AVCaptureMetadataOutput,
                         didOutput metadataObjects: [AVMetadataObject],
                         from connection: AVCaptureConnection) {
-        // UI 更新節流到每秒約 3 次，避免提示閃爍。
+        // 柔膚要跟著臉走，每秒約 10 次；畫面提示另外節流。
         let now = CACurrentMediaTime()
-        guard now - lastFaceUpdate > 0.33 else { return }
+        guard now - lastFaceUpdate > 0.09 else { return }
         lastFaceUpdate = now
 
         var largest: AVMetadataObject?
@@ -717,13 +1241,36 @@ extension CameraService: AVCaptureMetadataOutputObjectsDelegate {
         }
 
         DispatchQueue.main.async {
-            guard let face = largest,
-                  let layer = self.previewLayer,
-                  let converted = layer.transformedMetadataObject(for: face) else {
-                self.faces.update(nil)
-                return
+            let layer = self.previewLayer
+            var rect: CGRect?
+            if let face = largest, let converted = layer?.transformedMetadataObject(for: face) {
+                rect = converted.bounds
             }
-            self.faces.update(converted.bounds)
+            if let layer, let rect {
+                self.pipeline.setFace(self.frameRect(rect, in: layer))
+            }
+            // UI 更新節流到每秒約 3 次，避免提示閃爍。
+            guard now - self.lastFaceUIUpdate > 0.33 else { return }
+            self.lastFaceUIUpdate = now
+            self.faces.update(rect)
         }
+    }
+
+    /// 預覽層座標 → 影格座標（0…1，原點左上）。預覽層的換算已經處理好方向和裝置差異，
+    /// 這裡只差「預覽是鏡像、影格不一定是」。
+    /// 開防抖時影格外圍會被裁掉一圈，臉的位置會差幾個百分點，柔膚和測光都容得下。
+    private func frameRect(_ rect: CGRect, in layer: AVCaptureVideoPreviewLayer) -> CGRect? {
+        let whole = CGRect(x: 0, y: 0, width: 1, height: 1)
+        let video: CGRect = layer.layerRectConverted(fromMetadataOutputRect: whole).standardized
+        guard video.width > 1, video.height > 1 else { return nil }
+        let width: CGFloat = rect.width / video.width
+        let height: CGFloat = rect.height / video.height
+        var x: CGFloat = (rect.minX - video.minX) / video.width
+        let y: CGFloat = (rect.minY - video.minY) / video.height
+        let previewMirrored = layer.connection?.isVideoMirrored ?? true
+        if previewMirrored != pipeline.isMirrored {
+            x = 1 - x - width
+        }
+        return CGRect(x: x, y: y, width: width, height: height)
     }
 }

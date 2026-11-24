@@ -378,7 +378,8 @@ final class RecordingViewModel: ObservableObject {
     private func recordingChanged(_ recording: Bool) {
         if recording {
             phase = .recording
-            startDate = Date()
+            // 開防抖時影格晚到，影片第 0 秒比現在早，裁靜音的時間要對回去。
+            startDate = Date().addingTimeInterval(-(camera?.recordingLag ?? 0))
             elapsed = 0
             firstSound = nil
             lastSound = nil
