@@ -7,6 +7,8 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     /// 主畫面有錄好、還沒接起來的段落。
     var hasTakes = false
+    /// 字幕校對頁打開／關掉。
+    var onCaptionEditing: (Bool) -> Void = { _ in }
 
     @State private var speechDenied = false
     /// 想改成的分段設定，等使用者確認要丟掉已錄的段落。
@@ -172,7 +174,16 @@ struct SettingsView: View {
 
     private var subtitleSection: some View {
         Section {
-            LabeledSlider(title: "每行最多字數", value: $settings.subtitleMaxChars, range: 8...20, step: 1,
+            NavigationLink("字幕專案") {
+                CaptionListView(onEditing: onCaptionEditing)
+            }
+            CaptionStylePicker(style: $settings.captionStyle)
+                .padding(.vertical, 8)
+            LabeledSlider(title: "直式一行字數", value: $settings.captionCharsPortrait, range: 6...16, step: 1,
+                          display: "\(Int(settings.captionCharsPortrait)) 字")
+            LabeledSlider(title: "橫式一行字數", value: $settings.captionCharsLandscape, range: 8...24, step: 1,
+                          display: "\(Int(settings.captionCharsLandscape)) 字")
+            LabeledSlider(title: "SRT 每行最多字數", value: $settings.subtitleMaxChars, range: 8...20, step: 1,
                           display: "\(Int(settings.subtitleMaxChars)) 字")
         } header: {
             Text("字幕")

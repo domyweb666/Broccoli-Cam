@@ -284,7 +284,7 @@ struct RecordingView: View {
     private func sceneChanged(_ phase: ScenePhase) {
         switch phase {
         case .active:
-            if viewModel.review == nil { startCamera() }
+            if viewModel.review == nil && !viewModel.isCaptionEditing { startCamera() }
             clipPlayer.resume()
         case .background:
             viewModel.interrupt()
@@ -349,7 +349,7 @@ struct RecordingView: View {
             ScriptListView()
         }
         .sheet(isPresented: $showSettings, onDismiss: { viewModel.reconsiderScript() }) {
-            SettingsView(hasTakes: hasTakes)
+            SettingsView(hasTakes: hasTakes, onCaptionEditing: { open in captionEditing(open) })
         }
         .sheet(isPresented: $showModes, onDismiss: { viewModel.reconsiderScript() }) {
             ModeSheet()
@@ -474,6 +474,12 @@ struct RecordingView: View {
     private func askSpeechIfNeeded() {
         guard settings.voiceFollow, settings.usesPrompter, SpeechFollower.isUndetermined else { return }
         SpeechFollower.requestAuthorization { _ in }
+    }
+
+    /// 從設定打開或關掉字幕校對頁。校對頁自己會停相機，關掉再叫起來。
+    private func captionEditing(_ open: Bool) {
+        viewModel.isCaptionEditing = open
+        if !open { startCamera() }
     }
 
     private func startCamera() {

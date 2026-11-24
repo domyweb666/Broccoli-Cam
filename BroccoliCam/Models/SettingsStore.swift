@@ -154,6 +154,20 @@ final class SettingsStore: ObservableObject {
     @Published var voiceFollow: Bool { didSet { defaults.set(voiceFollow, forKey: "voiceFollow") } }
     /// 字幕每行最多幾個字
     @Published var subtitleMaxChars: Double { didSet { defaults.set(subtitleMaxChars, forKey: "subtitleMaxChars") } }
+    /// 燒進影片的字幕，直式一行最多幾個字
+    @Published var captionCharsPortrait: Double {
+        didSet { defaults.set(captionCharsPortrait, forKey: "captionCharsPortrait") }
+    }
+    /// 燒進影片的字幕，橫式一行最多幾個字
+    @Published var captionCharsLandscape: Double {
+        didSet { defaults.set(captionCharsLandscape, forKey: "captionCharsLandscape") }
+    }
+    /// 新的字幕專案用的樣式。已經建好的專案各自記各自的
+    @Published var captionStyle: CaptionStyle {
+        didSet {
+            if let data = try? JSONEncoder().encode(captionStyle) { defaults.set(data, forKey: "captionStyle") }
+        }
+    }
 
     /// 陪伴模式：不看稿，畫面上有一位聆聽者。關閉就是提詞模式。
     @Published var companionMode: Bool { didSet { defaults.set(companionMode, forKey: "companionMode") } }
@@ -213,6 +227,10 @@ final class SettingsStore: ObservableObject {
         trimSilence = (d.object(forKey: "trimSilence") as? Bool) ?? true
         voiceFollow = (d.object(forKey: "voiceFollow") as? Bool) ?? true
         subtitleMaxChars = (d.object(forKey: "subtitleMaxChars") as? Double) ?? 14
+        captionCharsPortrait = (d.object(forKey: "captionCharsPortrait") as? Double) ?? 12
+        captionCharsLandscape = (d.object(forKey: "captionCharsLandscape") as? Double) ?? 18
+        captionStyle = d.data(forKey: "captionStyle")
+            .flatMap { try? JSONDecoder().decode(CaptionStyle.self, from: $0) } ?? CaptionStyle()
         companionMode = (d.object(forKey: "companionMode") as? Bool) ?? false
         companionLayout = CompanionLayout(rawValue: d.string(forKey: "companionLayout") ?? "") ?? .fullCall
         companionPerson = CompanionPerson(rawValue: d.string(forKey: "companionPerson") ?? "") ?? .a

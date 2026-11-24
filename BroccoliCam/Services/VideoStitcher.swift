@@ -23,8 +23,10 @@ enum VideoStitcher {
         let end: Double?
     }
 
-    /// 輸出到 output，這個檔名不能已經存在。失敗時會把寫到一半的檔刪掉，各段不動。
-    static func stitch(_ clips: [Clip], to output: URL) async throws {
+    /// 把各段照順序排進同一條時間軸，還沒有輸出成檔案。接片、字幕預覽、燒錄都用這一份，時間才會一致。
+    /// offsets 是各段在整支影片裡的起點（秒），durations 是各段裁完的長度（秒）。
+    static func composition(_ clips: [Clip]) async throws
+        -> (composition: AVMutableComposition, offsets: [Double], durations: [Double], transform: CGAffineTransform) {
         let composition = AVMutableComposition()
         guard let videoTrack = composition.addMutableTrack(
             withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
@@ -33,6 +35,9 @@ enum VideoStitcher {
         var audioTrack: AVMutableCompositionTrack?
         var cursor = CMTime.zero
         var transformSet = false
+        var transform = CGAffineTransform.identity
+        var offsets: [Double] = []
+        var durations: [Double] = []
 
         for clip in clips {
             let asset = AVURLAsset(url: clip.url)
@@ -58,7 +63,8 @@ enum VideoStitcher {
             try videoTrack.insertTimeRange(range, of: sourceVideo, at: cursor)
             if !transformSet {
                 // 沿用原始影片的方向與鏡像設定。
-                videoTrack.preferredTransform = try await sourceVideo.load(.preferredTransform)
+                transform = try await sourceVideo.load(.preferredTransform)
+                videoTrack.preferredTransform = transform
                 transformSet = true
             }
 
@@ -75,8 +81,16 @@ enum VideoStitcher {
                 }
             }
 
+            offsets.append(cursor.seconds)
+            durations.append(range.duration.seconds)
             cursor = cursor + range.duration
         }
+        return (composition, offsets, durations, transform)
+    }
+
+    /// 輸出到 output，這個檔名不能已經存在。失敗時會把寫到一半的檔刪掉，各段不動。
+    static func stitch(_ clips: [Clip], to output: URL) async throws {
+        let composition = try await Self.composition(clips).composition
 
         let session: AVAssetExportSession
         if let hevc = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHEVCHighestQuality) {

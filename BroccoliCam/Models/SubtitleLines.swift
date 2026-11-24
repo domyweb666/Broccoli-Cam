@@ -7,123 +7,27 @@ struct SubtitleCue {
     var text: String
 }
 
-/// 把稿子切成一行一行的字幕，以及輸出 SRT。
+/// 字幕的寬度，以及輸出 SRT。斷句在 CaptionBreaker。
 enum SubtitleLines {
-    private static let strongBreaks: Set<Character> = ["。", "！", "？", "；", "!", "?", ";", "…", "\n"]
-    private static let weakBreaks: Set<Character> = ["，", "、", "：", ",", ":"]
-
     /// 字幕的寬度：中文字算 1，英數算半個。
     static func width(of text: String) -> Double {
         var total = 0.0
         for character in text {
-            if character == " " {
-                total += 0.5
-            } else if character.isASCII {
-                total += 0.5
-            } else {
-                total += 1
-            }
+            total += character.isASCII ? 0.5 : 1
         }
         return total
     }
 
-    /// 依標點切句；短句在同一行用空白接起來，太長的句子平均拆開。行尾不留標點。
-    static func split(_ script: String, maxChars: Int) -> [String] {
-        let limit = Double(max(4, maxChars))
-        let normalized = script
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-
-        // 先切成子句，記下每個子句後面是不是「強」斷點。
-        var clauses: [(text: String, strong: Bool)] = []
-        var current = ""
-        func flush(strong: Bool) {
-            let trimmed = current.trimmingCharacters(in: .whitespaces)
-            if !trimmed.isEmpty {
-                clauses.append((trimmed, strong))
-            } else if strong, !clauses.isEmpty {
-                clauses[clauses.count - 1].strong = true
-            }
-            current = ""
-        }
-        let characters = Array(normalized)
-        for (index, character) in characters.enumerated() {
-            if strongBreaks.contains(character) {
-                flush(strong: true)
-            } else if weakBreaks.contains(character) {
-                // 數字裡的逗號和小數點前後不切（1,000）。
-                let previous = index > 0 ? characters[index - 1] : " "
-                let next = index + 1 < characters.count ? characters[index + 1] : " "
-                if character.isASCII && previous.isNumber && next.isNumber {
-                    current.append(character)
-                } else {
-                    flush(strong: false)
-                }
-            } else {
-                current.append(character)
-            }
-        }
-        flush(strong: true)
-
-        // 短的子句併成一行，遇到強斷點就換行。
-        var lines: [String] = []
-        var line = ""
-        for clause in clauses {
-            let pieces = width(of: clause.text) > limit ? breakLong(clause.text, limit: limit) : [clause.text]
-            for (index, piece) in pieces.enumerated() {
-                let isLastPiece = index == pieces.count - 1
-                if line.isEmpty {
-                    line = piece
-                } else if pieces.count == 1 && width(of: line) + 0.5 + width(of: piece) <= limit {
-                    line += " " + piece
-                } else {
-                    lines.append(line)
-                    line = piece
-                }
-                if !isLastPiece || (isLastPiece && clause.strong) {
-                    lines.append(line)
-                    line = ""
-                }
-            }
-        }
-        if !line.isEmpty {
-            lines.append(line)
-        }
-        return lines
-    }
-
-    /// 太長的句子平均拆成幾行，不從英文單字或數字中間切。
-    private static func breakLong(_ text: String, limit: Double) -> [String] {
-        let characters = Array(text)
-        let total = width(of: text)
-        let count = Int((total / limit).rounded(.up))
-        guard count > 1 else { return [text] }
-        let target = total / Double(count)
-
-        var pieces: [String] = []
-        var current = ""
-        var currentWidth = 0.0
-        for (index, character) in characters.enumerated() {
-            current.append(character)
-            currentWidth += width(of: String(character))
-            let next = index + 1 < characters.count ? characters[index + 1] : nil
-            guard let next, pieces.count < count - 1, currentWidth >= target else { continue }
-            let insideWord = character.isASCII && next.isASCII
-                && (character.isLetter || character.isNumber)
-                && (next.isLetter || next.isNumber)
-            if insideWord { continue }
-            pieces.append(current.trimmingCharacters(in: .whitespaces))
-            current = ""
-            currentWidth = 0
-        }
-        let rest = current.trimmingCharacters(in: .whitespaces)
-        if !rest.isEmpty {
-            pieces.append(rest)
-        }
-        return pieces.filter { !$0.isEmpty }
-    }
-
     // MARK: - SRT
+
+    /// 會燒上去的句子照時間排；藏起來的、沒有字的不寫。
+    static func srt(_ lines: [CaptionLine]) -> String {
+        let cues = lines
+            .filter { !$0.isHidden && !$0.text.isEmpty && $0.end > $0.start }
+            .sorted { $0.start < $1.start }
+            .map { SubtitleCue(start: $0.start, end: $0.end, text: $0.text) }
+        return srt(cues)
+    }
 
     static func srt(_ cues: [SubtitleCue]) -> String {
         var output = ""

@@ -1,6 +1,14 @@
 import Foundation
 import Combine
 
+/// 接好的影片由哪一段、保留哪個範圍（秒，nil 是整段）、照著唸哪一段稿。
+struct RecordedPart: Equatable {
+    let url: URL
+    let start: Double?
+    let end: Double?
+    let script: String
+}
+
 struct RecordedVideo: Identifiable {
     let id = UUID()
     let url: URL
@@ -14,6 +22,19 @@ struct RecordedVideo: Identifiable {
     var notice: String?
     /// 接成這支的各段檔名。單支是空的。
     var takes: [String] = []
+    /// 接片時實際用的各段和裁切範圍，字幕逐段對時用。單支、或重開 App 救回來的是空的。
+    var parts: [RecordedPart] = []
+
+    /// 整支當成一段。
+    var wholeSource: [CaptionSource] {
+        [CaptionSource(url: url, script: script)]
+    }
+
+    /// 做字幕專案用的來源：拿得到各段就逐段，不然整支加整份稿子。
+    var captionSources: [CaptionSource] {
+        guard !parts.isEmpty else { return wholeSource }
+        return parts.map { CaptionSource(url: $0.url, start: $0.start, end: $0.end, script: $0.script) }
+    }
 }
 
 /// 稿子切出來的段落和已錄的不一樣，等使用者決定。
@@ -132,6 +153,8 @@ final class RecordingViewModel: ObservableObject {
 
     /// 稿件或設定頁開著的時候，不回應音量鍵。
     var hardwareEnabled = true
+    /// 從設定打開了字幕校對頁。這時候回到前景不可以把相機叫起來，會搶走音訊。
+    var isCaptionEditing = false
 
     /// 有視窗或完成頁蓋在主畫面上。這時候音量鍵、藍牙鍵都不算數。
     var hasWindow: Bool {
@@ -229,6 +252,10 @@ final class RecordingViewModel: ObservableObject {
         store.onLog = { [weak camera] message in
             camera?.log(message)
         }
+        CaptionStore.shared.onLog = { [weak camera] message in
+            camera?.log(message)
+        }
+        CaptionStore.shared.start()
         loadSaved()
     }
 
@@ -638,7 +665,7 @@ final class RecordingViewModel: ObservableObject {
     func mergeAll() {
         guard allRecorded, !isMerging, pending == nil, !restoring else { return }
         let trim = settings?.trimSilence ?? true
-        let clips: [VideoStitcher.Clip] = (0..<segments.count).compactMap { index in
+        let parts: [RecordedPart] = (0..<segments.count).compactMap { index in
             guard let take = takes[index] else { return nil }
             var start: Double?
             var end: Double?
@@ -646,7 +673,11 @@ final class RecordingViewModel: ObservableObject {
                 start = max(0, first - trimLead)
                 end = last + trimTail
             }
-            return VideoStitcher.Clip(url: take.url, start: start, end: end)
+            return RecordedPart(url: take.url, start: start, end: end, script: segments[index])
+        }
+        // 接片和字幕專案用同一組範圍，時間才對得上。
+        let clips: [VideoStitcher.Clip] = parts.map { part in
+            VideoStitcher.Clip(url: part.url, start: part.start, end: part.end)
         }
         isMerging = true
         let file = TakeStore.newFileName(merged: true)
@@ -667,7 +698,8 @@ final class RecordingViewModel: ObservableObject {
                     self.camera?.log("接片完成")
                     self.show(RecordedVideo(url: output, isStitched: true,
                                             script: self.segments.joined(separator: "\n"),
-                                            isLandscape: self.takesLandscape ?? false, takes: sources))
+                                            isLandscape: self.takesLandscape ?? false, takes: sources,
+                                            parts: parts))
                 }
             } catch {
                 await MainActor.run {

@@ -4,13 +4,18 @@ import Foundation
 /// 語音辨識常把字認成同音字（的／得、在／再），用音比對才對得上稿子。
 enum SpokenKeys {
     struct Key {
-        /// 比對用的值：中文是拼音，英數是小寫字元。
+        /// 比對用的值：中文和數字是拼音，英文是小寫字母。
         let value: String
         /// 這個字在原文裡的位置（UTF-16）。
         let utf16Offset: Int
     }
 
     private static var cache: [Character: String] = [:]
+    /// 稿子寫 3、聽到三（或反過來）是同一個音。
+    private static let digits: [Character: String] = [
+        "0": "ling", "1": "yi", "2": "er", "3": "san", "4": "si",
+        "5": "wu", "6": "liu", "7": "qi", "8": "ba", "9": "jiu"
+    ]
     private static let lock = NSLock()
 
     static func keys(of text: String) -> [Key] {
@@ -28,6 +33,7 @@ enum SpokenKeys {
     /// 標點和空白回傳 nil。
     static func key(for character: Character) -> String? {
         guard character.isLetter || character.isNumber else { return nil }
+        if let digit = digits[character] { return digit }
         if character.isASCII {
             return String(character).lowercased()
         }
