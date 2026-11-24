@@ -58,6 +58,11 @@ enum CaptionBridge {
         return (lines: result.lines, recognition: result.recognition)
     }
 
+    /// 整支都沒聽到（沒網路、不能辨識）。只有部分失敗不算。
+    static func heardNothing(_ lines: [CaptionLine], _ recognition: CaptionRecognition) -> Bool {
+        recognition.engine == CaptionBuilder.noEngine || lines.allSatisfy { $0.status == .unrecognized }
+    }
+
     static func makeVideo(_ project: CaptionProject) -> CaptionVideo {
         CaptionVideo(
             clips: project.clips.map { clip in

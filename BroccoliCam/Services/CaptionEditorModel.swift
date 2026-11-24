@@ -10,9 +10,14 @@ final class CaptionClock: ObservableObject {
 
 enum CaptionEditorError: LocalizedError {
     case notAuthorized
+    /// 重新對的時候整支都沒聽到。
+    case heardNothing
 
     var errorDescription: String? {
-        "沒有語音辨識的權限"
+        switch self {
+        case .notAuthorized: return "沒有語音辨識的權限"
+        case .heardNothing: return "這次沒有辨識到，字幕維持原樣"
+        }
     }
 }
 
@@ -56,7 +61,8 @@ final class CaptionEditorModel: ObservableObject {
     }
 
     let id: UUID
-    let player = AVPlayer()
+    /// 播放壞掉重新載入時會換一個新的。
+    @Published private(set) var player = AVPlayer()
     let clock = CaptionClock()
     let exporter = CaptionExporter()
 
@@ -81,6 +87,9 @@ final class CaptionEditorModel: ObservableObject {
     @Published private(set) var note: String?
     /// 整支平移了幾秒。nil 是沒在平移。
     @Published private(set) var shiftOffset: Double?
+    /// 影片播不出來的訊息。重新載入成功就消失。
+    @Published private(set) var playerProblem: String?
+    @Published private(set) var isReloading = false
 
     private let store = CaptionStore.shared
     private var video: CaptionVideo?
@@ -151,15 +160,17 @@ final class CaptionEditorModel: ObservableObject {
         loadTask = nil
         recognizeTicket += 1
         endShift()
-        if touched { saveNow(force: true) }
+        if touched { saveNow(force: true, backup: true) }
         if isBurning { exporter.cancel() }
         burn = .none
         releasePlayer()
+        playerProblem = nil
+        isReloading = false
     }
 
     /// 離開前景可能直接被滑掉，先寫進檔案。
     func leaveForeground(toBackground: Bool) {
-        if dirty { saveNow() }
+        if dirty || (toBackground && touched) { saveNow(force: true, backup: toBackground) }
         if toBackground { player.pause() }
     }
 
@@ -177,7 +188,7 @@ final class CaptionEditorModel: ObservableObject {
             done(true)
             return
         }
-        saveNow(force: true, then: done)
+        saveNow(force: true, backup: true, then: done)
     }
 
     private func load() async {
@@ -223,7 +234,8 @@ final class CaptionEditorModel: ObservableObject {
 
     // MARK: - 對字幕
 
-    private func recognize(_ known: CaptionBridge.Timeline?) async throws {
+    /// keepsOnFailure：整支都沒聽到就丟錯、不換掉現有的字幕。
+    private func recognize(_ known: CaptionBridge.Timeline?, keepsOnFailure: Bool = false) async throws {
         phase = .recognizing
         progress = 0
         guard await authorized() else { throw CaptionEditorError.notAuthorized }
@@ -252,11 +264,16 @@ final class CaptionEditorModel: ObservableObject {
             }
         )
         try Task.checkCancellation()
+        if keepsOnFailure, CaptionBridge.heardNothing(result.lines, result.recognition) {
+            throw CaptionEditorError.heardNothing
+        }
+        let isFirst = isFirstRecognition
         var next = project
         next.lines = CaptionEditing.cleaned(result.lines, duration: next.duration)
         next.recognition = result.recognition
         commit(next)
-        saveNow(force: true)
+        // 打開時的備份是空的，第一次對好就換上。重新對的不換，備份留著打開時的字。
+        saveNow(force: true, backup: isFirst)
     }
 
     private func recognitionMoved(_ value: Double, ticket: Int) {
@@ -279,13 +296,14 @@ final class CaptionEditorModel: ObservableObject {
 
     /// 重新對一次，改過的字會被蓋掉（可以撤銷）。失敗或取消就維持原樣。
     func recognizeAgain() {
-        guard phase == .ready, !isBurning else { return }
+        guard phase == .ready, !isBurning, !isReloading else { return }
         player.pause()
+        endShift()
         let before = Snapshot(lines: project.lines, style: project.style)
         loadTask?.cancel()
         loadTask = Task {
             do {
-                try await recognize(nil)
+                try await recognize(nil, keepsOnFailure: !before.lines.isEmpty)
                 push(before)
                 selectedID = pending.first?.id
             } catch {
@@ -323,7 +341,8 @@ final class CaptionEditorModel: ObservableObject {
         }
     }
 
-    private func saveNow(force: Bool = false, deleting files: [String] = [], then: ((Bool) -> Void)? = nil) {
+    private func saveNow(force: Bool = false, deleting files: [String] = [], backup: Bool = false,
+                         then: ((Bool) -> Void)? = nil) {
         saveTask?.cancel()
         saveTask = nil
         guard dirty || force else {
@@ -331,7 +350,7 @@ final class CaptionEditorModel: ObservableObject {
             return
         }
         dirty = false
-        store.save(project, deleting: files) { [weak self] error in
+        store.save(project, deleting: files, backup: backup) { [weak self] error in
             if let error {
                 self?.dirty = true
                 self?.saveError = "字幕沒存成功：\(error.localizedDescription)"
@@ -346,6 +365,8 @@ final class CaptionEditorModel: ObservableObject {
 
     /// 一次完整的修改：記一步撤銷、更新畫面、存檔。
     private func change(_ body: (inout CaptionProject) -> Void) {
+        // 平移一律從開始時的句子算，中途改的字會被蓋掉，先把平移收尾。
+        endShift()
         let before = Snapshot(lines: project.lines, style: project.style)
         var next = project
         body(&next)
@@ -408,6 +429,7 @@ final class CaptionEditorModel: ObservableObject {
     func setText(_ text: String, of lineID: UUID) {
         guard let index = project.lines.firstIndex(where: { $0.id == lineID }),
               project.lines[index].text != text else { return }
+        endShift()
         let before = Snapshot(lines: project.lines, style: project.style)
         if typingID != lineID {
             push(before)
@@ -428,7 +450,9 @@ final class CaptionEditorModel: ObservableObject {
         typingID = nil
     }
 
-    func moveCursor(_ utf16Offset: Int) {
+    /// 上一句收起來時會晚到，不是正在改的那句就不算。
+    func moveCursor(_ utf16Offset: Int, in lineID: UUID) {
+        guard selectedID == lineID else { return }
         cursor = utf16Offset
     }
 
@@ -545,9 +569,28 @@ final class CaptionEditorModel: ObservableObject {
 
     func endShift() {
         guard let base = shiftBase else { return }
+        let gone = shiftedOutCount
         if shiftOffset != 0 { push(base) }
         shiftBase = nil
         shiftOffset = nil
+        if gone > 0 { show(Self.shiftedOut(gone)) }
+    }
+
+    /// 平移之後整句跑到影片外面、看不到的有幾句。本來就看不到的不算。
+    var shiftedOutCount: Int {
+        guard let base = shiftBase, shiftOffset != 0 else { return 0 }
+        let visible: Set<UUID> = Set(base.lines.filter { Self.isVisible($0) }.map(\.id))
+        return project.lines.filter { visible.contains($0.id) && !Self.isVisible($0) }.count
+    }
+
+    static func shiftedOut(_ count: Int) -> String {
+        "有 \(count) 句移到影片外面"
+    }
+
+    /// 剩不到 0.05 秒等於看不到。
+    private static func isVisible(_ line: CaptionLine) -> Bool {
+        !line.isHidden && line.end - line.start >= 0.05
+            && !line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     // MARK: - 播放
@@ -587,8 +630,9 @@ final class CaptionEditorModel: ObservableObject {
     }
 
     /// 前一次跳完才跳下一次，拖拉時不會塞車，最後停的位置一定會到。
+    /// 影片還沒準備好就先記著，準備好會再來一次；這時候硬跳有閃退的紀錄。
     private func pumpSeek() {
-        guard !seeking, let target = scrubTarget, player.currentItem != nil else { return }
+        guard !seeking, let target = scrubTarget, player.currentItem?.status == .readyToPlay else { return }
         scrubTarget = nil
         seeking = true
         let time = CMTime(seconds: target, preferredTimescale: 600)
@@ -612,6 +656,85 @@ final class CaptionEditorModel: ObservableObject {
         player.replaceCurrentItem(with: item)
         player.actionAtItemEnd = .pause
         watchPlayer()
+        watchItem(item)
+    }
+
+    private func watchItem(_ item: AVPlayerItem) {
+        item.publisher(for: \.status)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                guard let self else { return }
+                MainActor.assumeIsolated {
+                    self.itemMoved(status)
+                }
+            }
+            .store(in: &watches)
+        NotificationCenter.default.publisher(for: .AVPlayerItemFailedToPlayToEndTime, object: item)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let self else { return }
+                let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+                MainActor.assumeIsolated {
+                    self.playbackBroke(error)
+                }
+            }
+            .store(in: &watches)
+        // 系統的影音服務重開過，手上的播放器就不能再用了。
+        NotificationCenter.default.publisher(for: AVAudioSession.mediaServicesWereResetNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                MainActor.assumeIsolated {
+                    self.playbackBroke(nil)
+                }
+            }
+            .store(in: &watches)
+    }
+
+    private func itemMoved(_ status: AVPlayerItem.Status) {
+        switch status {
+        case .readyToPlay: pumpSeek()
+        case .failed: playbackBroke(player.currentItem?.error)
+        default: break
+        }
+    }
+
+    private func playbackBroke(_ error: Error?) {
+        guard playerProblem == nil else { return }
+        player.pause()
+        playerProblem = "影片播不出來"
+        guard let error else {
+            log("字幕預覽停了：影音服務重新啟動")
+            return
+        }
+        let detail = error as NSError
+        log("字幕預覽播不出來：\(detail.localizedDescription)（\(detail.domain) \(detail.code)）")
+    }
+
+    /// 換一個新的播放器重來，停在原本的位置。字幕不受影響。
+    func reloadPlayer() {
+        guard phase == .ready, !isBurning, !isReloading else { return }
+        isReloading = true
+        let time = clock.time
+        loadTask?.cancel()
+        loadTask = Task {
+            do {
+                useAudioForPlayback()
+                // 監看都掛在舊的播放器上，先拆掉再換。
+                releasePlayer()
+                player = AVPlayer()
+                // 先清掉，新的那支又壞掉時才記得到。
+                playerProblem = nil
+                try await openPlayer()
+                isReloading = false
+                scrub(to: time)
+            } catch {
+                guard !Task.isCancelled else { return }
+                isReloading = false
+                playerProblem = "影片播不出來"
+                log("字幕預覽重新載入失敗：\(error.localizedDescription)")
+            }
+        }
     }
 
     private func watchPlayer() {
@@ -685,7 +808,12 @@ final class CaptionEditorModel: ObservableObject {
     // MARK: - 燒錄
 
     func startBurn() {
-        guard phase == .ready, project.canBurn, !isBurning, let video else { return }
+        guard phase == .ready, project.canBurn, !isBurning else { return }
+        guard let video else {
+            // 重新載入還沒好，或沒載入成功。
+            show("影片還沒載入好")
+            return
+        }
         player.pause()
         endShift()
         let wanted: CaptionResolution = has4K ? resolution : .hd1080

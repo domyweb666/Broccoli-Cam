@@ -46,6 +46,10 @@ struct CaptionLine: Codable, Equatable, Identifiable {
 
     /// 還擋著燒錄：要看過的句子，沒確認也沒隱藏。漏講的預設隱藏，但仍要看過一次。
     var blocksBurning: Bool { status.needsReview && !isConfirmed }
+    /// 燒了看得到：沒藏起來、真的有字、有時間。平移到片外的會剩零長度，燒了也沒有。
+    var isBurnable: Bool {
+        !isHidden && end > start && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 struct CaptionStyle: Codable, Equatable {
@@ -143,9 +147,9 @@ struct CaptionProject: Codable, Equatable, Identifiable {
 
     var script: String { clips.map(\.script).filter { !$0.isEmpty }.joined(separator: "\n") }
     var pendingCount: Int { lines.filter(\.blocksBurning).count }
-    var canBurn: Bool { pendingCount == 0 && lines.contains { !$0.isHidden && !$0.text.isEmpty } }
+    var canBurn: Bool { pendingCount == 0 && lines.contains(where: \.isBurnable) }
     /// 真的會燒上去的句子，照時間排。
     var burnLines: [CaptionLine] {
-        lines.filter { !$0.isHidden && !$0.text.isEmpty && $0.end > $0.start }.sorted { $0.start < $1.start }
+        lines.filter(\.isBurnable).sorted { $0.start < $1.start }
     }
 }

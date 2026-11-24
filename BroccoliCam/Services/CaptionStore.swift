@@ -1,4 +1,4 @@
-import Foundation
+import AVFoundation
 
 /// 要放進字幕專案的一段影片。
 struct CaptionSource: Equatable {
@@ -144,17 +144,98 @@ final class CaptionStore: @unchecked Sendable {
         }
     }
 
-    /// 用同一批影片建過的專案。完成頁離開再回來、或重開 App 之後再按一次，才不會多一份。
+    /// 用同一批影片、同樣的裁切和稿子建過的專案。完成頁離開再回來、或重開 App 之後再按一次，才不會多一份。
+    /// 改過「裁靜音」再接一次就是另一支影片，長度不同，不能沿用舊的。
     func existing(for sources: [CaptionSource]) async -> CaptionProject? {
         let wanted: [String] = sources.map { $0.url.lastPathComponent }
-        let found: CaptionProject? = try? await run { () -> CaptionProject? in
-            for id in self.ids() {
-                guard let project = try? self.read(id) else { continue }
-                if project.clips.map(\.file) == wanted, !self.isMissingVideo(project) { return project }
-            }
-            return nil
+        let scripts: [String] = sources.map { Self.flat($0.script) }
+        let found: [CaptionProject] = await candidates { project in
+            project.clips.map(\.file) == wanted && project.clips.map({ Self.flat($0.script) }) == scripts
         }
-        return found
+        guard !found.isEmpty else { return nil }
+        if let exact = Self.best(found.filter { Self.sameCuts($0, sources) }) { return exact }
+
+        // 數字不同不代表裁得不同：裁到檔案外面、或裁完太短而整段保留，接出來都和沒裁一樣。
+        // 看實際留下的範圍再比一次，才不會只因為這樣就另開一份，改過的字像不見了。
+        var wantedRanges: [ClosedRange<Double>] = []
+        var spans: [ClosedRange<Double>] = []
+        for source in sources {
+            guard let span = await Self.fileSpan(source.url) else { return nil }
+            spans.append(span)
+            wantedRanges.append(Self.kept(source.start, source.end, in: span))
+        }
+        let same: [CaptionProject] = found.filter { project in
+            guard project.clips.count == spans.count else { return false }
+            return project.clips.indices.allSatisfy { index in
+                let clip: CaptionClip = project.clips[index]
+                let range: ClosedRange<Double> = Self.kept(clip.start, clip.end, in: spans[index])
+                return Self.near(range.lowerBound, wantedRanges[index].lowerBound)
+                    && Self.near(range.upperBound, wantedRanges[index].upperBound)
+            }
+        }
+        return Self.best(same)
+    }
+
+    /// 重開 App 救回來的接好影片：只知道由哪幾段接成，不知道各段裁到哪裡。
+    /// 檔名和順序都一樣、總長也一樣，才是同一支。length 讀不到（nil）就只看檔名。
+    func existing(takes: [String], length: Double?) async -> CaptionProject? {
+        guard !takes.isEmpty else { return nil }
+        let found: [CaptionProject] = await candidates { $0.clips.map(\.file) == takes }
+        guard let length, length.isFinite else { return Self.best(found) }
+        return Self.best(found.filter { abs($0.duration - length) <= 0.5 })
+    }
+
+    private func candidates(_ fits: @escaping (CaptionProject) -> Bool) async -> [CaptionProject] {
+        let found: [CaptionProject]? = try? await run { () -> [CaptionProject] in
+            self.ids().compactMap { id -> CaptionProject? in
+                guard let project = try? self.read(id), fits(project), !self.isMissingVideo(project) else { return nil }
+                return project
+            }
+        }
+        return found ?? []
+    }
+
+    /// 對得上的不只一個時，有字幕的優先，再來是最近改過的。
+    private static func best(_ projects: [CaptionProject]) -> CaptionProject? {
+        projects.max { first, second in
+            if first.lines.isEmpty != second.lines.isEmpty { return first.lines.isEmpty }
+            return first.updatedAt < second.updatedAt
+        }
+    }
+
+    /// 空白和換行不算差別。
+    private static func flat(_ script: String) -> String {
+        script.filter { !$0.isWhitespace }
+    }
+
+    private static func near(_ first: Double?, _ second: Double?) -> Bool {
+        guard let first, let second else { return first == nil && second == nil }
+        return abs(first - second) <= 0.01
+    }
+
+    private static func sameCuts(_ project: CaptionProject, _ sources: [CaptionSource]) -> Bool {
+        guard project.clips.count == sources.count else { return false }
+        return zip(project.clips, sources).allSatisfy { clip, source in
+            near(clip.start, source.start) && near(clip.end, source.end)
+        }
+    }
+
+    /// 影片檔本身的範圍（秒）。
+    private static func fileSpan(_ url: URL) async -> ClosedRange<Double>? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let range = try? await track.load(.timeRange) else { return nil }
+        let lower: Double = range.start.seconds
+        let upper: Double = range.end.seconds
+        guard lower.isFinite, upper.isFinite, upper > lower else { return nil }
+        return lower...upper
+    }
+
+    /// 接片時實際留下的範圍，規則和 VideoStitcher 一樣：裁完太短就整段保留。
+    private static func kept(_ start: Double?, _ end: Double?, in span: ClosedRange<Double>) -> ClosedRange<Double> {
+        let first: Double = max(span.lowerBound, start ?? span.lowerBound)
+        let last: Double = min(span.upperBound, end ?? span.upperBound)
+        return last - first < 0.5 ? span : first...last
     }
 
     private func make(_ sources: [CaptionSource], isLandscape: Bool, style: CaptionStyle) throws -> CaptionProject {
@@ -334,7 +415,8 @@ final class CaptionStore: @unchecked Sendable {
     // MARK: - 寫
 
     /// 存檔，照呼叫的順序寫。寫成功之後才刪 files（只給舊的燒錄檔用）。then 在主執行緒。
-    func save(_ project: CaptionProject, deleting files: [String] = [],
+    /// backup：寫成功之後備份也換成這一份。
+    func save(_ project: CaptionProject, deleting files: [String] = [], backup: Bool = false,
               then: @escaping @MainActor (Error?) -> Void) {
         queue.async {
             var failure: Error?
@@ -345,6 +427,10 @@ final class CaptionStore: @unchecked Sendable {
                 }
                 let data = try Self.encode(project)
                 try self.write(data, to: self.url(Self.projectName, in: project.id))
+                if backup {
+                    // 備份寫不進去沒關係，不動用預留的空間。
+                    try? data.write(to: self.url(Self.backupName, in: project.id), options: .atomic)
+                }
                 let keep = Set(project.clips.map(\.file) + [project.burnedFile].compactMap { $0 })
                 for file in files where !keep.contains(file) && file.hasPrefix(Self.burnedPrefix) {
                     try? self.manager.removeItem(at: self.url(file, in: project.id))
@@ -372,6 +458,9 @@ final class CaptionStore: @unchecked Sendable {
         try? await run { () -> Void in
             let project = try self.read(id)
             guard project.lines.isEmpty, project.recognition == nil, project.burnedFile == nil else { return }
+            // 有壞掉留底的 project.json，現在這份空的是救回來的，留底裡可能還有改過的字。
+            let names = try self.manager.contentsOfDirectory(atPath: self.folder(id).path)
+            guard !names.contains(where: { $0.hasPrefix(Self.badPrefix) }) else { return }
             try self.remove(id)
         }
     }

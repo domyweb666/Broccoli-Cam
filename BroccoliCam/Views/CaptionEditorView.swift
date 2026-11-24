@@ -71,7 +71,9 @@ struct CaptionEditorView: View {
             .alert("全部取代", isPresented: $askReplace) {
                 TextField("原本的字", text: $findText)
                 TextField("換成", text: $replaceText)
-                Button("取代") { model.replaceAll(findText, with: replaceText) }
+                Button("取代") {
+                    CaptionKeyboard.settle { model.replaceAll(findText, with: replaceText) }
+                }
                 Button("取消", role: .cancel) {}
             }
             .alert("重新對字幕？", isPresented: $askRecognize) {
@@ -101,6 +103,10 @@ struct CaptionEditorView: View {
                 } else {
                     model.leaveForeground(toBackground: phase == .background)
                 }
+            }
+            .onChange(of: model.shiftOffset) { _, offset in
+                // 別的動作把平移收尾了，面板也跟著收。
+                if offset == nil, panel == .shift { panel = .none }
             }
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
                 keyboardUp = true
@@ -208,6 +214,7 @@ struct CaptionEditorView: View {
                     .onTapGesture { model.togglePlay() }
                     .accessibilityLabel(model.isPlaying ? "暫停" : "播放")
                     .accessibilityAddTraits(.isButton)
+                    .overlay { playerProblem }
                 CaptionTransport(model: model, clock: model.clock)
                 if let message = model.saveError {
                     ScriptErrorBanner(message: message) {
@@ -232,6 +239,26 @@ struct CaptionEditorView: View {
         return max(80, min(natural, size.height * (keyboardUp ? 0.30 : 0.42)))
     }
 
+    @ViewBuilder
+    private var playerProblem: some View {
+        if model.isReloading {
+            ZStack {
+                Color.black
+                ProgressView().tint(.white)
+            }
+        } else if let message = model.playerProblem {
+            ZStack {
+                Color.black
+                VStack(spacing: 2) {
+                    Text(message)
+                        .font(.subheadline)
+                        .foregroundStyle(.yellow)
+                    CaptionTextButton(title: "重新載入") { model.reloadPlayer() }
+                }
+            }
+        }
+    }
+
     private var topBar: some View {
         HStack(spacing: 0) {
             CaptionIconButton(icon: "xmark", label: "關閉", action: leave)
@@ -242,8 +269,10 @@ struct CaptionEditorView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
             Spacer(minLength: 4)
-            CaptionIconButton(icon: "arrow.uturn.backward", label: "撤銷") { model.undo() }
-                .disabled(!model.canUndo || panel == .shift)
+            CaptionIconButton(icon: "arrow.uturn.backward", label: "撤銷") {
+                CaptionKeyboard.settle { model.undo() }
+            }
+            .disabled(!model.canUndo || panel == .shift)
             moreMenu
         }
         .padding(.horizontal, 8)
@@ -259,13 +288,15 @@ struct CaptionEditorView: View {
     private var moreMenu: some View {
         Menu {
             Section {
-                Button("全部確認", systemImage: "checkmark.circle") { model.confirmAll() }
-                    .disabled(model.project.pendingCount == 0)
+                Button("全部確認", systemImage: "checkmark.circle") {
+                    CaptionKeyboard.settle { model.confirmAll() }
+                }
+                .disabled(model.project.pendingCount == 0)
                 Button("全部取代", systemImage: "character.cursor.ibeam") {
                     findText = ""
                     replaceText = ""
                     model.pause()
-                    askReplace = true
+                    CaptionKeyboard.settle { askReplace = true }
                 }
                 Button("整支平移", systemImage: "arrow.left.and.right") {
                     hideKeyboard()
@@ -321,7 +352,7 @@ struct CaptionEditorView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            CaptionLineList(model: model, keyboardUp: keyboardUp)
+            CaptionLineList(model: model, keyboardUp: keyboardUp, isLocked: panel == .shift)
         }
     }
 
@@ -391,7 +422,14 @@ struct CaptionEditorView: View {
         return model.project.burnedFile == nil ? "燒錄" : "重新燒錄"
     }
 
+    @ViewBuilder
     private var shiftBar: some View {
+        let gone = model.shiftedOutCount
+        if gone > 0 {
+            Text(CaptionEditorModel.shiftedOut(gone))
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.yellow)
+        }
         HStack(spacing: 10) {
             CaptionChip(title: "－0.1", selected: false) { model.shift(by: -0.1) }
                 .accessibilityLabel("全部早 0.1 秒")
@@ -461,12 +499,27 @@ struct CaptionEditorView: View {
     }
 
     private func hideKeyboard() {
-        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        CaptionKeyboard.hide()
     }
 
     private func openSettings() {
         guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
         UIApplication.shared.open(url)
+    }
+}
+
+@MainActor
+private enum CaptionKeyboard {
+    static func hide() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+
+    /// 先收鍵盤，等最後的字（注音組到一半的）在這一輪送進來，再做會動到句子的事。
+    static func settle(_ action: @escaping () -> Void) {
+        hide()
+        DispatchQueue.main.async {
+            action()
+        }
     }
 }
 
@@ -582,6 +635,8 @@ enum CaptionTime {
 private struct CaptionLineList: View {
     @ObservedObject var model: CaptionEditorModel
     let keyboardUp: Bool
+    /// 整支平移中：點一句照樣跳過去聽，但不能改。
+    let isLocked: Bool
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -627,6 +682,7 @@ private struct CaptionLineList: View {
             isSelected: model.selectedID == line.id,
             isPlaying: model.playingID == line.id,
             canMerge: model.selectedID == line.id && model.canMerge(line),
+            isLocked: isLocked,
             model: model
         )
         .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
@@ -640,6 +696,7 @@ private struct CaptionLineRow: View {
     let isSelected: Bool
     let isPlaying: Bool
     let canMerge: Bool
+    let isLocked: Bool
     /// 只拿來叫動作，不跟著它重畫。
     let model: CaptionEditorModel
 
@@ -650,13 +707,13 @@ private struct CaptionLineRow: View {
                 .frame(width: 4)
             VStack(alignment: .leading, spacing: 8) {
                 meta
-                if isSelected {
+                if isSelected && !isLocked {
                     expanded
                 } else {
                     collapsedText
                 }
             }
-            if !isSelected && line.blocksBurning {
+            if !isSelected && !isLocked && line.blocksBurning {
                 confirmButton
             }
         }
@@ -714,7 +771,7 @@ private struct CaptionLineRow: View {
 
     private var confirmButton: some View {
         Button {
-            model.confirm(line.id)
+            CaptionKeyboard.settle { model.confirm(line.id) }
         } label: {
             Image(systemName: "checkmark.circle")
                 .font(.title2)
@@ -733,7 +790,7 @@ private struct CaptionLineRow: View {
         CaptionTextBox(
             text: line.text,
             onChange: { model.setText($0, of: line.id) },
-            onCursor: { model.moveCursor($0) },
+            onCursor: { model.moveCursor($0, in: line.id) },
             onBegin: { model.beganTyping(line.id) },
             onEnd: { model.endedTyping() }
         )
@@ -745,14 +802,14 @@ private struct CaptionLineRow: View {
         tools
         if line.blocksBurning {
             CaptionWideButton(title: "確認", icon: "checkmark", prominent: true) {
-                model.confirm(line.id)
+                CaptionKeyboard.settle { model.confirm(line.id) }
             }
         }
     }
 
     private func choice(_ title: String, _ text: String) -> some View {
         Button {
-            model.choose(text, for: line.id)
+            CaptionKeyboard.settle { model.choose(text, for: line.id) }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
@@ -774,12 +831,16 @@ private struct CaptionLineRow: View {
 
     private var tools: some View {
         HStack(spacing: 4) {
-            tool("scissors", "拆開") { model.split(line.id) }
-            tool("arrow.down.to.line", "併下句") { model.mergeNext(line.id) }
-                .disabled(!canMerge)
-                .opacity(canMerge ? 1 : 0.35)
+            tool("scissors", "拆開") {
+                CaptionKeyboard.settle { model.split(line.id) }
+            }
+            tool("arrow.down.to.line", "併下句") {
+                CaptionKeyboard.settle { model.mergeNext(line.id) }
+            }
+            .disabled(!canMerge)
+            .opacity(canMerge ? 1 : 0.35)
             tool(line.isHidden ? "eye" : "eye.slash", line.isHidden ? "顯示" : "隱藏") {
-                model.toggleHidden(line.id)
+                CaptionKeyboard.settle { model.toggleHidden(line.id) }
             }
             tool("minus.circle", "早 0.1") { model.nudge(line.id, by: -0.1) }
             tool("plus.circle", "晚 0.1") { model.nudge(line.id, by: 0.1) }
@@ -895,8 +956,10 @@ private struct CaptionTextBox: UIViewRepresentable {
         }
 
         func textViewDidEndEditing(_ view: UITextView) {
-            report(view)
+            // 收鍵盤才組完的字不一定會通知游標動了，拆句要用，補報一次。
             let owner = self.owner
+            owner.onCursor(view.selectedRange.location)
+            report(view)
             DispatchQueue.main.async {
                 owner.onEnd()
             }

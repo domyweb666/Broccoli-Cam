@@ -127,6 +127,7 @@ enum CaptionEditing {
     }
 
     /// 整句挪早或挪晚。撞到旁邊那句就把旁邊那句縮短，縮到不能再短為止。
+    /// 不燒的句子只移自己：它本來就可以和別句重疊，動到旁邊會把對好的時間弄歪。
     static func nudge(_ id: UUID, by delta: Double, in lines: [CaptionLine], duration: Double) -> [CaptionLine] {
         var result = sorted(lines)
         guard let index = result.firstIndex(where: { $0.id == id }) else { return lines }
@@ -134,13 +135,14 @@ enum CaptionEditing {
         let limit = duration > 0 ? duration : Double.greatestFiniteMagnitude
         var start = min(max(0, result[index].start + delta), max(0, limit - length))
 
-        if delta < 0, let before = result[..<index].lastIndex(where: { !$0.isHidden }) {
+        let isHidden = result[index].isHidden
+        if !isHidden, delta < 0, let before = result[..<index].lastIndex(where: { !$0.isHidden }) {
             let floor = result[before].start + shortest
             // 本來就疊得比這個還前面就不硬推回去。
             start = max(start, min(floor, result[index].start))
             if result[before].end > start { result[before].end = max(result[before].start, start) }
         }
-        if delta > 0, let after = result[(index + 1)...].firstIndex(where: { !$0.isHidden }) {
+        if !isHidden, delta > 0, let after = result[(index + 1)...].firstIndex(where: { !$0.isHidden }) {
             let ceiling = result[after].end - shortest - length
             start = min(start, max(ceiling, result[index].start))
             if result[after].start < start + length { result[after].start = min(result[after].end, start + length) }
@@ -170,34 +172,118 @@ enum CaptionEditing {
 
     /// 顯示或隱藏。使用者動手選了就算看過。
     static func toggledHidden(_ id: UUID, in lines: [CaptionLine], duration: Double) -> [CaptionLine] {
-        var result = lines
+        var result = sorted(lines)
         guard let index = result.firstIndex(where: { $0.id == id }) else { return lines }
         result[index].isHidden.toggle()
         result[index].isConfirmed = true
-        // 漏講的句子時間是猜的，可能短到看不見。
-        if !result[index].isHidden, result[index].end - result[index].start < shortest {
-            result[index] = roomy(result[index], among: result, duration: duration)
+        // 藏著的句子時間是猜的，可以和別句重疊；要燒了就得有自己的位置，不然兩句只看得到一句。
+        if !result[index].isHidden {
+            settle(&result, index, duration: duration)
+            keepOrder(&result)
         }
         return sorted(result)
     }
 
-    /// 在前後兩句中間找位置；太擠就照樣給最短的長度。
-    private static func roomy(_ line: CaptionLine, among lines: [CaptionLine], duration: Double) -> CaptionLine {
+    /// 在前後兩句會燒的中間找位置，找不到就請下一句往後讓，再不行請上一句早點收。
+    private static func settle(_ lines: inout [CaptionLine], _ index: Int, duration: Double) {
         let limit = duration > 0 ? duration : Double.greatestFiniteMagnitude
-        let others = lines.filter { $0.id != line.id && !$0.isHidden }
-        let floor = others.filter { $0.start <= line.start }.map(\.end).max() ?? 0
-        let ceiling = others.filter { $0.start > line.start }.map(\.start).min() ?? limit
-        var result = line
+        let line = lines[index]
+        let length = line.end - line.start
+        let before = latestEnd(lines, before: index)
+        let after = lines[(index + 1)...].firstIndex(where: { !$0.isHidden })
+        var floor = 0.0
+        if let before { floor = min(lines[before].end, limit) }
+        var ceiling = limit
+        if let after { ceiling = lines[after].start }
+        // 沒有擋到誰、自己也看得到，就不動。
+        if length >= shortest, line.start >= floor - 0.01, line.end <= ceiling + 0.01 { return }
+
+        // 上一句講完之後補空隙的尾巴可以還出來，先用那裡，不動到講話的時間。
+        if let before, ceiling - floor < comfortable {
+            let previous = lines[before]
+            let spoken = previous.words.map({ $0.end }).max() ?? previous.end
+            let kept = previous.start + min(comfortable, max(0, previous.end - previous.start))
+            floor = min(floor, max(kept, max(spoken, ceiling - comfortable)))
+        }
         let gap = ceiling - floor
         if gap >= shortest {
-            let length = min(comfortable, gap)
-            result.start = min(max(line.start, floor), ceiling - length)
-            result.end = result.start + length
-        } else {
-            result.start = max(0, min(line.start, limit - comfortable))
-            result.end = min(limit, result.start + comfortable)
+            let room = min(max(comfortable, length), gap)
+            let start = min(max(line.start, floor), ceiling - room)
+            put(&lines, index, start, start + room)
+            if let before { cut(&lines, before, at: start) }
+            return
         }
-        return result
+        // 兩句平分，誰都不會短到看不見。
+        if let after {
+            let room = min(comfortable, (lines[after].end - floor) / 2)
+            if room >= shortest {
+                put(&lines, index, floor, floor + room)
+                put(&lines, after, floor + room, lines[after].end)
+                if let before { cut(&lines, before, at: floor) }
+                return
+            }
+        }
+        if let before {
+            let room = min(comfortable, (ceiling - lines[before].start) / 2)
+            if room >= shortest {
+                put(&lines, index, ceiling - room, ceiling)
+                cut(&lines, before, at: ceiling - room)
+                return
+            }
+        }
+        // 前後都短得讓不出來，只好一路往後推。
+        put(&lines, index, floor, floor + shortest)
+        var shown = lines.filter { !$0.isHidden }
+        CaptionAligner.tidy(&shown, duration: limit, least: shortest, closesGaps: false)
+        for moved in shown {
+            if let place = lines.firstIndex(where: { $0.id == moved.id }) { lines[place] = moved }
+        }
+    }
+
+    /// 前面會燒的句子裡，最晚結束的那一句。
+    private static func latestEnd(_ lines: [CaptionLine], before index: Int) -> Int? {
+        var found: Int?
+        for position in 0..<index where !lines[position].isHidden {
+            if let known = found, lines[known].end > lines[position].end { continue }
+            found = position
+        }
+        return found
+    }
+
+    private static func put(_ lines: inout [CaptionLine], _ index: Int, _ start: Double, _ end: Double) {
+        lines[index].start = start
+        lines[index].end = end
+        CaptionAligner.fitWords(&lines[index])
+    }
+
+    private static func cut(_ lines: inout [CaptionLine], _ index: Int, at time: Double) {
+        guard lines[index].end > time else { return }
+        put(&lines, index, lines[index].start, max(lines[index].start, time))
+    }
+
+    /// 挪完之後，還藏著的句子跟著收進前後兩句會燒的開頭中間。順序要留著，之後再叫出來才知道放哪。
+    private static func keepOrder(_ lines: inout [CaptionLine]) {
+        var floors: [Double] = []
+        var floor = 0.0
+        for line in lines {
+            floors.append(floor)
+            if !line.isHidden { floor = max(floor, line.start) }
+        }
+        var ceiling = Double.greatestFiniteMagnitude
+        for index in lines.indices.reversed() {
+            guard lines[index].isHidden else {
+                ceiling = min(ceiling, lines[index].start)
+                continue
+            }
+            let moved = max(floors[index], min(ceiling, lines[index].start)) - lines[index].start
+            guard moved != 0 else { continue }
+            lines[index].start += moved
+            lines[index].end += moved
+            for word in lines[index].words.indices {
+                lines[index].words[word].start += moved
+                lines[index].words[word].end += moved
+            }
+        }
     }
 
     /// 全部取代，回傳換了幾處。

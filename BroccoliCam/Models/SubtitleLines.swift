@@ -23,7 +23,7 @@ enum SubtitleLines {
     /// 會燒上去的句子照時間排；藏起來的、沒有字的不寫。
     static func srt(_ lines: [CaptionLine]) -> String {
         let cues = lines
-            .filter { !$0.isHidden && !$0.text.isEmpty && $0.end > $0.start }
+            .filter(\.isBurnable)
             .sorted { $0.start < $1.start }
             .map { SubtitleCue(start: $0.start, end: $0.end, text: $0.text) }
         return srt(cues)

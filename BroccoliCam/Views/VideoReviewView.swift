@@ -34,6 +34,8 @@ struct VideoReviewView: View {
     @State private var isMakingProject = false
     @State private var captionProblem: String?
     @State private var captionTicket: CaptionTicket?
+    /// 最近一次打開的專案。
+    @State private var openedProject: UUID?
     /// 這支影片已經有字幕專案了。
     @State private var captionProject: CaptionProject?
     @State private var sendsAudioOut = false
@@ -227,6 +229,7 @@ struct VideoReviewView: View {
         Task { @MainActor in
             do {
                 let project = try await Self.project(for: video, style: style)
+                openedProject = project.id
                 captionTicket = CaptionTicket(id: project.id)
             } catch {
                 captionProblem = "字幕專案沒有建成：\(error.localizedDescription)"
@@ -248,9 +251,13 @@ struct VideoReviewView: View {
     }
 
     private static func existingProject(for video: RecordedVideo) async -> CaptionProject? {
-        if let made = await CaptionStore.shared.existing(for: video.captionSources) { return made }
-        guard !video.parts.isEmpty else { return nil }
-        return await CaptionStore.shared.existing(for: video.wholeSource)
+        let store = CaptionStore.shared
+        if let made = await store.existing(for: video.captionSources) { return made }
+        if !video.parts.isEmpty { return await store.existing(for: video.wholeSource) }
+        // 重開 App 救回來的接好影片沒有各段的裁切，專案當初是用各段建的，拿段落檔名和總長去對。
+        guard video.isStitched, !video.takes.isEmpty else { return nil }
+        let length: Double? = try? await AVURLAsset(url: video.url).load(.duration).seconds
+        return await store.existing(takes: video.takes, length: length)
     }
 
     private func refreshCaptionProject() {
@@ -263,10 +270,10 @@ struct VideoReviewView: View {
     /// 校對頁關掉了。沒對成字幕的空專案收掉，原片還在這一頁。
     private func captionClosed() {
         let video = self.video
+        let opened = openedProject
         Task { @MainActor in
-            if let made = await Self.existingProject(for: video),
-               FileManager.default.fileExists(atPath: video.url.path) {
-                await CaptionStore.shared.discardIfEmpty(made.id)
+            if let opened, FileManager.default.fileExists(atPath: video.url.path) {
+                await CaptionStore.shared.discardIfEmpty(opened)
             }
             captionProject = await Self.existingProject(for: video)
         }
@@ -327,17 +334,7 @@ struct VideoReviewView: View {
                     camera.log(message)
                 }
                 await MainActor.run {
-                    let note: String
-                    if script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        note = "沒有稿子，字幕是直接聽出來的，可能有錯字。共 \(result.cueCount) 句。"
-                    } else if !result.recognized {
-                        note = "這支手機現在不能辨識中文，時間是照字數平均排的，匯入後請自己調。共 \(result.cueCount) 句。"
-                    } else if result.coverage < 0.3 {
-                        note = "聲音和稿子對不太上，時間是照字數平均排的，匯入後請自己調。共 \(result.cueCount) 句。"
-                    } else {
-                        note = "共 \(result.cueCount) 句，字用的是你的稿子。"
-                    }
-                    subtitleState = .done(note)
+                    subtitleState = .done(Self.subtitleNote(result, script: script))
                     sharedSubtitle = SharedFile(url: result.url)
                 }
             } catch {
@@ -347,6 +344,26 @@ struct VideoReviewView: View {
                 }
             }
         }
+    }
+
+    private static func subtitleNote(_ result: SubtitleMaker.Result, script: String) -> String {
+        let count = "共 \(result.cueCount) 句"
+        if script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let failed = result.hasFailures ? "有一段沒辨識到。" : ""
+            return "沒有稿子，字幕是直接聽出來的，可能有錯字。\(failed)\(count)。"
+        }
+        if !result.recognized {
+            return "這支手機現在不能辨識中文，時間是照字數平均排的，匯入後請自己調。\(count)。"
+        }
+        if result.hasFailures {
+            // 對不太上可能只是因為沒辨識到，這時候列的也不全是聽到的話。
+            let unlike = result.coverage < 0.3 ? "聲音和稿子對不太上，" : ""
+            return "\(unlike)有一段沒辨識到，時間是猜的，匯入後請自己調。\(count)。"
+        }
+        if result.coverage < 0.3 {
+            return "聲音和稿子對不太上，列的是聽到的話。\(count)。"
+        }
+        return "\(count)，字用的是你的稿子。"
     }
 
     private func save() {

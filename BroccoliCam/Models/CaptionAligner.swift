@@ -416,6 +416,12 @@ enum CaptionAligner {
             var heard: Range<Int>?
         }
 
+        /// 一行可能落在的時間。
+        private struct Window {
+            var lower: Double
+            var upper: Double
+        }
+
         init(script: String, heard: Heard, failed: [ClosedRange<Double>], duration: Double, maxChars: Int,
              boundaries: @escaping (String) -> Set<Int>) {
             self.heard = heard
@@ -668,30 +674,137 @@ enum CaptionAligner {
             return Double(keys) / duration < CaptionAligner.sparseRate
         }
 
-        /// 這一行應該在的時間有沒有碰到辨識失敗的範圍。
-        private func touchesFailure(_ range: Range<Int>) -> Bool {
-            guard !failed.isEmpty else { return false }
+        /// 這段時間有沒有碰到辨識失敗的範圍。
+        private func touchesFailure(_ lower: Double, _ upper: Double) -> Bool {
+            failed.contains { min(upper, $0.upperBound) - max(lower, $0.lowerBound) >= 0.3 }
+        }
+
+        /// 聽到的第 key 個音和前一個音之間，夾著一段辨識失敗。
+        private func isHole(before key: Int) -> Bool {
+            touchesFailure(heard.keys[key - 1].end, heard.keys[key].start)
+        }
+
+        /// 斷線前後聽到的一兩個音常聽錯，會碰巧配給斷點另一邊那句，那句就被拉成橫跨整段失敗，
+        /// 夾在中間的句子沒有地方放。隔的時間比那幾個字該花的長很多，就放掉音少的那一邊。
+        private mutating func trimAcrossFailure(_ range: Range<Int>) {
+            let paired = range.filter { pair[$0] >= 0 }
+            guard paired.count >= 2 else { return }
+            for index in 1..<paired.count {
+                let a = paired[index - 1]
+                let b = paired[index]
+                guard pair[a] >= 0, pair[b] >= 0 else { continue }
+                let from = heard.keys[pair[a]].end
+                let to = heard.keys[pair[b]].start
+                let needed = pace * weight((a + 1)..<b) + 1
+                guard touchesFailure(from, to), to - from >= needed else { continue }
+                let left = range.lowerBound..<(a + 1)
+                let right = b..<range.upperBound
+                if hitCount(left) <= 2, hitCount(left) <= hitCount(right) {
+                    release(left)
+                } else if hitCount(right) <= 2 {
+                    release(right)
+                }
+            }
+        }
+
+        /// 對得上又夠長，時間靠得住。短句可能是碰巧，不能拿來當前後的界線。
+        private func isAnchor(_ range: Range<Int>) -> Bool {
+            weight(range) > Double(CaptionAligner.shortLine) && ratio(range) >= CaptionAligner.matchedRatio
+        }
+
+        /// 每一行最寬可能落在哪段時間：只認前後靠得住的行，中間那些自己也不確定的不算數。
+        private func windows(_ drafts: [Draft]) -> [Window] {
+            var result = [Window](repeating: Window(lower: 0, upper: duration), count: drafts.count)
+            var lower = 0.0
+            for index in drafts.indices {
+                result[index].lower = lower
+                let keys = drafts[index].keys
+                if isAnchor(keys), let last = keys.last(where: { hit[$0] }) {
+                    lower = heard.keys[pair[last]].end
+                }
+            }
+            var upper = duration
+            for index in drafts.indices.reversed() {
+                result[index].upper = upper
+                let keys = drafts[index].keys
+                if isAnchor(keys), let first = keys.first(where: { hit[$0] }) {
+                    upper = heard.keys[pair[first]].start
+                }
+            }
+            return result
+        }
+
+        /// 有兩個以上的音對上、不是碰巧，知道自己在哪。
+        private func isSolid(_ range: Range<Int>) -> Bool {
+            guard hitCount(range) >= 2 else { return false }
+            return weight(range) > Double(CaptionAligner.shortLine) || ratio(range) >= CaptionAligner.matchedRatio
+        }
+
+        private func isSilent(_ range: Range<Int>) -> Bool {
+            range.allSatisfy { pair[$0] < 0 }
+        }
+
+        /// 只靠一兩個音站住的短句，旁邊整句沒聽到、中間又沒有失敗可以解釋：多半是斷點旁聽錯的音碰巧一樣。
+        /// 放掉它，不然隔壁真的講了的句子會被擠到沒地方放。
+        private mutating func releaseDoubtful(_ drafts: [Draft], _ windows: [Window]) {
+            guard !failed.isEmpty else { return }
+            var changed = true
+            while changed {
+                changed = false
+                for index in drafts.indices {
+                    let range = drafts[index].keys
+                    let window = windows[index]
+                    guard !isSolid(range), touchesFailure(window.lower, window.upper) else { continue }
+                    let paired = range.filter { pair[$0] >= 0 }
+                    guard let first = paired.first, let last = paired.last else { continue }
+                    let start = heard.keys[pair[first]].start
+                    let end = heard.keys[pair[last]].end
+                    var isDoubtful = false
+                    if index > 0, isSilent(drafts[index - 1].keys), !touchesFailure(window.lower, start) {
+                        isDoubtful = true
+                    }
+                    if index + 1 < drafts.count, isSilent(drafts[index + 1].keys), !touchesFailure(end, window.upper) {
+                        isDoubtful = true
+                    }
+                    if isDoubtful {
+                        release(range)
+                        changed = true
+                    }
+                }
+            }
+        }
+
+        /// 沒對上的這一行可能落在哪。自己有聽到幾個音的看前後配到的音；其他的看前後靠得住的行，寧可多標沒辨識。
+        private func reach(_ range: Range<Int>, _ window: Window) -> Window {
+            guard isSolid(range) else { return window }
             let before = lastPaired(before: range.lowerBound)
             let after = firstPaired(from: range.upperBound)
-            let lower = before >= 0 ? heard.keys[before].end : 0
-            let upper = after < heard.keys.count ? heard.keys[after].start : duration
-            return failed.contains { min(upper, $0.upperBound) - max(lower, $0.lowerBound) >= 0.3 }
+            return Window(lower: before >= 0 ? heard.keys[before].end : 0,
+                          upper: after < heard.keys.count ? heard.keys[after].start : duration)
         }
 
         private mutating func grade(_ drafts: inout [Draft], sparse: Bool) {
+            if !failed.isEmpty {
+                for draft in drafts { trimAcrossFailure(draft.keys) }
+            }
+            // 先把對不上的行碰巧沾到的音全部放掉再判，不然前面的行會拿後面還沒放掉的當界線。
+            for draft in drafts where ratio(draft.keys) < CaptionAligner.missingRatio {
+                release(draft.keys)
+            }
+            let areas = windows(drafts)
+            releaseDoubtful(drafts, areas)
             for index in drafts.indices {
                 let range = drafts[index].keys
                 let share = ratio(range)
+                let area = reach(range, areas[index])
                 if share >= CaptionAligner.matchedRatio {
                     drafts[index].status = .matched
-                } else if sparse || touchesFailure(range) {
+                } else if sparse || touchesFailure(area.lower, area.upper) {
                     drafts[index].status = .unrecognized
-                    if share < CaptionAligner.missingRatio { release(range) }
                 } else if share >= CaptionAligner.missingRatio {
                     drafts[index].status = .uncertain
                 } else {
                     drafts[index].status = .missing
-                    release(range)
                 }
             }
             for index in drafts.indices {
@@ -738,10 +851,13 @@ enum CaptionAligner {
                     continue
                 }
                 var end = start
-                while end < total, owner[end] < 0 { end += 1 }
+                // 中間斷過就分開算，斷點兩邊的聲音不能接給同一行。
+                while end < total, owner[end] < 0, end == start || !isHole(before: end) { end += 1 }
                 let run = start..<end
-                let before: Int? = start > 0 ? owner[start - 1] : nil
-                let after: Int? = end < total ? owner[end] : nil
+                var before: Int?
+                if start > 0, owner[start - 1] >= 0, !isHole(before: start) { before = owner[start - 1] }
+                var after: Int?
+                if end < total, owner[end] >= 0, !isHole(before: end) { after = owner[end] }
                 start = end
 
                 let tail = before.map { unpairedTail(drafts[$0].keys) } ?? 0
@@ -938,11 +1054,17 @@ enum CaptionAligner {
             CaptionAligner.tidy(&shown, duration: duration)
             var aside = hidden
             for index in aside.indices {
-                // 藏起來的句子可以和別句重疊，只要自己站得住。
-                aside[index].start = min(max(0, aside[index].start), max(0, duration - CaptionAligner.minimumDuration))
+                // 藏起來的句子可以和別句重疊，只要自己站得住。靠近片尾往前挪時不能跑到前一句的前面，順序會亂。
+                let wanted = aside[index].start
+                var previous = 0.0
+                if let line = shown.last(where: { $0.start < wanted }) { previous = line.start + 0.01 }
+                let latest = max(0, duration - CaptionAligner.minimumDuration)
+                aside[index].start = max(previous, min(max(0, wanted), latest))
                 aside[index].end = min(duration, max(aside[index].end, aside[index].start + CaptionAligner.minimumDuration))
+                CaptionAligner.fitWords(&aside[index])
             }
-            return CaptionAligner.ordered(shown + aside)
+            // 開始時間一樣的，藏著的排前面：它是塞在兩句中間的，接在前一句後面。
+            return CaptionAligner.ordered(aside + shown)
         }
     }
 
@@ -958,18 +1080,13 @@ enum CaptionAligner {
     }
 
     /// 不重疊、每句至少 0.7 秒、不超出這一段；小空隙補起來免得字幕閃。
-    static func tidy(_ lines: inout [CaptionLine], duration: Double) {
+    /// least 是最短停留。closesGaps 關掉就不補空隙，使用者調過的時間不要動。
+    static func tidy(_ lines: inout [CaptionLine], duration: Double,
+                     least shortest: Double = CaptionAligner.minimumDuration, closesGaps: Bool = true) {
         guard !lines.isEmpty, duration > 0 else { return }
-        let least = minimumDuration
-        if Double(lines.count) * least > duration {
-            // 塞不下，平均分，至少不重疊。
-            let each = duration / Double(lines.count)
-            for index in lines.indices {
-                lines[index].start = each * Double(index)
-                lines[index].end = each * Double(index + 1)
-            }
-            return
-        }
+        // 塞不下就縮短最短停留，已經對好的時間盡量留著。只取平均的一半：取滿的話每一句都被擠成一樣長，等於重分。
+        let average = duration / Double(lines.count)
+        let least = shortest > average ? average / 2 : shortest
         // 先用旁邊的空檔補長度：往後補，不夠再往前。
         for index in lines.indices {
             let previousEnd = index > 0 ? lines[index - 1].end : 0
@@ -997,9 +1114,23 @@ enum CaptionAligner {
         }
         for index in lines.indices {
             let nextStart = index + 1 < lines.count ? lines[index + 1].start : duration
-            if nextStart - lines[index].end < closeGap {
+            if closesGaps, nextStart - lines[index].end < closeGap {
                 lines[index].end = max(lines[index].end, nextStart)
             }
+            fitWords(&lines[index])
+        }
+    }
+
+    /// 句子挪過之後，詞的時間跟著收進句子裡，不然拆句的切點會歪。沒跑出去的不動。
+    static func fitWords(_ line: inout CaptionLine) {
+        guard let from = line.words.map({ $0.start }).min(), let to = line.words.map({ $0.end }).max(),
+              line.end >= line.start, to > from else { return }
+        if from >= line.start - 0.01, to <= line.end + 0.01 { return }
+        let scale = min(1, (line.end - line.start) / (to - from))
+        let origin = min(max(from, line.start), line.end - (to - from) * scale)
+        for index in line.words.indices {
+            line.words[index].start = origin + (line.words[index].start - from) * scale
+            line.words[index].end = origin + (line.words[index].end - from) * scale
         }
     }
 }

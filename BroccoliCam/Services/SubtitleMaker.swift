@@ -33,6 +33,8 @@ enum SubtitleMaker {
         let coverage: Double
         /// 這次有沒有真的做語音辨識。沒有的話，時間是照字數平均排的。
         let recognized: Bool
+        /// 有沒有一段沒辨識到。那一段的句子時間是猜的。
+        let hasFailures: Bool
     }
 
     static func make(videoURL: URL, script: String, maxChars: Int,
@@ -44,9 +46,10 @@ enum SubtitleMaker {
             clips: [(url: videoURL, clip: clip, offset: 0, duration: duration)],
             maxChars: maxChars, log: log, progress: { _ in }
         )
-        // 漏講的不進字幕檔；多講的、要確認的都進，剪輯時看得到。
-        let lines = built.lines.filter { !$0.isHidden && !$0.text.isEmpty }
+        let lines = writable(built.lines, duration: duration)
         guard !lines.isEmpty else { throw SubtitleError.nothingToWrite }
+        let hasFailures = !built.recognition.failedRanges.isEmpty
+            || built.lines.contains { $0.status == .unrecognized }
         // 沒有稿子就沒有對不對得上的問題。
         let coverage = built.recognition.coverage ?? 1
         log(String(format: "字幕 %d 句，對上 %.0f%%", lines.count, coverage * 100))
@@ -58,6 +61,19 @@ enum SubtitleMaker {
         try? FileManager.default.removeItem(at: url)
         try SubtitleLines.srt(lines).write(to: url, atomically: true, encoding: .utf8)
         return Result(url: url, cueCount: lines.count, coverage: coverage,
-                      recognized: built.recognition.engine != CaptionBuilder.noEngine)
+                      recognized: built.recognition.engine != CaptionBuilder.noEngine,
+                      hasFailures: hasFailures)
+    }
+
+    /// 漏講的不進字幕檔；多講的、要確認的都進，剪輯時看得到。
+    /// 沒辨識到又塞不下的句子在校對頁先藏著等人看，字幕檔沒有人會看過，漏掉不會有人發現，所以照進。
+    private static func writable(_ lines: [CaptionLine], duration: Double) -> [CaptionLine] {
+        var result = lines.filter { !($0.isHidden && $0.status == .missing) }
+        if result.contains(where: { $0.isHidden }) {
+            for index in result.indices { result[index].isHidden = false }
+            // 藏著的可以和別句重疊，這裡要排開。最短停留放短，才不會把前後對好的句子推太遠。
+            CaptionAligner.tidy(&result, duration: duration, least: CaptionEditing.shortest)
+        }
+        return result.filter(\.isBurnable)
     }
 }

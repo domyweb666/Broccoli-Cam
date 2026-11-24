@@ -71,6 +71,8 @@ final class CameraService: NSObject, ObservableObject {
     private var audioPacketCount = 0
     private var videoDevice: AVCaptureDevice?
     private var isConfigured = false
+    /// 現在該不該開著：start 之後、stop 之前。完成頁和校對頁開著時是 false。sessionQueue 讀寫。
+    private var wantsRunning = false
     private var desiredResolution: VideoResolution = .hd1080
     private var desiredFPS = 30
     private var desiredStabilization: StabilizationLevel = .off
@@ -190,6 +192,7 @@ final class CameraService: NSObject, ObservableObject {
         let knownAngle = currentCaptureAngle()
         lastSentAngle = knownAngle
         sessionQueue.async {
+            self.wantsRunning = true
             self.desiredResolution = resolution
             self.desiredFPS = fps
             self.mirrorOutput = mirrorOutput
@@ -231,6 +234,7 @@ final class CameraService: NSObject, ObservableObject {
 
     func stop() {
         sessionQueue.async {
+            self.wantsRunning = false
             // 先把檔案收好，再停相機。
             self.finishRecordingNow()
             if self.session.isRunning {
@@ -1178,7 +1182,8 @@ final class CameraService: NSObject, ObservableObject {
         }
         if error?.code == .mediaServicesWereReset {
             sessionQueue.async {
-                if !self.session.isRunning {
+                // 完成頁或校對頁開著就不叫起來，會把播放的音訊搶走。離開那一頁時畫面會自己再叫 start。
+                if self.wantsRunning, !self.session.isRunning {
                     self.session.startRunning()
                 }
                 let running = self.session.isRunning

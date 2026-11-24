@@ -504,8 +504,8 @@ private final class CaptionBurnJob: @unchecked Sendable {
         guard reader.canAdd(frames) else { throw CaptionBurnError.cannotRead }
         reader.add(frames)
 
+        // 不開 shouldOptimizeForNetworkUse：收尾要再寫一份，空間快滿時會燒到最後才失敗，存照片也用不到。
         let writer = try AVAssetWriter(outputURL: output, fileType: .mov)
-        writer.shouldOptimizeForNetworkUse = true
         let videoInput = try addVideo(to: writer)
         let attributes: [String: Any] = Self.bufferAttributes(size: size)
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: videoInput,
