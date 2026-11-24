@@ -55,9 +55,36 @@ final class SpeechActivityMonitor: ObservableObject {
         route = text.isEmpty ? "無輸入" : text
     }
 
+    private func currentLevel() -> Float? {
+        #if targetEnvironment(simulator)
+        if let fake = fakeLevel() { return fake }
+        #endif
+        return levelProvider?()
+    }
+
+    #if targetEnvironment(simulator)
+    /// 測試用：模擬器沒有聲音。debugFakeLevel 寫「音量x次數」，例如 20x30,70x10 是
+    /// -20 dBFS 三秒、-70 一秒，一直重複；上下晃 4 dB，才不會被當成冷氣聲。
+    private static let fakePattern: [Float] = {
+        let text = UserDefaults.standard.string(forKey: "debugFakeLevel") ?? ""
+        return text.split(separator: ",").flatMap { part -> [Float] in
+            let pair = part.split(separator: "x")
+            guard pair.count == 2, let level = Float(pair[0]), let count = Int(pair[1]) else { return [] }
+            return Array(repeating: -level, count: count)
+        }
+    }()
+    private var fakeIndex = 0
+
+    private func fakeLevel() -> Float? {
+        guard !Self.fakePattern.isEmpty else { return nil }
+        fakeIndex += 1
+        return Self.fakePattern[fakeIndex % Self.fakePattern.count] + (fakeIndex % 2 == 0 ? 4 : -4)
+    }
+    #endif
+
     private func tick() {
         let now = Date()
-        guard let value = levelProvider?() else {
+        guard let value = currentLevel() else {
             if level != -160 { level = -160 }
             if now.timeIntervalSince(startedAt) > 3, micStatus != .noSignal { micStatus = .noSignal }
             if isSpeaking { isSpeaking = false }

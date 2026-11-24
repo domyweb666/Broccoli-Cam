@@ -78,7 +78,11 @@ final class CompanionModel: ObservableObject {
         let now = ProcessInfo.processInfo.systemUptime
         if let reaction = reactor.feed(time: now, level: Double(level), busy: isReacting) {
             // 播放器沒接（還在換人、沒有這種片），就當沒做過，不扣間隔。
-            if onReaction?(reaction) != true { reactor.declined() }
+            let accepted = onReaction?(reaction) == true
+            if !accepted { reactor.declined() }
+            #if targetEnvironment(simulator)
+            NSLog("[companion] %.2f %@ %@", now, "\(reaction)", accepted ? "播" : "沒接")
+            #endif
         }
         updateExpecting()
     }
@@ -109,6 +113,9 @@ final class CompanionModel: ObservableObject {
         // 點頭：只在對方持續講話時，偶爾一次，間隔不固定。
         if speaking, let due = nextNod, Date() >= due {
             nodCount += 1
+            #if targetEnvironment(simulator)
+            NSLog("[companion] %.2f 隨機點頭", ProcessInfo.processInfo.systemUptime)
+            #endif
             nextNod = Date().addingTimeInterval(Double.random(in: 4...8))
         }
     }

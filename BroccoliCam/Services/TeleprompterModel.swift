@@ -20,11 +20,30 @@ final class PromptLayout {
         let isBlank: Bool
     }
 
-    /// 一套排版。NSLayoutManager 不會抓著 NSTextStorage，要自己留著。
+    /// 每一行的基線都放在同樣的高度。不管的話，整行都是中文的會比夾了英文數字的低 3pt，行距看起來忽大忽小。
+    private final class FixedBaseline: NSObject, NSLayoutManagerDelegate {
+        let offset: CGFloat
+
+        init(offset: CGFloat) {
+            self.offset = offset
+        }
+
+        func layoutManager(_ layoutManager: NSLayoutManager,
+                           shouldSetLineFragmentRect lineFragmentRect: UnsafeMutablePointer<CGRect>,
+                           lineFragmentUsedRect: UnsafeMutablePointer<CGRect>,
+                           baselineOffset: UnsafeMutablePointer<CGFloat>,
+                           in textContainer: NSTextContainer, forGlyphRange glyphRange: NSRange) -> Bool {
+            baselineOffset.pointee = offset
+            return true
+        }
+    }
+
+    /// 一套排版。NSLayoutManager 不會抓著 NSTextStorage 和 delegate，要自己留著。
     private struct Engine {
         let storage: NSTextStorage
         let manager: NSLayoutManager
         let container: NSTextContainer
+        let baseline: FixedBaseline
 
         init(text: String, width: CGFloat, fontSize: CGFloat, color: UIColor) {
             let font = UIFont.systemFont(ofSize: fontSize, weight: .semibold)
@@ -46,6 +65,8 @@ final class PromptLayout {
                 .shadow: shadow
             ])
             manager = NSLayoutManager()
+            baseline = FixedBaseline(offset: font.ascender)
+            manager.delegate = baseline
             container = NSTextContainer(size: CGSize(width: width, height: .greatestFiniteMagnitude))
             container.lineFragmentPadding = 0
             manager.addTextContainer(container)
