@@ -28,6 +28,17 @@ struct SegmentTake {
     let lastSound: Double?
 }
 
+/// 切到陪伴時收起來的分段進度。檔案不動，切回提詞原樣放回去。
+private struct ShelvedTakes {
+    let segments: [String]
+    let currentIndex: Int
+    let takes: [Int: SegmentTake]
+    let takesLandscape: Bool?
+    let pending: SegmentTake?
+    let lockedAngle: Double
+    let declinedSegments: [String]?
+}
+
 /// 錄影狀態與流程協調：倒數 → 錄影 → （分段：留用或重錄 → 接片）→ 完成頁。
 final class RecordingViewModel: ObservableObject {
     enum Phase: Equatable {
@@ -68,6 +79,10 @@ final class RecordingViewModel: ObservableObject {
     private var waitingScript: String?
     /// 使用者選了保留時，新稿切出來的段落。同一份不再問。
     private var declinedSegments: [String]?
+    /// 切到陪伴時收起來的段落。
+    private var shelf: ShelvedTakes?
+    /// 現在的段落是照哪個模式切的。
+    private var isCompanion = false
     /// 跳轉、切換之後在畫面上閃一下的字，約 1.2 秒自己消失。
     @Published private(set) var jumpNote: String?
     /// 按下錄影那一刻介面轉的角度，錄影中不跟著手機晃動改變。
@@ -137,6 +152,7 @@ final class RecordingViewModel: ObservableObject {
         guard self.camera == nil else { return }
         self.camera = camera
         self.settings = settings
+        isCompanion = settings.companionMode
         camera.onRecordingFinished = { [weak self] url, note in
             self?.recordingFinished(url, damaged: note != nil)
         }
@@ -177,6 +193,8 @@ final class RecordingViewModel: ObservableObject {
     /// 稿件內容、分段開關變了就重新切段。切出來不同、又已經錄了幾段時先問（force 是已經問過了）。
     /// 錄影中先記著，回到待機再套。
     func updateScript(_ script: String, force: Bool = false) {
+        // 模式還沒換好就拿新模式的稿子來比，會誤刪已錄的。
+        applyMode()
         guard split(script) != segments else {
             waitingScript = nil
             declinedSegments = nil
@@ -204,8 +222,55 @@ final class RecordingViewModel: ObservableObject {
         declinedSegments = waitingScript.map { split($0) }
     }
 
-    /// 有等著套用的新稿就再看一次能不能套。
+    /// 提詞和陪伴切換。陪伴不看稿，但稿子沒有變，已錄的各段先收著，切回提詞再放回來。
+    /// 這裡不問換稿：選單或設定頁還開著，視窗跳不出來，等那一頁關掉再由 reconsiderScript 看。
+    func applyMode() {
+        guard let settings, settings.companionMode != isCompanion else { return }
+        guard phase == .idle, !isMerging, review == nil else { return }
+        isCompanion = settings.companionMode
+        scriptChange = nil
+        if isCompanion {
+            shelveTakes()
+        } else {
+            restoreTakes()
+        }
+    }
+
+    private func shelveTakes() {
+        if recordedCount > 0 {
+            shelf = ShelvedTakes(
+                segments: segments, currentIndex: currentIndex, takes: takes,
+                takesLandscape: takesLandscape, pending: pending,
+                lockedAngle: lockedAngle, declinedSegments: declinedSegments
+            )
+        }
+        // 檔案交給 shelf 了，先清空，discardAllTakes 才不會刪到。
+        takes = [:]
+        pending = nil
+        waitingScript = settings?.activeScript ?? ""
+        discardAllTakes()
+    }
+
+    private func restoreTakes() {
+        waitingScript = settings?.activeScript ?? ""
+        guard let saved = shelf else {
+            discardAllTakes()
+            return
+        }
+        shelf = nil
+        segments = saved.segments
+        currentIndex = saved.currentIndex
+        takes = saved.takes
+        takesLandscape = saved.takesLandscape
+        pending = saved.pending
+        if saved.pending != nil { lockedAngle = saved.lockedAngle }
+        declinedSegments = saved.declinedSegments
+        prompter.reset()
+    }
+
+    /// 有等著套用的模式或新稿就再看一次能不能套。
     func reconsiderScript() {
+        applyMode()
         guard let waiting = waitingScript else { return }
         updateScript(waiting)
     }

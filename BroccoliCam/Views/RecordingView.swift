@@ -216,7 +216,7 @@ struct RecordingView: View {
     private var scriptObserved: some View {
         formatObserved
             .onChange(of: settings.companionMode) { _, _ in
-                viewModel.updateScript(settings.activeScript, force: true)
+                viewModel.applyMode()
                 viewModel.prompter.reset()
                 updateCompanion()
             }
@@ -335,10 +335,10 @@ struct RecordingView: View {
         }) {
             ScriptListView()
         }
-        .sheet(isPresented: $showSettings) {
+        .sheet(isPresented: $showSettings, onDismiss: { viewModel.reconsiderScript() }) {
             SettingsView(hasTakes: hasTakes)
         }
-        .sheet(isPresented: $showModes) {
+        .sheet(isPresented: $showModes, onDismiss: { viewModel.reconsiderScript() }) {
             ModeSheet()
         }
         .fullScreenCover(item: $viewModel.review, onDismiss: {
