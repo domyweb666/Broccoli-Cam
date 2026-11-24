@@ -20,6 +20,8 @@ final class SpeechFollower {
     private let requestLock = NSLock()
 
     private var keys: [SpokenKeys.Key] = []
+    /// 稿子全長（UTF-16），整篇唸完時回報這個位置。
+    private var textLength = 0
     /// 下一個要唸的字在 keys 裡的位置。
     private var position = 0
     private var active = false
@@ -28,6 +30,11 @@ final class SpeechFollower {
 
     static var isAuthorized: Bool {
         SFSpeechRecognizer.authorizationStatus() == .authorized
+    }
+
+    /// 還沒問過權限。
+    static var isUndetermined: Bool {
+        SFSpeechRecognizer.authorizationStatus() == .notDetermined
     }
 
     static func requestAuthorization(_ done: @escaping (Bool) -> Void) {
@@ -50,6 +57,7 @@ final class SpeechFollower {
         let all = SpokenKeys.keys(of: text)
         guard all.count >= 4 else { return false }
         keys = all
+        textLength = text.utf16.count
         position = 0
         matchCount = 0
         failures = 0
@@ -194,7 +202,6 @@ final class SpeechFollower {
 
         position = next
         matchCount += 1
-        let target = keys[min(position, keys.count - 1)].utf16Offset
-        onProgress?(target)
+        onProgress?(position < keys.count ? keys[position].utf16Offset : textLength)
     }
 }

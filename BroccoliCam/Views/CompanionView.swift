@@ -4,14 +4,22 @@ import UIKit
 
 /// 陪伴模式的聆聽者：播 CompanionClipPlayer 的 9:16 預錄短片。
 /// 只是預覽上的畫面，不會錄進影片，也不會發出聲音。
-/// 四種擺法（圓形頭像、頂部小窗、上下分割、視訊通話）都用這個 view，差在外框大小和裁法。
+/// 所有擺法都用這個 view，差在外框大小和裁法。
 struct CompanionView: View {
+    enum Crop {
+        /// 寬或高貼滿外框，頭頂對齊上緣。
+        case top
+        /// 放大到臉（圓形頭像）。
+        case face
+        /// 眉毛到嘴巴的橫條（眼神條）。
+        case eyes
+    }
+
     @ObservedObject var player: CompanionClipPlayer
-    /// 放大到臉（圓形頭像用）。關掉時影片寬度貼齊外框、頭頂對齊上緣。
-    var faceZoom = false
+    var crop: Crop = .top
 
     var body: some View {
-        CompanionVideoView(player: player, faceZoom: faceZoom)
+        CompanionVideoView(player: player, crop: crop)
             .allowsHitTesting(false)
             .accessibilityLabel("聆聽者")
     }
@@ -19,13 +27,15 @@ struct CompanionView: View {
 
 private struct CompanionVideoView: UIViewRepresentable {
     @ObservedObject var player: CompanionClipPlayer
-    let faceZoom: Bool
+    let crop: CompanionView.Crop
 
     final class VideoView: UIView {
         let stillView = UIImageView()
         let videoLayers = [AVPlayerLayer(), AVPlayerLayer()]
-        var faceZoom = false {
-            didSet { setNeedsLayout() }
+        var crop: CompanionView.Crop = .top {
+            didSet {
+                if crop != oldValue { setNeedsLayout() }
+            }
         }
         private var shownFront = -1
 
@@ -48,17 +58,24 @@ private struct CompanionVideoView: UIViewRepresentable {
         }
 
         /// 9:16 影片在外框裡的位置。
-        /// 一般：寬或高至少一邊貼滿，頭頂貼齊上緣，讓眼睛靠近前鏡頭。
-        /// 放大到臉：頭到脖子塞滿外框（定格圖的眼睛大約在高度 21% 的地方）。
+        /// 定格圖的眼睛大約在高度 21% 的地方，放大時都拿眼睛當基準。
         private func videoRect() -> CGRect {
             let w = bounds.width
             let h = bounds.height
             guard w > 0, h > 0 else { return .zero }
-            if faceZoom {
+            switch crop {
+            case .face:
                 let videoHeight = h * 2.6
                 let videoWidth = videoHeight * 9 / 16
                 return CGRect(x: (w - videoWidth) / 2, y: h / 2 - videoHeight * 0.21,
                               width: videoWidth, height: videoHeight)
+            case .eyes:
+                let videoWidth = w
+                let videoHeight = videoWidth * 16 / 9
+                return CGRect(x: 0, y: h * 0.34 - videoHeight * 0.21,
+                              width: videoWidth, height: videoHeight)
+            case .top:
+                break
             }
             let scale = max(w / 9, h / 16)
             let videoWidth = 9 * scale
@@ -96,7 +113,7 @@ private struct CompanionVideoView: UIViewRepresentable {
     func makeUIView(context: Context) -> VideoView {
         let view = VideoView()
         view.stillView.image = player.still
-        view.faceZoom = faceZoom
+        view.crop = crop
         for (index, videoLayer) in view.videoLayers.enumerated() {
             videoLayer.player = player.players[index]
         }
@@ -105,7 +122,7 @@ private struct CompanionVideoView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: VideoView, context: Context) {
-        uiView.faceZoom = faceZoom
+        uiView.crop = crop
         uiView.show(front: player.front, animated: true)
     }
 }

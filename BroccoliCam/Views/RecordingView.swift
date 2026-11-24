@@ -12,6 +12,7 @@ struct RecordingView: View {
 
     @State private var showScript = false
     @State private var showSettings = false
+    @State private var showModes = false
 
     // body 拆成三層（版面、狀態監聽、彈出視窗），一整串寫在一起編譯器會算不完。
     var body: some View {
@@ -104,6 +105,7 @@ struct RecordingView: View {
             }
             .onChange(of: showScript) { _, _ in updateHardwareEnabled() }
             .onChange(of: showSettings) { _, _ in updateHardwareEnabled() }
+            .onChange(of: showModes) { _, _ in updateHardwareEnabled() }
     }
 
     /// 和相機有關的監聽。
@@ -117,6 +119,7 @@ struct RecordingView: View {
             UIApplication.shared.isIdleTimerDisabled = true
             startCamera()
             updateCompanion()
+            askSpeechIfNeeded()
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
@@ -172,11 +175,15 @@ struct RecordingView: View {
         .sheet(isPresented: $showScript, onDismiss: {
             viewModel.updateScript(settings.activeScript)
             viewModel.prompter.reset()
+            askSpeechIfNeeded()
         }) {
             ScriptEditorView()
         }
         .sheet(isPresented: $showSettings) {
             SettingsView()
+        }
+        .sheet(isPresented: $showModes) {
+            ModeSheet()
         }
         .fullScreenCover(item: $viewModel.review, onDismiss: {
             startCamera()
@@ -192,7 +199,8 @@ struct RecordingView: View {
     private var statusAndSegments: some View {
         VStack(spacing: 10) {
             StatusRow(phase: viewModel.phase, elapsed: viewModel.elapsed, estimate: estimate,
-                      canSwitchMode: !viewModel.isBusy && viewModel.pending == nil)
+                      canSwitchMode: !viewModel.isBusy && viewModel.pending == nil,
+                      showModes: $showModes)
             if viewModel.isSegmented {
                 SegmentBar(viewModel: viewModel)
             }
@@ -250,7 +258,13 @@ struct RecordingView: View {
     }
 
     private func updateHardwareEnabled() {
-        viewModel.hardwareEnabled = !(showScript || showSettings)
+        viewModel.hardwareEnabled = !(showScript || showSettings || showModes)
+    }
+
+    /// 有稿子要唸、又開著語音跟隨，先把辨識權限問完，不要等按了錄影才跳出來。
+    private func askSpeechIfNeeded() {
+        guard settings.voiceFollow, settings.usesPrompter, SpeechFollower.isUndetermined else { return }
+        SpeechFollower.requestAuthorization { _ in }
     }
 
     private func startCamera() {
@@ -276,41 +290,116 @@ private struct PreviewStack: View {
     let bottomInset: CGFloat
 
     /// 陪伴模式下聆聽者的擺法；提詞模式是 nil。
-    /// 橫放時「上下分割」「視訊通話」改用頂部小窗：鏡頭在側邊，分割和滿版都對不上視線。
+    /// 橫放時只有圓形頭像和頂部小窗對得上視線（鏡頭在側邊），其他擺法改用頂部小窗。
     private var layout: CompanionLayout? {
         guard settings.companionMode else { return nil }
         let chosen = settings.companionLayout
-        if angle != 0 && (chosen == .split || chosen == .fullCall) {
+        if angle != 0 && chosen != .circle {
             return .topCard
         }
         return chosen
     }
 
-    /// 圓形頭像和頂部小窗：聆聽者是疊在自己畫面上的小圖。
-    private var showsSmallCompanion: Bool {
-        layout == .circle || layout == .topCard
+    /// 已經按下錄影、倒數結束。
+    private var isRolling: Bool {
+        switch phase {
+        case .starting, .recording, .finishing: return true
+        case .idle, .countdown: return false
+        }
     }
 
-    /// 自己的畫面是不是佔滿預覽區。分割和視訊通話時自己的畫面變小，構圖框就不顯示。
-    private var cameraIsFull: Bool {
-        layout != .split && layout != .fullCall
+    /// 自己的畫面在預覽區裡的位置。一律是完整的 9:16，頭在裡面的位置就是錄出來的位置。
+    private var cameraRect: CGRect {
+        let full = CGRect(origin: .zero, size: size)
+        switch layout {
+        case .fullCall?:
+            return selfWindowRect
+        case .alignFirst?:
+            return isRolling ? selfWindowRect : full
+        case .fullFrame?:
+            let available = size.height - bottomInset - 8
+            let height = available * 0.64
+            let width = height * 9 / 16
+            return CGRect(x: (size.width - width) / 2, y: available - height, width: width, height: height)
+        default:
+            return full
+        }
     }
+
+    /// 視訊通話時，自己縮成右下角的 9:16 小窗。
+    private var selfWindowRect: CGRect {
+        let width = size.width * 0.28
+        let height = width * 16 / 9
+        return CGRect(x: size.width - 12 - width, y: size.height - bottomInset - 12 - height,
+                      width: width, height: height)
+    }
+
+    /// 聆聽者放在哪裡、怎麼裁。
+    private struct CompanionPlacement {
+        /// 轉正之前的大小。
+        var size: CGSize
+        var center: CGPoint
+        var radius: CGFloat
+        var crop: CompanionView.Crop = .top
+        /// 墊在自己的畫面底下（滿版）。
+        var isBackdrop = false
+    }
+
+    private func placement(_ layout: CompanionLayout) -> CompanionPlacement {
+        switch layout {
+        case .circle, .topCard:
+            let isCircle = layout == .circle
+            let width: CGFloat = isCircle ? min(size.width * 0.34, 150) : min(size.width * 0.30, 128)
+            let height: CGFloat = isCircle ? width : width * 16 / 9
+            // 橫放時整個轉 90 度，佔的高度是原本的寬。
+            let visualHeight = angle == 0 ? height : width
+            return CompanionPlacement(size: CGSize(width: width, height: height),
+                                      center: CGPoint(x: size.width / 2, y: 12 + visualHeight / 2),
+                                      radius: isCircle ? width / 2 : 16,
+                                      crop: isCircle ? .face : .top)
+        case .eyeStrip:
+            let height = size.height * Self.eyeStripHeight
+            return CompanionPlacement(size: CGSize(width: size.width * 0.62, height: height),
+                                      center: CGPoint(x: size.width / 2, y: 8 + height / 2),
+                                      radius: 20, crop: .eyes)
+        case .fullFrame:
+            let cam = cameraRect
+            let height = max(1, cam.minY - 16)
+            return CompanionPlacement(size: CGSize(width: cam.width, height: height),
+                                      center: CGPoint(x: size.width / 2, y: 8 + height / 2),
+                                      radius: 14)
+        case .fullCall, .alignFirst:
+            return CompanionPlacement(size: size, center: CGPoint(x: size.width / 2, y: size.height / 2),
+                                      radius: 0, isBackdrop: true)
+        }
+    }
+
+    /// 眼神條的高度（佔畫面高度的比例）。
+    private static let eyeStripHeight: CGFloat = 0.12
 
     /// 有稿件時，構圖框只在開始提詞前顯示供對位；提詞開始後淡出。
     private var showGuide: Bool {
-        guard settings.showGuide, cameraIsFull else { return false }
+        guard settings.showGuide else { return false }
         if settings.usesPrompter && (prompter.isPlaying || prompter.offset > 0) { return false }
         return true
     }
 
     var body: some View {
         ZStack(alignment: .top) {
-            stage
+            cameraLayer
+
+            if let layout {
+                companionLayer(placement(layout))
+            }
 
             if showGuide {
-                FramingGuideView(faces: camera.faces, scale: CGFloat(settings.guideScale), angle: angle)
-                    .turned(angle, width: size.width, height: size.height)
+                let cam = cameraRect
+                FramingGuideView(faces: camera.faces, scale: CGFloat(settings.guideScale), angle: angle,
+                                 topReserve: layout == .eyeStrip ? Self.eyeStripHeight + 0.02 : 0.06)
+                    .turned(angle, width: cam.width, height: cam.height)
+                    .position(x: cam.midX, y: cam.midY)
                     .transition(.opacity)
+                    .zIndex(2)
             }
 
             if settings.usesPrompter {
@@ -326,12 +415,7 @@ private struct PreviewStack: View {
                 .turned(angle, width: bandWidth, height: bandHeight)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .padding(.top, 8)
-            }
-
-            if showsSmallCompanion {
-                smallCompanion
-                    .padding(.top, 12)
-                    .transition(.opacity)
+                .zIndex(3)
             }
 
             if case .countdown(let remaining) = phase {
@@ -341,6 +425,7 @@ private struct PreviewStack: View {
                     .shadow(color: .black.opacity(0.5), radius: 8)
                     .rotationEffect(.degrees(angle))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .zIndex(6)
             }
 
             if isMerging {
@@ -356,6 +441,7 @@ private struct PreviewStack: View {
                 .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .rotationEffect(.degrees(angle))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .zIndex(6)
             }
 
             if let note = camera.interruptionText {
@@ -367,62 +453,35 @@ private struct PreviewStack: View {
                     .background(.black.opacity(0.7), in: Capsule())
                     .rotationEffect(.degrees(angle))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .zIndex(6)
             }
         }
         .animation(.easeInOut(duration: 0.3), value: showGuide)
     }
 
-    /// 最底層：自己的前鏡頭畫面，分割和視訊通話時再加上滿版的聆聽者。
-    @ViewBuilder
-    private var stage: some View {
-        switch layout {
-        case .split?:
-            VStack(spacing: 0) {
-                CompanionView(player: clipPlayer)
-                    .frame(width: size.width, height: size.height * 0.5)
-                CameraPreviewView(camera: camera, fill: true)
-                    .frame(width: size.width, height: size.height * 0.5)
-                    .clipShape(UnevenRoundedRectangle(topLeadingRadius: 18, topTrailingRadius: 18, style: .continuous))
-            }
-        case .fullCall?:
-            ZStack(alignment: .bottomTrailing) {
-                CompanionView(player: clipPlayer)
-                    .frame(width: size.width, height: size.height)
-                selfWindow
-            }
-        default:
-            CameraPreviewView(camera: camera)
-        }
-    }
-
-    /// 視訊通話時，自己的畫面縮成右下角的 9:16 小窗。
-    private var selfWindow: some View {
-        let width = size.width * 0.28
+    /// 前鏡頭預覽從頭到尾是同一個 view，換擺法只改外框。前後順序用 zIndex 調，不搬動 view。
+    private var cameraLayer: some View {
+        let cam = cameraRect
+        let isFull = cam.size == size
+        let shape = RoundedRectangle(cornerRadius: isFull ? 0 : 14, style: .continuous)
         return CameraPreviewView(camera: camera)
-            .frame(width: width, height: width * 16 / 9)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(.white.opacity(0.3), lineWidth: 1)
-            )
-            .padding(.trailing, 12)
-            .padding(.bottom, bottomInset + 12)
+            .frame(width: cam.width, height: cam.height)
+            .clipShape(shape)
+            .overlay(shape.stroke(Color.white.opacity(isFull ? 0 : 0.3), lineWidth: 1))
+            .position(x: cam.midX, y: cam.midY)
+            .zIndex(1)
     }
 
-    /// 圓形頭像和頂部小窗：鏡頭正下方的小聆聽者。橫放時整個轉過來。
-    private var smallCompanion: some View {
-        let isCircle = layout == .circle
-        let width: CGFloat = isCircle ? min(size.width * 0.34, 150) : min(size.width * 0.30, 128)
-        let height: CGFloat = isCircle ? width : width * 16 / 9
-        let shape: AnyShape = isCircle
-            ? AnyShape(Circle())
-            : AnyShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        let sideways = angle != 0
-        return CompanionView(player: clipPlayer, faceZoom: isCircle)
-            .frame(width: width, height: height)
+    private func companionLayer(_ place: CompanionPlacement) -> some View {
+        let shape = RoundedRectangle(cornerRadius: place.radius, style: .circular)
+        return CompanionView(player: clipPlayer, crop: place.crop)
+            .frame(width: place.size.width, height: place.size.height)
             .clipShape(shape)
-            .overlay(shape.stroke(.white.opacity(0.2), lineWidth: 1))
-            .turned(angle, width: sideways ? height : width, height: sideways ? width : height)
+            .overlay(shape.stroke(Color.white.opacity(place.isBackdrop ? 0 : 0.2), lineWidth: 1))
+            .rotationEffect(.degrees(angle))
+            .position(place.center)
+            .allowsHitTesting(false)
+            .zIndex(place.isBackdrop ? 0 : 4)
     }
 }
 
@@ -436,6 +495,7 @@ private struct StatusRow: View {
     let estimate: TimeInterval?
     /// 待機時才能切換提詞／陪伴。
     let canSwitchMode: Bool
+    @Binding var showModes: Bool
 
     private var timeText: String {
         let now = Self.format(elapsed)
@@ -466,7 +526,7 @@ private struct StatusRow: View {
 
             if canSwitchMode {
                 Button {
-                    settings.companionMode.toggle()
+                    showModes = true
                 } label: {
                     HStack(spacing: 5) {
                         Image(systemName: settings.companionMode ? "person.wave.2.fill" : "text.alignleft")
@@ -482,7 +542,7 @@ private struct StatusRow: View {
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(settings.companionMode ? "切換到提詞模式" : "切換到陪伴模式")
+                .accessibilityLabel(settings.companionMode ? "選擇模式，目前是陪伴" : "選擇模式，目前是提詞")
             }
         }
     }

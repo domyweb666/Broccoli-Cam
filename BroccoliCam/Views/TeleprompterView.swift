@@ -19,9 +19,9 @@ struct TeleprompterView: View {
 
     var body: some View {
         GeometryReader { geo in
-            Text(text)
+            PromptText(text: text, spoken: model.spokenOffset)
+                .equatable()
                 .font(.system(size: fontSize, weight: .semibold))
-                .foregroundStyle(.white)
                 .multilineTextAlignment(.center)
                 .lineSpacing(fontSize * 0.28)
                 .shadow(color: .black.opacity(0.6), radius: 2, x: 0, y: 1)
@@ -76,5 +76,25 @@ struct TeleprompterView: View {
                     dragStartOffset = nil
                 }
         )
+    }
+}
+
+/// 稿子文字：唸過的字變綠，還沒唸的維持白色。
+/// 提詞每一格都在捲動，獨立成 Equatable 的 view，唸到的位置沒變就不重新組字。
+private struct PromptText: View, Equatable {
+    let text: String
+    let spoken: Int
+
+    var body: some View {
+        Text(styled)
+    }
+
+    private var styled: AttributedString {
+        let cut = String.Index(utf16Offset: min(max(0, spoken), text.utf16.count), in: text)
+        var done = AttributedString(String(text[..<cut]))
+        done.foregroundColor = Theme.good
+        var rest = AttributedString(String(text[cut...]))
+        rest.foregroundColor = Color.white
+        return done + rest
     }
 }

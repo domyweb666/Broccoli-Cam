@@ -11,16 +11,21 @@ enum VideoResolution: String, CaseIterable, Identifiable {
     var height: Int32 { self == .uhd4k ? 2160 : 1080 }
 }
 
-/// 陪伴模式裡聆聽者放在哪裡。四種都做，多米在真機上切著比。
+/// 陪伴模式裡聆聽者放在哪裡。每種都做，多米在真機上切著比。
+/// 共同規則：自己的畫面一定是完整的 9:16，看到頭在哪，錄出來就在哪。
 enum CompanionLayout: String, CaseIterable, Identifiable {
     /// 鏡頭下方一個小圓（原本的做法）
     case circle
     /// 鏡頭下方一張 9:16 小卡
     case topCard
-    /// 聆聽者上半，自己的畫面下半
-    case split
     /// 聆聽者滿版，自己縮在角落（像視訊通話）
     case fullCall
+    /// 鏡頭正下方一條她的眼睛，自己滿版
+    case eyeStrip
+    /// 她在上、自己完整的 9:16 畫面在下，互不遮擋
+    case fullFrame
+    /// 開錄前自己滿版對位，開錄後她滿版、自己縮成小窗
+    case alignFirst
 
     var id: String { rawValue }
 
@@ -28,8 +33,10 @@ enum CompanionLayout: String, CaseIterable, Identifiable {
         switch self {
         case .circle: return "圓形頭像"
         case .topCard: return "頂部小窗"
-        case .split: return "上下分割"
         case .fullCall: return "視訊通話"
+        case .eyeStrip: return "眼神條"
+        case .fullFrame: return "完整取景"
+        case .alignFirst: return "對位再開講"
         }
     }
 }
@@ -66,7 +73,7 @@ final class SettingsStore: ObservableObject {
     /// 接片時裁掉每段頭尾沒有聲音的部分
     @Published var trimSilence: Bool { didSet { defaults.set(trimSilence, forKey: "trimSilence") } }
 
-    /// 提詞跟著聲音走（語音辨識）。還沒在真機驗過，預設關。
+    /// 提詞跟著聲音走（語音辨識），唸過的字會變色。還沒在真機驗過。
     @Published var voiceFollow: Bool { didSet { defaults.set(voiceFollow, forKey: "voiceFollow") } }
     /// 字幕每行最多幾個字
     @Published var subtitleMaxChars: Double { didSet { defaults.set(subtitleMaxChars, forKey: "subtitleMaxChars") } }
@@ -96,7 +103,7 @@ final class SettingsStore: ObservableObject {
         speechRate = (d.object(forKey: "speechRate") as? Double) ?? 220
         waitOnPause = (d.object(forKey: "waitOnPause") as? Bool) ?? true
         trimSilence = (d.object(forKey: "trimSilence") as? Bool) ?? true
-        voiceFollow = (d.object(forKey: "voiceFollow") as? Bool) ?? false
+        voiceFollow = (d.object(forKey: "voiceFollow") as? Bool) ?? true
         subtitleMaxChars = (d.object(forKey: "subtitleMaxChars") as? Double) ?? 14
         companionMode = (d.object(forKey: "companionMode") as? Bool) ?? false
         companionLayout = CompanionLayout(rawValue: d.string(forKey: "companionLayout") ?? "") ?? .fullCall

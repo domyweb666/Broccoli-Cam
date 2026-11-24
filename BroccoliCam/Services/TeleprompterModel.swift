@@ -7,6 +7,8 @@ final class TeleprompterModel: ObservableObject {
     @Published private(set) var isPlaying = false
     /// 目前是不是跟著聲音走。
     @Published private(set) var isFollowing = false
+    /// 語音跟隨已經唸到稿子的第幾個字（UTF-16），這之前的字會變色。沒在跟隨時是 0。
+    @Published private(set) var spokenOffset = 0
 
     /// 捲動速度（pt／秒）
     var speed: CGFloat = 36
@@ -67,6 +69,7 @@ final class TeleprompterModel: ObservableObject {
         pause()
         offset = 0
         followTarget = 0
+        spokenOffset = 0
     }
 
     /// 手動滑動時直接指定位置。
@@ -81,11 +84,14 @@ final class TeleprompterModel: ObservableObject {
         guard on != isFollowing else { return }
         followTarget = offset
         isFollowing = on
+        spokenOffset = 0
     }
 
     /// 唸到 text 的第 utf16Offset 個字了：把那一行捲到閱讀區最上面。
     func follow(utf16Offset: Int, in text: String) {
-        guard isFollowing, let table = table(for: text), !table.lines.isEmpty else { return }
+        guard isFollowing else { return }
+        spokenOffset = utf16Offset
+        guard let table = table(for: text), !table.lines.isEmpty else { return }
         let line = table.lines.first { $0.end > utf16Offset } ?? table.lines[table.lines.count - 1]
         // SwiftUI 實際排出來的高度和這裡算的可能差一點，按比例換算。
         let actual = max(1, contentHeight - 12)

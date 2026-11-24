@@ -28,13 +28,26 @@ final class FaceDetectionService: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
     }
 
-    /// 寬容比較：臉部矩形只是近似，不等於完整頭部輪廓。
+    /// 整顆頭（頭髮到下巴）的高寬比。
+    static let headAspect: CGFloat = 1.5
+
+    /// 由臉部矩形推估整顆頭的範圍：下緣對齊下巴，往上補額頭和頭髮。
+    /// 倍率是估的，真機上對不準就調這裡。
+    static func head(from face: CGRect) -> CGRect {
+        let width = face.width * 1.08
+        let height = width * headAspect
+        let bottom = face.maxY + face.height * 0.03
+        return CGRect(x: face.midX - width / 2, y: bottom - height, width: width, height: height)
+    }
+
+    /// 寬容比較：看頭的位置，大小差太多（超出頭像框縮放範圍）才算沒對上。
     static func status(face: CGRect?, guide: CGRect) -> FramingStatus {
         guard let face, guide.width > 0, guide.height > 0 else { return .unknown }
-        let dx = abs(face.midX - guide.midX) / guide.width
-        let dy = abs(face.midY - guide.midY) / guide.height
-        let ratio = face.width / guide.width
-        if dx < 0.28 && dy < 0.28 && ratio > 0.45 && ratio < 1.2 {
+        let head = Self.head(from: face)
+        let dx = abs(head.midX - guide.midX) / guide.width
+        let dy = abs(head.midY - guide.midY) / guide.height
+        let ratio = head.width / guide.width
+        if dx < 0.22 && dy < 0.18 && ratio > 0.65 && ratio < 1.5 {
             return .good
         }
         return .adjust

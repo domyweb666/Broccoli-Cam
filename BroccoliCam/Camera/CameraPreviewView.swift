@@ -3,10 +3,10 @@ import AVFoundation
 import AVKit
 
 /// 前鏡頭預覽。外層把這個 view 的大小固定成 9:16，所以看到的範圍就是錄到的範圍。
-/// 陪伴模式「上下分割」時外框不是 9:16，用 fill 裁滿外框，看到的會比錄到的少一些。
+/// 整個主畫面只能有一個，換擺法時只改大小和位置。重建預覽層會卡住主執行緒，
+/// 而且新的預覽層常常接不回執行中的 session，自己的畫面就一直是黑的（QC-0005）。
 struct CameraPreviewView: UIViewRepresentable {
     let camera: CameraService
-    var fill = false
 
     final class PreviewUIView: UIView {
         override class var layerClass: AnyClass {
@@ -31,7 +31,7 @@ struct CameraPreviewView: UIViewRepresentable {
         let view = PreviewUIView()
         view.backgroundColor = .black
         view.previewLayer.session = camera.session
-        view.previewLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
+        view.previewLayer.videoGravity = .resizeAspect
         camera.attachPreviewLayer(view.previewLayer)
         view.onLayout = { [weak camera] in
             camera?.applyPreviewRotation()
@@ -49,7 +49,5 @@ struct CameraPreviewView: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: PreviewUIView, context: Context) {
-        uiView.previewLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
-    }
+    func updateUIView(_ uiView: PreviewUIView, context: Context) {}
 }
