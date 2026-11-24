@@ -88,8 +88,10 @@ final class KeyCatcherView: UIView {
             }
         } else {
             stopWatchdog()
-            if isFirstResponder {
-                _ = resignFirstResponder()
+            // 同樣不在 SwiftUI 更新畫面的當下放，不然會報版面循環。
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.isActive, self.isFirstResponder else { return }
+                _ = self.resignFirstResponder()
             }
         }
     }
