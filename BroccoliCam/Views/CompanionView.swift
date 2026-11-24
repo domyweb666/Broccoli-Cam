@@ -168,6 +168,10 @@ private struct CompanionVideoView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: VideoView, context: Context) {
+        // 媒體服務重啟後播放器整組換新。
+        for (index, videoLayer) in uiView.videoLayers.enumerated() where videoLayer.player !== player.players[index] {
+            videoLayer.player = player.players[index]
+        }
         uiView.crop = crop
         uiView.setStill(player.still, animated: true)
         uiView.show(front: player.front, animated: true)

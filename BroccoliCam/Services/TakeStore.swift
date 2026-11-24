@@ -26,6 +26,21 @@ struct SavedSession: Codable, Equatable {
     var files: [String] {
         takes.values.map(\.file) + (pending.map { [$0.file] } ?? [])
     }
+
+    /// 拿掉這幾個檔之後剩下的進度。什麼都不剩就是 nil。
+    func removing(_ gone: Set<String>) -> SavedSession? {
+        var result = self
+        result.takes = takes.filter { !gone.contains($0.value.file) }
+        if let pending, gone.contains(pending.file) { result.pending = nil }
+        if result.takes.isEmpty { result.takesLandscape = nil }
+        return result.count == 0 ? nil : result
+    }
+
+    /// 這支接好的影片是不是就由現在這幾段接成的。
+    func matches(_ files: [String]?) -> Bool {
+        guard let files, !files.isEmpty else { return false }
+        return Set(files) == Set(takes.values.map(\.file))
+    }
 }
 
 /// 正在錄的檔。開錄前就寫下來，錄到一半被滑掉才知道那個檔是哪一段的。
@@ -39,6 +54,8 @@ struct SavedRecording: Codable, Equatable {
     var failed = false
     /// 看過幾次都看不出好壞。
     var attempts = 0
+    /// 正在接片的輸出檔：由哪幾段接成。一般錄影是 nil。
+    var takes: [String]?
 }
 
 /// 完成、還沒存到照片的影片（一鏡到底，或接好的）。
@@ -48,6 +65,8 @@ struct SavedVideo: Codable, Equatable {
     var script: String
     var isLandscape: Bool
     var notice: String?
+    /// 由哪幾段接成。存到照片之後只刪這幾段。
+    var takes: [String]?
 }
 
 struct TakeManifest: Codable, Equatable {
@@ -92,6 +111,7 @@ final class TakeStore: @unchecked Sendable {
     private static let manifestName = "manifest.json"
     private static let badPrefix = "manifest-bad-"
     private static let reserveName = "reserve.bin"
+    private static let reserveSize = 128 * 1024
     private static let mergedPrefix = "broccoli-merged-"
     /// 短於這個長度的錄影當作沒錄到。
     private static let shortest: Double = 0.5
@@ -191,8 +211,11 @@ final class TakeStore: @unchecked Sendable {
 
     private func makeReserve() {
         let reserve = url(Self.reserveName)
-        guard !FileManager.default.fileExists(atPath: reserve.path) else { return }
-        try? Data(repeating: 0xA5, count: 128 * 1024).write(to: reserve)
+        // 上次硬碟滿的時候可能只寫了一半，大小不夠就重寫。
+        let attributes = try? FileManager.default.attributesOfItem(atPath: reserve.path)
+        let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+        guard size < Self.reserveSize else { return }
+        try? Data(repeating: 0xA5, count: Self.reserveSize).write(to: reserve)
     }
 
     // MARK: - 開 App 時讀回來
@@ -207,7 +230,7 @@ final class TakeStore: @unchecked Sendable {
         var notes: [String] = []
     }
 
-    private enum Verdict {
+    enum Verdict {
         case usable(isLandscape: Bool)
         case broken
         case unsure
@@ -228,6 +251,14 @@ final class TakeStore: @unchecked Sendable {
         let interrupted = manifest.recordings
         manifest.recordings = []
         dropMissing(&manifest, existing: Set(snapshot.files.keys), notes: &notes)
+        // 各段對不上了，就當成單支：存完不准動到現在這幾段。
+        for index in manifest.videos.indices where manifest.videos[index].isStitched {
+            let owner = manifest.session ?? manifest.shelf
+            if owner?.matches(manifest.videos[index].takes) != true {
+                manifest.videos[index].isStitched = false
+                manifest.videos[index].takes = nil
+            }
+        }
 
         for entry in interrupted {
             guard snapshot.files[entry.file] != nil, !manifest.files.contains(entry.file) else { continue }
@@ -357,19 +388,21 @@ final class TakeStore: @unchecked Sendable {
                 manifest.session = session
                 return
             }
-            // 接好的那支結尾是完整的。
+            // 接片前就記下由哪幾段接成，和現在的各段對得上才算接好的那支，對不上就當單支。
+            let stitched = manifest.session?.matches(entry.takes) ?? false
+            // 接好的那支能播就是寫完了，結尾是完整的。
             let merged = entry.file.hasPrefix(mergedPrefix)
-            let script = merged ? (manifest.session?.segments.joined(separator: "\n") ?? "") : entry.script
-            manifest.videos.append(SavedVideo(file: entry.file, isStitched: merged && manifest.session != nil,
-                                              script: script, isLandscape: isLandscape,
-                                              notice: merged ? nil : "結尾有一小段沒存到"))
+            manifest.videos.append(SavedVideo(file: entry.file, isStitched: stitched,
+                                              script: entry.script, isLandscape: isLandscape,
+                                              notice: merged ? nil : "結尾有一小段沒存到",
+                                              takes: stitched ? entry.takes : nil))
         }
     }
 
     // MARK: - 檢查影片
 
     /// 檔案能不能用。錄影時每 2 秒落地一次片段，被滑掉之後前面的通常還能播。
-    private static func examine(_ url: URL) async -> Verdict {
+    static func examine(_ url: URL) async -> Verdict {
         await withCheckedContinuation { (continuation: CheckedContinuation<Verdict, Never>) in
             let reply = OneReply(continuation)
             Task.detached {
@@ -386,8 +419,10 @@ final class TakeStore: @unchecked Sendable {
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         do {
             let playable: Bool = try await asset.load(.isPlayable)
+            // 說不能播不代表壞了（例如媒體服務剛重啟），之後再判。
+            guard playable else { return .unsure }
             let tracks: [AVAssetTrack] = try await asset.loadTracks(withMediaType: .video)
-            guard playable, let video = tracks.first else { return .broken }
+            guard let video = tracks.first else { return .broken }
             let whole: CMTime = try await asset.load(.duration)
             let range: CMTimeRange = try await video.load(.timeRange)
             let size: CGSize = try await video.load(.naturalSize)

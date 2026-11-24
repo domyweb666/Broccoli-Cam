@@ -96,7 +96,8 @@ final class CompanionClipPlayer: ObservableObject {
     private static let prerollLimit: TimeInterval = 0.3
 
     /// 一台在前面播，其他的先載好接下來可能要播的：下一支待機、兩種最可能的反應。
-    let players: [AVPlayer] = [AVPlayer(), AVPlayer(), AVPlayer(), AVPlayer()]
+    /// 媒體服務重啟之後舊的都不能用，會整組換新，畫面要跟著換。
+    @Published private(set) var players: [AVPlayer] = CompanionClipPlayer.makePlayers()
     /// 現在在前面的是哪一台，-1 是還沒有（只看到定格圖）。畫面看到變化就做淡化。
     @Published private(set) var front = -1
     /// 定格圖。播放器還沒出畫面的那一瞬間墊在底下，和片子第一格一樣。
@@ -124,6 +125,7 @@ final class CompanionClipPlayer: ObservableObject {
     private var broken: Set<URL> = []
 
     private var endObserver: NSObjectProtocol?
+    private var resetObserver: NSObjectProtocol?
     private var personCancellable: AnyCancellable?
     private var modelCancellables: Set<AnyCancellable> = []
     private weak var model: CompanionModel?
@@ -131,13 +133,23 @@ final class CompanionClipPlayer: ObservableObject {
     /// 至少有一位聆聽者的待機片放進 App 才算可用。
     var isAvailable: Bool { assets != nil }
 
-    init() {
-        for player in players {
+    private static func makePlayers() -> [AVPlayer] {
+        (0..<4).map { _ in
+            let player = AVPlayer()
             player.isMuted = true
             player.allowsExternalPlayback = false
             player.preventsDisplaySleepDuringVideoPlayback = false
             player.automaticallyWaitsToMinimizeStalling = false
             player.actionAtItemEnd = .pause
+            return player
+        }
+    }
+
+    init() {
+        resetObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.rebuild()
         }
         // 一訂閱就會先收到目前選的那一位。
         personCancellable = UserDefaults.standard.publisher(for: \.companionPerson)
@@ -161,9 +173,34 @@ final class CompanionClipPlayer: ObservableObject {
         preload()
     }
 
+    deinit {
+        if let resetObserver { NotificationCenter.default.removeObserver(resetObserver) }
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+    }
+
+    /// 媒體服務重啟：舊的播放器全部作廢，換一組新的，重新從定格圖開始。
+    private func rebuild() {
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+        }
+        endObserver = nil
+        waiting = nil
+        frontEnded = false
+        switching = false
+        current = .idle
+        model?.isReacting = false
+        broken = []
+        clearScreen()
+        players = Self.makePlayers()
+        guard running else { return }
+        playIdle()
+        preload()
+    }
+
     func stop() {
         running = false
         modelCancellables = []
+        model?.onReaction = nil
         model?.isReacting = false
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
@@ -187,8 +224,16 @@ final class CompanionClipPlayer: ObservableObject {
 
     /// 回到前景時接著播（App 進背景時系統會把播放器停掉）。
     func resume() {
-        guard running, players.indices.contains(front), !frontEnded else { return }
-        players[front].play()
+        guard running else { return }
+        if players.indices.contains(front), !frontEnded {
+            players[front].play()
+            return
+        }
+        // 停在最後一格、或一支都沒播起來：再試一次，之前載不起來的也給它機會。
+        guard waiting == nil else { return }
+        broken = []
+        playIdle()
+        preload()
     }
 
     private func subscribe(to model: CompanionModel) {
@@ -196,11 +241,11 @@ final class CompanionClipPlayer: ObservableObject {
             .dropFirst()
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.react(.nod) }
+            .sink { [weak self] _ in _ = self?.react(.nod) }
             .store(in: &modelCancellables)
-        model.reactions
-            .sink { [weak self] reaction in self?.react(reaction) }
-            .store(in: &modelCancellables)
+        model.onReaction = { [weak self] reaction in
+            self?.react(reaction) ?? false
+        }
         model.expecting
             .sink { [weak self] reactions in
                 self?.expecting = reactions
@@ -249,14 +294,14 @@ final class CompanionClipPlayer: ObservableObject {
 
     // MARK: - 挑片
 
-    private func react(_ reaction: CompanionReaction) {
+    /// 回傳有沒有接下來要播。
+    private func react(_ reaction: CompanionReaction) -> Bool {
         // 反應片還在播、正在換人、已經有一支反應在等，就不插隊，這一次直接丟掉。
         guard running, !switching, current == .idle, waiting?.kind != .reaction,
-              let clip = upcoming(reaction) else { return }
-        if request(clip, kind: .reaction) {
-            nextReaction[reaction] = nil
-            lastClip[.reaction] = clip
-        }
+              let clip = upcoming(reaction), request(clip, kind: .reaction) else { return false }
+        nextReaction[reaction] = nil
+        lastClip[.reaction] = clip
+        return true
     }
 
     private func playIdle() {
@@ -386,6 +431,7 @@ final class CompanionClipPlayer: ObservableObject {
         let wasWaiting = waiting?.index == index
         let kind = waiting?.kind
         if wasWaiting { waiting = nil }
+        if wasWaiting && kind == .reaction { model?.reactionDropped() }
         unload(index)
         if nextIdle == clip { nextIdle = nil }
         nextReaction = nextReaction.filter { $0.value != clip }
@@ -431,6 +477,7 @@ final class CompanionClipPlayer: ObservableObject {
     private func giveUpIfLate(index: Int, generation: Int) {
         guard let waiting, waiting.index == index, waiting.generation == generation else { return }
         self.waiting = nil
+        model?.reactionDropped()
         if frontEnded { playIdle() }
     }
 

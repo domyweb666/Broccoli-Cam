@@ -97,6 +97,11 @@ final class PromptLayout {
         plain = engine
     }
 
+    /// 先把變色用的那一份排好。
+    func prepareSpoken() {
+        _ = spokenEngine
+    }
+
     /// 畫一行，唸過的部分用另一個顏色。origin 是整篇左上角在目前畫布上的位置。
     func draw(_ line: Line, spoken: Int, at origin: CGPoint, in context: CGContext, bounds: CGRect) {
         if spoken <= line.start {
@@ -144,6 +149,10 @@ final class TeleprompterModel: ObservableObject {
     private var fontSize: CGFloat = 26
     private var contentHeight: CGFloat = 0
     private var cachedLayout: PromptLayout?
+    /// 上一次整篇排版的時間，拉字級時用來節流。
+    private var lastBuild: CFTimeInterval = 0
+    private var rebuildQueued = false
+    private let rebuildInterval: CFTimeInterval = 0.15
 
     /// 固定速度自己捲到底而停下來的，不是人按的暫停。
     private(set) var stoppedAtEnd = false
@@ -357,8 +366,29 @@ final class TeleprompterModel: ObservableObject {
     /// 畫面要畫的排版。寬度和字級由畫面決定，在這裡記下來，之後的換算都用同一份。
     func layout(for text: String, width: CGFloat, fontSize: CGFloat) -> PromptLayout? {
         layoutWidth = width
+        // 拉字級時每一格都會來，長稿整篇重排會卡。太密就先用舊的，過一下再排一次。
+        if fontSize != self.fontSize, let cached = cachedLayout, cached.text == text, cached.width == width,
+           CACurrentMediaTime() - lastBuild < rebuildInterval {
+            queueRebuild()
+            return cached
+        }
         self.fontSize = fontSize
         return layout(for: text)
+    }
+
+    private func queueRebuild() {
+        guard !rebuildQueued else { return }
+        rebuildQueued = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + rebuildInterval) { [weak self] in
+            guard let self else { return }
+            self.rebuildQueued = false
+            self.objectWillChange.send()
+        }
+    }
+
+    /// 開錄前先把變色用的排版建好。
+    func prepareSpoken(in text: String) {
+        layout(for: text)?.prepareSpoken()
     }
 
     private func layout(for text: String) -> PromptLayout? {
@@ -368,6 +398,7 @@ final class TeleprompterModel: ObservableObject {
         }
         let built = PromptLayout(text: text, width: layoutWidth, fontSize: fontSize, spokenColor: UIColor(Theme.good))
         cachedLayout = built
+        lastBuild = CACurrentMediaTime()
         contentHeight = built.height + Self.topPadding
         return built
     }

@@ -95,6 +95,8 @@ final class FrameRecorder {
 
     /// 聲音最多比畫面超前多少就先寫進去。
     private static let audioLead = CMTime(value: 1, timescale: 2)
+    /// 聲音落後畫面這麼多就當作收不到了，補無聲。
+    private static let audioStall = CMTime(value: 3, timescale: 2)
     /// 最多留著多少還沒寫的聲音（秒）。
     private static let audioBacklog: Double = 6
 
@@ -262,10 +264,14 @@ final class FrameRecorder {
         let isFirst = !lastVideoTime.isValid
         lastVideoTime = time
         counts.frames += 1
+        #if targetEnvironment(simulator)
+        appendFakeAudioLocked(until: time)
+        #endif
         if isFirst {
             onStarted?(time)
         }
         drainAudioLocked(limit: time + Self.audioLead)
+        padSilenceLocked(until: time - Self.audioStall)
     }
 
     func noteRenderFailure() {
@@ -338,6 +344,45 @@ final class FrameRecorder {
             endLocked()
         }
     }
+
+    /// 有音軌卻一直收不到聲音時補上無聲。寫檔器要每一軌都有資料才肯把片段落地，
+    /// 不補的話，錄到一半被滑掉整段都救不回來。
+    private func padSilenceLocked(until limit: CMTime) {
+        guard let audioInput, pendingAudio.isEmpty else { return }
+        var start: CMTime = lastAudioEnd.isValid ? lastAudioEnd : firstVideoTime
+        while start < limit, writer.status == .writing, audioInput.isReadyForMoreMediaData {
+            guard let sample = Self.silence(at: start) else { return }
+            writeAudioLocked(sample, at: start, to: audioInput)
+            guard lastAudioEnd.isValid, lastAudioEnd > start else { return }
+            start = lastAudioEnd
+        }
+    }
+
+    private static func silence(at time: CMTime) -> CMSampleBuffer? {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024),
+              let samples = buffer.floatChannelData else { return nil }
+        buffer.frameLength = 1024
+        samples[0].update(repeating: 0, count: 1024)
+        return AudioReformatter.sampleBuffer(from: buffer, description: format.formatDescription, at: time)
+    }
+
+    #if targetEnvironment(simulator)
+    /// 測試用：模擬器沒有聲音，設 debugFakeAudio 就照著畫面的時間餵無聲的聲音，跟真機一樣每一刻都有聲音進來。
+    private static let fakesAudio = UserDefaults.standard.bool(forKey: "debugFakeAudio")
+    private var fakeAudioEnd: CMTime = .invalid
+
+    private func appendFakeAudioLocked(until time: CMTime) {
+        guard Self.fakesAudio, audioInput != nil else { return }
+        var start: CMTime = fakeAudioEnd.isValid ? fakeAudioEnd : firstVideoTime
+        while start < time {
+            guard let sample = Self.silence(at: start) else { return }
+            pendingAudio.append(sample)
+            start = audioEnd(sample, from: start)
+        }
+        fakeAudioEnd = start
+    }
+    #endif
 
     private func audioEnd(_ sampleBuffer: CMSampleBuffer, from time: CMTime) -> CMTime {
         let duration: CMTime = CMSampleBufferGetDuration(sampleBuffer)
@@ -496,8 +541,8 @@ final class FrameRecorder {
     }
 
     /// 寫檔器失敗後，看看已經寫出去的片段能不能播。能播就留著用。
-    /// 讀檔本身出錯不代表檔案壞了（例如媒體服務剛重啟），等一下再試；
-    /// 還是讀不了就把檔案留著，下次開 App 由 TakeStore 再看一次。
+    /// 現在讀不了不代表檔案壞了（例如媒體服務剛重啟），等一下再試；
+    /// 還是不行也不刪，下次開 App 由 TakeStore 再看一次。
     private func salvage(_ message: String) {
         let fileURL = url
         Task {
@@ -505,16 +550,10 @@ final class FrameRecorder {
                 if attempt > 0 {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                 }
-                let asset = AVURLAsset(url: fileURL)
-                guard let playable: Bool = try? await asset.load(.isPlayable),
-                      let duration: CMTime = try? await asset.load(.duration) else { continue }
-                if playable, duration.isNumeric, duration.seconds > 0.5 {
+                if case .usable = await TakeStore.examine(fileURL) {
                     self.report(.finished(fileURL, note: message))
-                } else {
-                    try? FileManager.default.removeItem(at: fileURL)
-                    self.report(.failed(message))
+                    return
                 }
-                return
             }
             self.report(.failed(message))
         }
@@ -595,7 +634,7 @@ private final class AudioReformatter {
         return Self.sampleBuffer(from: output, description: targetDescription, at: time)
     }
 
-    private static func sampleBuffer(from buffer: AVAudioPCMBuffer, description: CMFormatDescription,
+    static func sampleBuffer(from buffer: AVAudioPCMBuffer, description: CMFormatDescription,
                                      at time: CMTime) -> CMSampleBuffer? {
         let rate = CMTimeScale(buffer.format.sampleRate.rounded())
         var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: rate),

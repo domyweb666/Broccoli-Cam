@@ -114,6 +114,8 @@ struct ListenerReactor {
     /// 這一次停頓已經歪過頭了。
     private var tiltDone = false
     private var nextAllowed: Double = 0
+    /// 最近一次反應之前的 nextAllowed，那次沒做成就退回來。
+    private var previousAllowed: Double?
 
     /// `random` 回傳範圍內的亂數，測試時可以換成固定的。
     init(random: @escaping (ClosedRange<Double>) -> Double = { Double.random(in: $0) }) {
@@ -132,6 +134,13 @@ struct ListenerReactor {
     /// 忘掉聽過的一切。
     mutating func reset() {
         self = ListenerReactor(random: random)
+    }
+
+    /// 剛剛回傳的反應沒有做成，間隔不算。
+    mutating func declined() {
+        guard let previousAllowed else { return }
+        nextAllowed = previousAllowed
+        self.previousAllowed = nil
     }
 
     /// 餵一次音量。`time` 是一直往前走的秒數，`busy` 是反應片還在播。
@@ -184,6 +193,7 @@ struct ListenerReactor {
             }
         }
         longDue = time + random(Tuning.longTalk)
+        previousAllowed = nextAllowed
         nextAllowed = time + random(Tuning.gap)
         return reaction
     }

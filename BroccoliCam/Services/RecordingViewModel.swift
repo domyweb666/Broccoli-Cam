@@ -12,6 +12,8 @@ struct RecordedVideo: Identifiable {
     var isLandscape = false
     /// 這支影片有什麼要告訴使用者的（例如結尾沒存到）。
     var notice: String?
+    /// 接成這支的各段檔名。單支是空的。
+    var takes: [String] = []
 }
 
 /// 稿子切出來的段落和已錄的不一樣，等使用者決定。
@@ -108,8 +110,10 @@ final class RecordingViewModel: ObservableObject {
     private var recordings: [SavedRecording] = []
     /// 還沒存到照片的完成影片。
     private var videos: [SavedVideo] = []
-    /// 接好的那支已經存到照片，各段不用再留。
-    private var stitchedSaved = false
+    /// 接好的那支已經存到照片，接成它的這幾段不用再留。
+    private var stitchedTakes: Set<String> = []
+    /// 這次開錄的是哪一個檔。等太久取消之後，晚到的回呼靠它認出來不是這一次的。
+    private var activeFile: String?
     /// 完成頁正在看的那支，關掉之後看要不要刪檔。
     private var shownVideo: URL?
     /// 上次的分段進度，使用者還沒決定要不要接著錄。
@@ -118,6 +122,8 @@ final class RecordingViewModel: ObservableObject {
     private var loaded = false
     /// 上次留下來的還沒處理完，先不讓錄。
     private var restoring = true
+    /// 按了「看影片」，完成頁還沒出來。
+    private var openingVideo = false
     /// 一個視窗收起來之後隔一下再跳下一個，同時換會跳不出來。
     private let alertGap: TimeInterval = 0.45
 
@@ -126,6 +132,12 @@ final class RecordingViewModel: ObservableObject {
 
     /// 稿件或設定頁開著的時候，不回應音量鍵。
     var hardwareEnabled = true
+
+    /// 有視窗或完成頁蓋在主畫面上。這時候音量鍵、藍牙鍵都不算數。
+    var hasWindow: Bool {
+        review != nil || openingVideo || recovery != nil || scriptChange != nil
+            || mergeError != nil || orientationError != nil || recordingError != nil
+    }
 
     private weak var camera: CameraService?
     private weak var settings: SettingsStore?
@@ -233,10 +245,15 @@ final class RecordingViewModel: ObservableObject {
         let recordingSegment = recordings.contains { $0.index != nil && !$0.failed }
         if let recoveredSession {
             result.session = recoveredSession
-        } else if isSegmented, !stitchedSaved, recordedCount > 0 || recordingSegment {
+        } else if isSegmented, recordedCount > 0 || recordingSegment {
             result.session = liveSession()
         }
         result.shelf = shelf
+        // 已經存到照片的那幾段不再提，關掉完成頁才真的刪。
+        if !stitchedTakes.isEmpty {
+            result.session = result.session?.removing(stitchedTakes)
+            result.shelf = result.shelf?.removing(stitchedTakes)
+        }
         result.recordings = recordings
         result.videos = videos
         return result
@@ -294,7 +311,7 @@ final class RecordingViewModel: ObservableObject {
     private func askRecovery(after delay: TimeInterval) {
         guard restoring, loaded else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, self.restoring, self.recovery == nil, self.review == nil else { return }
+            guard let self, self.restoring, self.recovery == nil, self.review == nil, !self.openingVideo else { return }
             if !self.videos.isEmpty {
                 self.recovery = .video
             } else if self.recoveredSession != nil {
@@ -319,12 +336,14 @@ final class RecordingViewModel: ObservableObject {
             askRecovery(after: alertGap)
             return
         }
+        openingVideo = true
         if video.isStitched { takeBackSession() }
         DispatchQueue.main.asyncAfter(deadline: .now() + alertGap) { [weak self] in
             guard let self else { return }
+            self.openingVideo = false
             self.show(RecordedVideo(url: self.store.url(video.file), isStitched: video.isStitched,
                                     script: video.script, isLandscape: video.isLandscape,
-                                    notice: video.notice))
+                                    notice: video.notice, takes: video.takes ?? []))
         }
     }
 
@@ -373,7 +392,8 @@ final class RecordingViewModel: ObservableObject {
         let file = video.url.lastPathComponent
         if !videos.contains(where: { $0.file == file }) {
             videos.append(SavedVideo(file: file, isStitched: video.isStitched, script: video.script,
-                                     isLandscape: video.isLandscape, notice: video.notice))
+                                     isLandscape: video.isLandscape, notice: video.notice,
+                                     takes: video.isStitched ? video.takes : nil))
         }
         shownVideo = video.url
         review = video
@@ -383,7 +403,7 @@ final class RecordingViewModel: ObservableObject {
     /// 已經存到照片。檔案等完成頁關掉才刪，還要拿來做字幕。
     func reviewSaved(_ video: RecordedVideo) {
         videos.removeAll { $0.file == video.url.lastPathComponent }
-        if video.isStitched { stitchedSaved = true }
+        if video.isStitched { stitchedTakes = Set(video.takes) }
         persist()
     }
 
@@ -395,7 +415,7 @@ final class RecordingViewModel: ObservableObject {
 
     /// 完成頁關掉了。沒存、也沒說不要的，檔案留著。
     func reviewDismissed() {
-        if stitchedSaved { discardAllTakes() }
+        if !stitchedTakes.isEmpty { discardTakes(stitchedTakes) }
         if let url = shownVideo {
             shownVideo = nil
             if !videos.contains(where: { $0.file == url.lastPathComponent }) {
@@ -430,6 +450,8 @@ final class RecordingViewModel: ObservableObject {
     /// 換稿：已錄的各段作廢。
     func acceptScriptChange() {
         scriptChange = nil
+        // 視窗開著時用別的辦法開錄了：現在刪會刪到正在錄的。新稿還記著，回到待機會再問一次。
+        guard phase == .idle, !isMerging else { return }
         discardAllTakes()
     }
 
@@ -496,6 +518,7 @@ final class RecordingViewModel: ObservableObject {
     /// 錄影鈕：待機 → 倒數／開始；倒數中 → 取消；錄影中 → 停止。
     func primaryTapped(countdown: Int, autoPrompt: Bool) {
         if restoring {
+            guard !openingVideo else { return }
             // 上次留下來的還沒決定。視窗沒跳出來（當時有別的頁面開著）的話，在這裡再問一次。
             recovery = nil
             askRecovery(after: 0.1)
@@ -513,6 +536,8 @@ final class RecordingViewModel: ObservableObject {
                 return
             }
             self.autoPrompt = autoPrompt
+            // 唸過的字要變色的話，另一套排版先建好，不要錄到一半才卡一下。
+            if settings?.voiceFollow ?? false { prompter.prepareSpoken(in: currentText) }
             if countdown > 0 {
                 startCountdown(countdown)
             } else {
@@ -529,7 +554,7 @@ final class RecordingViewModel: ObservableObject {
 
     /// 音量鍵或藍牙遙控器：等同錄影鈕；剛錄完一段時等同「留用」。
     private func hardwareButtonPressed() {
-        guard hardwareEnabled, review == nil, !isMerging, !restoring, let settings else { return }
+        guard hardwareEnabled, !hasWindow, !isMerging, !restoring, let settings else { return }
         if pending != nil {
             acceptPending()
         } else {
@@ -624,26 +649,64 @@ final class RecordingViewModel: ObservableObject {
             return VideoStitcher.Clip(url: take.url, start: start, end: end)
         }
         isMerging = true
-        let output = store.url(TakeStore.newFileName(merged: true))
+        let file = TakeStore.newFileName(merged: true)
+        let output = store.url(file)
+        let sources = clips.map { $0.url.lastPathComponent }
+        // 先記下由哪幾段接成。接完還沒進完成頁就被滑掉，下次才認得出是這一批。
+        recordings.append(SavedRecording(file: file, index: nil, script: segments.joined(separator: "\n"),
+                                         angle: lockedAngle, takes: sources))
+        persist()
         camera?.log("開始接片：\(clips.count) 段，裁靜音 \(trim ? "開" : "關")")
         Task {
             do {
+                guard self.store.flush() else { throw VideoStitchError.exportFailed("手機空間不夠") }
                 try await VideoStitcher.stitch(clips, to: output)
                 await MainActor.run {
                     self.isMerging = false
+                    self.recordings.removeAll { $0.file == file }
                     self.camera?.log("接片完成")
                     self.show(RecordedVideo(url: output, isStitched: true,
                                             script: self.segments.joined(separator: "\n"),
-                                            isLandscape: self.takesLandscape ?? false))
+                                            isLandscape: self.takesLandscape ?? false, takes: sources))
                 }
             } catch {
                 await MainActor.run {
                     self.isMerging = false
+                    self.recordings.removeAll { $0.file == file }
+                    self.persist(deleting: [output])
                     self.mergeError = error.localizedDescription
                     self.camera?.log("接片失敗：\(error.localizedDescription)")
                 }
             }
         }
+    }
+
+    /// 丟掉接成這支影片的各段。
+    func discardTakes(of video: RecordedVideo) {
+        discardTakes(Set(video.takes))
+    }
+
+    /// 只丟這幾個檔，不在裡面的段落不動。
+    private func discardTakes(_ files: Set<String>) {
+        var doomed: [URL] = []
+        if let saved = shelf {
+            let gone = saved.files.filter { files.contains($0) }
+            if !gone.isEmpty {
+                shelf = saved.removing(files)
+                doomed += gone.map { store.url($0) }
+            }
+        }
+        let kept = takes.filter { !files.contains($0.value.url.lastPathComponent) }
+        stitchedTakes = []
+        if kept.isEmpty && pending == nil {
+            discardAllTakes()
+            persist(deleting: doomed)
+            return
+        }
+        doomed += takes.values.map { $0.url }.filter { files.contains($0.lastPathComponent) }
+        takes = kept
+        if kept.isEmpty { takesLandscape = nil }
+        persist(deleting: doomed)
     }
 
     /// 丟掉所有已錄的段落，回到第一段。
@@ -654,7 +717,7 @@ final class RecordingViewModel: ObservableObject {
         takesLandscape = nil
         pending = nil
         currentIndex = 0
-        stitchedSaved = false
+        stitchedTakes = []
         if let waiting = waitingScript {
             waitingScript = nil
             declinedSegments = nil
@@ -704,17 +767,21 @@ final class RecordingViewModel: ObservableObject {
         elapsed = 0
         // 先記下要寫哪個檔、是哪一段，存好了相機才開錄。錄到一半被滑掉，下次才找得回來。
         let file = TakeStore.newFileName()
+        activeFile = file
+        // 稿子存這一段的，救成單支時字幕才對得上。
         recordings.append(SavedRecording(file: file, index: isSegmented ? currentIndex : nil,
-                                         script: segments.first ?? "", angle: lockedAngle))
+                                         script: currentText, angle: lockedAngle))
         persist()
         let store = self.store
-        camera?.startRecording(landscape: lockedAngle != 0, to: store.url(file)) {
+        let url = store.url(file)
+        camera?.startRecording(landscape: lockedAngle != 0, to: url) {
             store.flush()
         }
         // 3 秒內沒有真的開始錄，就回到待機，不要卡住。
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.phase == .starting, self.recordings.last?.file == file else { return }
-            self.camera?.cancelStart()
+            guard let self, self.phase == .starting, self.activeFile == file else { return }
+            self.activeFile = nil
+            self.camera?.cancelStart(url)
             self.camera?.log("錄影未在 3 秒內開始")
             self.phase = .idle
             self.recordingError = "相機沒有開始錄，請再試一次"
@@ -728,6 +795,8 @@ final class RecordingViewModel: ObservableObject {
     }
 
     private func recordingChanged(_ recording: Bool) {
+        // 等太久已經取消的那一個晚點才動起來，不算這一次的。
+        guard let activeFile, camera?.recordingURL?.lastPathComponent == activeFile else { return }
         if recording {
             phase = .recording
             // 開防抖時影格晚到，影片第 0 秒比現在早，裁靜音的時間要對回去。
@@ -798,6 +867,11 @@ final class RecordingViewModel: ObservableObject {
     }
 
     private func recordingFinished(_ url: URL, damaged: Bool) {
+        guard url.lastPathComponent == activeFile else {
+            keepForLater(url)
+            return
+        }
+        activeFile = nil
         phase = .idle
         recordings.removeAll { $0.file == url.lastPathComponent }
         let notice: String? = damaged ? "結尾有一小段沒存到" : nil
@@ -920,7 +994,7 @@ final class RecordingViewModel: ObservableObject {
 
     /// 踏板、翻頁器、實體鍵盤按下去要做的事。
     func perform(_ action: RemoteAction) {
-        guard hardwareEnabled, review == nil, !isMerging, let settings else { return }
+        guard hardwareEnabled, !hasWindow, !isMerging, let settings else { return }
         switch action {
         case .next:
             jump(forward: true)
@@ -1026,8 +1100,16 @@ final class RecordingViewModel: ObservableObject {
     }
 
     private func recordingFailed(_ url: URL, _ reason: String) {
-        phase = .idle
-        recordingError = reason
+        if url.lastPathComponent == activeFile {
+            activeFile = nil
+            phase = .idle
+            recordingError = reason
+        }
+        keepForLater(url)
+    }
+
+    /// 檔案還在就留著，下次開 App 再看能不能用。
+    private func keepForLater(_ url: URL) {
         let file = url.lastPathComponent
         if let index = recordings.firstIndex(where: { $0.file == file }) {
             if FileManager.default.fileExists(atPath: url.path) {

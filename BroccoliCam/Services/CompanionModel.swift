@@ -9,8 +9,8 @@ import Combine
 final class CompanionModel: ObservableObject {
     /// 隨機點頭：每點一次頭就加一，播放器看到變化就切到點頭片段。
     @Published private(set) var nodCount = 0
-    /// 即時反應。不用 @Published，主畫面不需要跟著重畫。
-    let reactions = PassthroughSubject<CompanionReaction, Never>()
+    /// 即時反應交給播放器，它回答有沒有接下來要播。
+    var onReaction: ((CompanionReaction) -> Bool)?
     /// 接下來最可能做的反應，播放器拿來預先載入。
     let expecting = CurrentValueSubject<[CompanionReaction], Never>([.nod])
     /// 反應片播放中，由播放器寫。
@@ -77,9 +77,15 @@ final class CompanionModel: ObservableObject {
         guard instant else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if let reaction = reactor.feed(time: now, level: Double(level), busy: isReacting) {
-            reactions.send(reaction)
+            // 播放器沒接（還在換人、沒有這種片），就當沒做過，不扣間隔。
+            if onReaction?(reaction) != true { reactor.declined() }
         }
         updateExpecting()
+    }
+
+    /// 接了但來不及播。
+    func reactionDropped() {
+        reactor.declined()
     }
 
     private func updateExpecting() {

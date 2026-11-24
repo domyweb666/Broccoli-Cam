@@ -14,6 +14,8 @@ final class CameraService: NSObject, ObservableObject {
     @Published private(set) var authorization: Authorization = .unknown
     @Published private(set) var isSessionRunning = false
     @Published private(set) var isRecording = false
+    /// isRecording 講的是哪一個檔。比 isRecording 早更新（主執行緒）。
+    private(set) var recordingURL: URL?
     @Published private(set) var availableResolutions: [VideoResolution] = [.hd1080]
     @Published private(set) var availableFPS: [VideoResolution: [Int]] = [.hd1080: [30]]
     /// 目前格式支援的防抖強度，一定含 .off。
@@ -728,12 +730,11 @@ final class CameraService: NSObject, ObservableObject {
         }
     }
 
-    /// 等太久，不錄了：還沒開始的取消，已經建好寫檔器但一格都沒收到的也收掉。
-    func cancelStart() {
+    /// 等太久，不錄這個檔了：還沒開始的取消，寫檔器已經建好的也收掉。
+    func cancelStart(_ url: URL) {
         _ = nextStartRun()
         sessionQueue.async {
-            guard let recorder = self.pipeline.recorder, recorder.isActive,
-                  recorder.currentCounts.frames == 0 else { return }
+            guard let recorder = self.pipeline.recorder, recorder.isActive, recorder.url == url else { return }
             recorder.finishNow(at: self.captureTime())
         }
     }
@@ -788,7 +789,7 @@ final class CameraService: NSObject, ObservableObject {
             tailTimeout: desiredStabilization == .strong ? 2.0 : 1.0
         )
         recorder.onStarted = { [weak self] time in
-            self?.recordingStarted(firstFrame: time)
+            self?.recordingStarted(firstFrame: time, url: url)
         }
         recorder.onEnded = { [weak self, weak recorder] outcome in
             guard let self else { return }
@@ -849,12 +850,13 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     /// 第一格寫進去了。在寫檔器的鎖裡面被呼叫，只能丟到主執行緒。
-    private func recordingStarted(firstFrame: CMTime) {
+    private func recordingStarted(firstFrame: CMTime, url: URL) {
         let lag: Double = (captureTime() - firstFrame).seconds
         log("開始錄影")
         DispatchQueue.main.async {
             self.recordingLag = lag.isFinite ? max(0, lag) : 0
             self.beginRecordingTask()
+            self.recordingURL = url
             self.isRecording = true
         }
     }

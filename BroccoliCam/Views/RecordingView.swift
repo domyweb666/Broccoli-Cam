@@ -169,8 +169,7 @@ struct RecordingView: View {
 
     private var remoteActive: Bool {
         if showScript || showSettings || showModes { return false }
-        return viewModel.review == nil && viewModel.mergeError == nil && viewModel.orientationError == nil
-            && viewModel.recordingError == nil && viewModel.scriptChange == nil && viewModel.recovery == nil
+        return !viewModel.hasWindow
     }
 
     /// 橫放：計時、收音、分段列轉 90 度，沿著使用者看到的下緣排，避開提詞那一側。
@@ -308,11 +307,12 @@ struct RecordingView: View {
     private var recoveryAlerts: some View {
         observed
             .alert("上次有一支影片還沒儲存", isPresented: recoveryShown(.video)) {
-                Button("看影片") { viewModel.openRecoveredVideo() }
+                // 一定要有 cancel，不然系統會自己多加一顆「取消」。
+                Button("看影片", role: .cancel) { viewModel.openRecoveredVideo() }
                 Button("刪掉", role: .destructive) { viewModel.deleteRecoveredVideo() }
             }
             .alert("上次還有 \(viewModel.recoveredCount) 段沒接完", isPresented: recoveryShown(.takes)) {
-                Button("接著錄") { viewModel.resumeRecoveredTakes() }
+                Button("接著錄", role: .cancel) { viewModel.resumeRecoveredTakes() }
                 Button("刪掉", role: .destructive) { viewModel.deleteRecoveredTakes() }
             }
     }
@@ -363,7 +363,7 @@ struct RecordingView: View {
                 video: video,
                 onSaved: { viewModel.reviewSaved(video) },
                 onDiscard: { viewModel.reviewDiscarded(video) },
-                onDiscardAll: { viewModel.discardAllTakes() }
+                onDiscardAll: { viewModel.discardTakes(of: video) }
             )
         }
     }

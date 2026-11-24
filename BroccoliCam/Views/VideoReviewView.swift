@@ -12,7 +12,7 @@ struct VideoReviewView: View {
     var onSaved: () -> Void = {}
     /// 使用者不要這一支了。檔案由外面在這一頁關掉之後刪，這裡不刪。
     var onDiscard: () -> Void = {}
-    /// 丟掉所有已錄的段落（分段錄影用）。
+    /// 丟掉接成這一支的各段（只有接好的影片會叫）。
     var onDiscardAll: () -> Void = {}
 
     private enum SaveState: Equatable {
@@ -62,7 +62,8 @@ struct VideoReviewView: View {
                 HStack(spacing: 12) {
                     Button {
                         if saveState == .saved {
-                            onDiscardAll()
+                            // 單支影片和分段沒關係，不要順手刪掉還沒接完的段落。
+                            if video.isStitched { onDiscardAll() }
                             close()
                         } else {
                             confirmDiscard = true
