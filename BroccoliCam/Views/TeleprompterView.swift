@@ -1,11 +1,5 @@
 import SwiftUI
-
-private struct ContentHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
+import UIKit
 
 /// 提詞區塊：固定在預覽頂端、緊鄰前鏡頭的窄區塊。
 /// 只是預覽上的 Overlay，不會進入影片；可以蓋住預覽中的臉。
@@ -33,36 +27,19 @@ struct TeleprompterView: View {
 
     var body: some View {
         GeometryReader { geo in
-            PromptBody(text: text, spoken: model.spokenOffset, spacing: fontSize * 0.28)
-                .equatable()
-                .font(.system(size: fontSize, weight: .semibold))
-                .multilineTextAlignment(.center)
-                .lineSpacing(fontSize * 0.28)
-                .frame(width: max(0, geo.size.width - 28))
-                .fixedSize(horizontal: false, vertical: true)
-                .background(
-                    GeometryReader { inner in
-                        Color.clear.preference(key: ContentHeightKey.self, value: inner.size.height)
-                    }
-                )
-                .padding(.top, TeleprompterModel.topPadding)
-                .offset(y: -model.offset)
-                .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
-                .clipped()
-                .onPreferenceChange(ContentHeightKey.self) { height in
-                    model.contentHeight = height + TeleprompterModel.topPadding
-                }
+            let width = max(0, geo.size.width - 28)
+            PromptLines(layout: model.layout(for: text, width: width, fontSize: fontSize),
+                        offset: model.offset, spoken: model.spokenOffset)
+                .frame(width: width, height: geo.size.height)
+                .frame(width: geo.size.width, height: geo.size.height)
+                .allowsHitTesting(false)
+                .accessibilityElement()
+                .accessibilityLabel(text)
                 .onAppear {
                     model.viewportHeight = geo.size.height
-                    model.layoutWidth = max(0, geo.size.width - 28)
-                    model.fontSize = fontSize
                 }
                 .onChange(of: geo.size) { _, size in
                     model.viewportHeight = size.height
-                    model.layoutWidth = max(0, size.width - 28)
-                }
-                .onChange(of: fontSize) { _, value in
-                    model.fontSize = value
                 }
         }
         .background(Color.black.opacity(backgroundOpacity))
@@ -112,64 +89,127 @@ struct TeleprompterView: View {
     }
 }
 
-/// 整篇提詞文字，一個換行一塊。
-/// 整篇一鏡到底的稿子很長，全部塞在一個 Text 會變成一張很高的圖，分開畫才不會爆。
-/// 提詞每一格都在捲動，獨立成 Equatable 的 view，唸到的位置沒變就不重新組。
-private struct PromptBody: View, Equatable {
-    let text: String
+/// 畫提詞的文字。用的就是換算用的那一份排版，點到哪行、捲到哪行才不會差。
+/// 整篇一鏡到底的稿子很長，只留看得到的那幾行，一行一個小圖層；捲動時只搬位置，不重畫。
+private struct PromptLines: UIViewRepresentable {
+    let layout: PromptLayout?
+    let offset: CGFloat
+    /// 唸到第幾個字（UTF-16），這之前的字變綠。
     let spoken: Int
-    let spacing: CGFloat
 
-    private struct Block: Identifiable {
-        let id: Int
-        let text: String
-        /// 這一塊裡已經唸過幾個字（UTF-16）。
-        let spoken: Int
+    func makeUIView(context: Context) -> PromptLinesUIView {
+        PromptLinesUIView(frame: .zero)
     }
 
-    private var blocks: [Block] {
-        var result: [Block] = []
-        var start = 0
-        for (index, line) in text.components(separatedBy: "\n").enumerated() {
-            let length = line.utf16.count
-            result.append(Block(id: index, text: line, spoken: min(max(0, spoken - start), length)))
-            start += length + 1
+    func updateUIView(_ view: PromptLinesUIView, context: Context) {
+        view.show(layout, offset: offset, spoken: spoken)
+    }
+}
+
+private final class PromptLinesUIView: UIView {
+    private var layout: PromptLayout?
+    private var offset: CGFloat = 0
+    private var spoken = 0
+    private let content = UIView()
+    private var lineViews: [Int: PromptLineUIView] = [:]
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        clipsToBounds = true
+        addSubview(content)
+    }
+
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    func show(_ next: PromptLayout?, offset nextOffset: CGFloat, spoken nextSpoken: Int) {
+        if layout !== next {
+            layout = next
+            removeLines { _ in true }
         }
-        return result
+        offset = nextOffset
+        spoken = nextSpoken
+        refresh()
     }
 
-    var body: some View {
-        VStack(spacing: spacing) {
-            ForEach(blocks) { block in
-                PromptText(text: block.text, spoken: block.spoken)
-                    .equatable()
-                    .shadow(color: .black.opacity(0.6), radius: 2, x: 0, y: 1)
-                    .frame(maxWidth: .infinity)
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        refresh()
+    }
+
+    private func refresh() {
+        guard let layout, bounds.height > 0 else { return }
+        let shift = TeleprompterModel.topPadding - offset
+        content.frame = CGRect(x: 0, y: shift, width: layout.width, height: layout.height)
+        let margin = PromptLineUIView.margin
+        let lowest = -shift - margin
+        let highest = bounds.height - shift + margin
+        let visible: (Int) -> Bool = { index in
+            let line = layout.lines[index]
+            return line.top + line.height >= lowest && line.top <= highest
+        }
+        removeLines { !visible($0) }
+        for index in layout.lines.indices where visible(index) {
+            let line = layout.lines[index]
+            guard !line.isBlank else { continue }
+            if let existing = lineViews[index] {
+                existing.setSpoken(spoken)
+            } else {
+                let view = PromptLineUIView(layout: layout, line: line, spoken: spoken)
+                content.addSubview(view)
+                lineViews[index] = view
             }
+        }
+    }
+
+    private func removeLines(where gone: (Int) -> Bool) {
+        for (index, view) in lineViews where gone(index) {
+            view.removeFromSuperview()
+            lineViews[index] = nil
         }
     }
 }
 
-/// 稿子文字：唸過的字變綠，還沒唸的維持白色。
-private struct PromptText: View, Equatable {
-    let text: String
-    let spoken: Int
+/// 一行字。
+private final class PromptLineUIView: UIView {
+    /// 四周多留一點，陰影和超出行高的筆畫才不會被切掉。
+    static let margin: CGFloat = 8
 
-    var body: some View {
-        // 空行也要佔一行的高度。
-        if text.isEmpty {
-            Text(" ")
-        } else {
-            Text(styled)
-        }
+    private let layout: PromptLayout
+    private let line: PromptLayout.Line
+    private var spoken: Int
+
+    init(layout: PromptLayout, line: PromptLayout.Line, spoken: Int) {
+        self.layout = layout
+        self.line = line
+        self.spoken = Self.clamped(spoken, to: line)
+        let frame = CGRect(x: 0, y: line.top, width: layout.width, height: line.height)
+        super.init(frame: frame.insetBy(dx: -Self.margin, dy: -Self.margin))
+        isOpaque = false
+        backgroundColor = .clear
     }
 
-    private var styled: AttributedString {
-        let cut = String.Index(utf16Offset: min(max(0, spoken), text.utf16.count), in: text)
-        var done = AttributedString(String(text[..<cut]))
-        done.foregroundColor = Theme.good
-        var rest = AttributedString(String(text[cut...]))
-        rest.foregroundColor = Color.white
-        return done + rest
+    required init?(coder: NSCoder) {
+        return nil
+    }
+
+    /// 這一行裡唸到的位置沒變就不重畫。
+    func setSpoken(_ next: Int) {
+        let value = Self.clamped(next, to: line)
+        guard value != spoken else { return }
+        spoken = value
+        setNeedsDisplay()
+    }
+
+    private static func clamped(_ spoken: Int, to line: PromptLayout.Line) -> Int {
+        min(max(spoken, line.start), line.end)
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let context = UIGraphicsGetCurrentContext() else { return }
+        layout.draw(line, spoken: spoken, at: CGPoint(x: Self.margin, y: Self.margin - line.top),
+                    in: context, bounds: bounds)
     }
 }

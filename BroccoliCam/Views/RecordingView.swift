@@ -170,7 +170,7 @@ struct RecordingView: View {
     private var remoteActive: Bool {
         if showScript || showSettings || showModes { return false }
         return viewModel.review == nil && viewModel.mergeError == nil && viewModel.orientationError == nil
-            && viewModel.recordingError == nil && viewModel.scriptChange == nil
+            && viewModel.recordingError == nil && viewModel.scriptChange == nil && viewModel.recovery == nil
     }
 
     /// 橫放：計時、收音、分段列轉 90 度，沿著使用者看到的下緣排，避開提詞那一側。
@@ -304,9 +304,22 @@ struct RecordingView: View {
         }
     }
 
+    /// 上次留下來的段落或影片，開 App 時問。
+    private var recoveryAlerts: some View {
+        observed
+            .alert("上次有一支影片還沒儲存", isPresented: recoveryShown(.video)) {
+                Button("看影片") { viewModel.openRecoveredVideo() }
+                Button("刪掉", role: .destructive) { viewModel.deleteRecoveredVideo() }
+            }
+            .alert("上次還有 \(viewModel.recoveredCount) 段沒接完", isPresented: recoveryShown(.takes)) {
+                Button("接著錄") { viewModel.resumeRecoveredTakes() }
+                Button("刪掉", role: .destructive) { viewModel.deleteRecoveredTakes() }
+            }
+    }
+
     /// 彈出視窗：提示、腳本、設定、完成頁。
     private var presented: some View {
-        observed
+        recoveryAlerts
         .alert("接片沒有成功", isPresented: mergeErrorShown) {
             Button("好") {}
         } message: {
@@ -343,11 +356,15 @@ struct RecordingView: View {
         }
         .fullScreenCover(item: $viewModel.review, onDismiss: {
             startCamera()
+            viewModel.reviewDismissed()
             viewModel.reconsiderScript()
         }) { video in
-            VideoReviewView(video: video, onDiscardAll: {
-                viewModel.discardAllTakes()
-            })
+            VideoReviewView(
+                video: video,
+                onSaved: { viewModel.reviewSaved(video) },
+                onDiscard: { viewModel.reviewDiscarded(video) },
+                onDiscardAll: { viewModel.discardAllTakes() }
+            )
         }
     }
 
@@ -389,6 +406,14 @@ struct RecordingView: View {
             set: { shown in
                 if !shown { viewModel.recordingError = nil }
             }
+        )
+    }
+
+    /// 兩顆按鈕都會自己清掉，這裡不用再動。
+    private func recoveryShown(_ kind: RecordingViewModel.Recovery) -> Binding<Bool> {
+        Binding(
+            get: { viewModel.recovery == kind },
+            set: { _ in }
         )
     }
 

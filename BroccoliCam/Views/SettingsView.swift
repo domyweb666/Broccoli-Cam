@@ -71,6 +71,7 @@ struct SettingsView: View {
         Section {
             ModePicker()
                 .padding(.vertical, 8)
+            Toggle("即時反應", isOn: $settings.instantReaction)
         } header: {
             Text("模式")
         }

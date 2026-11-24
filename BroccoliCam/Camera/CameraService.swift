@@ -35,8 +35,8 @@ final class CameraService: NSObject, ObservableObject {
     /// 錄影檔完成（主執行緒回呼）。
     /// 第二個值有東西代表中途出過狀況，檔案只救回一部分。
     var onRecordingFinished: ((URL, String?) -> Void)?
-    /// 錄影失敗和原因（主執行緒回呼）。
-    var onRecordingFailed: ((String) -> Void)?
+    /// 錄影失敗：要寫的檔和原因（主執行緒回呼）。檔案可能還在。
+    var onRecordingFailed: ((URL, String) -> Void)?
     /// 音量鍵或藍牙遙控器被按下（主執行緒回呼）。
     var onCaptureButton: (() -> Void)?
 
@@ -77,6 +77,10 @@ final class CameraService: NSObject, ObservableObject {
     private var activeFPS = 30
     /// 上次要求的曝光補償，sessionQueue 讀寫。裝置讀回來的值會慢慢變、也會四捨五入，拿來比會一直重設。
     private var lastRequestedBias: Float?
+
+    /// 第幾次開錄。畫面那邊等太久放棄了就換號，還在排隊的那次不會突然自己錄起來。
+    private let startLock = NSLock()
+    private var startRun = 0
 
     // 畫面優化。lookLock 保護這一組。
     private let lookLock = NSLock()
@@ -684,32 +688,67 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     /// landscape：手機橫放，要錄成橫式 16:9。角度交給 RotationCoordinator 依手機實際的擺法決定。請在主執行緒呼叫。
-    func startRecording(landscape: Bool = false) {
+    /// ready 在 sessionQueue 上呼叫，會等「這個檔已經記進清單」，回 false 就不錄。
+    func startRecording(landscape: Bool, to url: URL, ready: @escaping () -> Bool) {
         // 一鍵優化跑到一半就開錄：不要讓它在錄影中動曝光。
         cancelOptimize()
+        let run = nextStartRun()
         let turn = landscape ? currentLandscapeTurn() : 0
         if landscape {
             log("橫式錄影 再轉 \(turn) 度")
         }
         sessionQueue.async {
+            guard self.isCurrentStart(run) else {
+                self.log("開錄等太久，已經取消")
+                return
+            }
             guard self.isConfigured, self.session.isRunning, !self.session.isInterrupted else {
                 self.log("相機尚未就緒，無法錄影")
-                DispatchQueue.main.async { self.onRecordingFailed?("相機還沒準備好，請再試一次") }
+                DispatchQueue.main.async { self.onRecordingFailed?(url, "相機還沒準備好，請再試一次") }
                 return
             }
             guard !self.pipeline.isRecording else { return }
+            guard ready() else {
+                let text = "手機空間不夠，沒辦法開始錄"
+                self.fail(text)
+                DispatchQueue.main.async { self.onRecordingFailed?(url, text) }
+                return
+            }
             // 分析中動過的曝光和測光先還原。
             self.applyLookToDevice()
             do {
-                let recorder = try self.makeRecorder(turn: turn)
+                let recorder = try self.makeRecorder(turn: turn, url: url)
                 self.pipeline.setRecorder(recorder)
                 recorder.start(at: self.captureTime())
             } catch {
                 let text = "無法開始錄影：\(error.localizedDescription)"
                 self.fail(text)
-                DispatchQueue.main.async { self.onRecordingFailed?(text) }
+                DispatchQueue.main.async { self.onRecordingFailed?(url, text) }
             }
         }
+    }
+
+    /// 等太久，不錄了：還沒開始的取消，已經建好寫檔器但一格都沒收到的也收掉。
+    func cancelStart() {
+        _ = nextStartRun()
+        sessionQueue.async {
+            guard let recorder = self.pipeline.recorder, recorder.isActive,
+                  recorder.currentCounts.frames == 0 else { return }
+            recorder.finishNow(at: self.captureTime())
+        }
+    }
+
+    private func nextStartRun() -> Int {
+        startLock.lock()
+        defer { startLock.unlock() }
+        startRun += 1
+        return startRun
+    }
+
+    private func isCurrentStart(_ run: Int) -> Bool {
+        startLock.lock()
+        defer { startLock.unlock() }
+        return startRun == run
     }
 
     func stopRecording() {
@@ -731,16 +770,12 @@ final class CameraService: NSObject, ObservableObject {
     ///
     /// 鏡像時的轉向：影格 = 先轉直式角度、再左右鏡像。要的成品 = 先轉橫式角度、再左右鏡像。
     /// 鏡像前後夾住一個旋轉，等於反方向的旋轉（M·R(θ)·M = R(-θ)），所以鏡像時再轉的方向要反過來。
-    private func makeRecorder(turn: Int) throws -> FrameRecorder {
+    private func makeRecorder(turn: Int, url: URL) throws -> FrameRecorder {
         let finalTurn = pipeline.isMirrored ? -turn : turn
         let upright = pipeline.frameSize ?? expectedFrameSize()
         let sideways = abs(finalTurn) == 90
         let width = Int(sideways ? upright.height : upright.width)
         let height = Int(sideways ? upright.width : upright.height)
-
-        let name = "broccoli-\(Int(Date().timeIntervalSince1970 * 1000)).mov"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-        try? FileManager.default.removeItem(at: url)
 
         let recorder = try FrameRecorder(
             url: url, width: width, height: height, turn: finalTurn,
@@ -761,7 +796,7 @@ final class CameraService: NSObject, ObservableObject {
                 self.logCounts(of: recorder)
                 self.pipeline.clearRecorder(recorder)
             }
-            self.recordingEnded(outcome)
+            self.recordingEnded(outcome, url: url)
         }
         log("準備錄影 \(width)x\(height) 音軌\(recorder.hasAudio ? "有" : "無")")
         return recorder
@@ -829,7 +864,7 @@ final class CameraService: NSObject, ObservableObject {
         log("寫檔 \(counts.frames) 格，來不及 \(counts.notReady)，算圖失敗 \(counts.renderFailed)，聲音丟 \(counts.audioDropped)")
     }
 
-    private func recordingEnded(_ outcome: FrameRecorder.Outcome) {
+    private func recordingEnded(_ outcome: FrameRecorder.Outcome, url: URL) {
         switch outcome {
         case .finished(let url, let note):
             if let note {
@@ -849,7 +884,7 @@ final class CameraService: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 self.isRecording = false
                 self.lastError = message
-                self.onRecordingFailed?(message)
+                self.onRecordingFailed?(url, message)
                 self.applyPreviewRotation()
                 self.endRecordingTask()
             }

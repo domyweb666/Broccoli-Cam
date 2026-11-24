@@ -1,4 +1,126 @@
+import SwiftUI
 import UIKit
+
+/// 整篇稿子的排版。畫面就是用這一份畫的，換算也用這一份，所以看到的行和算出來的行一定是同一行。
+///
+/// 以前畫面由 SwiftUI 的 Text 一段一段排，換算另外用 TextKit 整篇排一次，再用「總高度的比例」對起來。
+/// 兩邊中文行、英文行、空行的行高比例不一樣，折行規則也不一樣，有空行的長稿用一個比例對不齊，會差到別行去。
+final class PromptLayout {
+    struct Line {
+        /// 這行開頭與結束（不含）的字元位置（UTF-16）。
+        let start: Int
+        let end: Int
+        let glyphs: NSRange
+        /// 這行頂端的 y 和高度（含行距）。
+        let top: CGFloat
+        let height: CGFloat
+        /// 字的中線，判斷點在哪一行用。
+        let center: CGFloat
+        /// 空行，不拿來當跳轉的目的地。
+        let isBlank: Bool
+    }
+
+    /// 一套排版。NSLayoutManager 不會抓著 NSTextStorage，要自己留著。
+    private struct Engine {
+        let storage: NSTextStorage
+        let manager: NSLayoutManager
+        let container: NSTextContainer
+
+        init(text: String, width: CGFloat, fontSize: CGFloat, color: UIColor) {
+            let font = UIFont.systemFont(ofSize: fontSize, weight: .semibold)
+            let style = NSMutableParagraphStyle()
+            style.alignment = .center
+            style.lineSpacing = fontSize * 0.28
+            style.lineBreakStrategy = .standard
+            // 中文、英文、空行用的字型不同，行高會不一樣，固定成一樣高。
+            style.minimumLineHeight = font.lineHeight
+            style.maximumLineHeight = font.lineHeight
+            let shadow = NSShadow()
+            shadow.shadowColor = UIColor.black.withAlphaComponent(0.6)
+            shadow.shadowBlurRadius = 4
+            shadow.shadowOffset = CGSize(width: 0, height: 1)
+            storage = NSTextStorage(string: text, attributes: [
+                .font: font,
+                .paragraphStyle: style,
+                .foregroundColor: color,
+                .shadow: shadow
+            ])
+            manager = NSLayoutManager()
+            container = NSTextContainer(size: CGSize(width: width, height: .greatestFiniteMagnitude))
+            container.lineFragmentPadding = 0
+            manager.addTextContainer(container)
+            storage.addLayoutManager(manager)
+            manager.ensureLayout(for: container)
+        }
+    }
+
+    let text: String
+    let width: CGFloat
+    let fontSize: CGFloat
+    let lines: [Line]
+    let height: CGFloat
+
+    private let plain: Engine
+    /// 唸過的字用的另一個顏色。排版和 plain 一樣，唸到才建。
+    private lazy var spokenEngine = Engine(text: text, width: width, fontSize: fontSize, color: spokenColor)
+    private let spokenColor: UIColor
+
+    init(text: String, width: CGFloat, fontSize: CGFloat, spokenColor: UIColor) {
+        self.text = text
+        self.width = width
+        self.fontSize = fontSize
+        self.spokenColor = spokenColor
+        let engine = Engine(text: text, width: width, fontSize: fontSize, color: .white)
+        let manager = engine.manager
+        let source = text as NSString
+        var found: [Line] = []
+        var bottom: CGFloat = 0
+        let glyphs = NSRange(location: 0, length: manager.numberOfGlyphs)
+        manager.enumerateLineFragments(forGlyphRange: glyphs) { rect, _, _, glyphRange, _ in
+            let characters = manager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
+            let content = source.substring(with: characters)
+            let baseline = manager.location(forGlyphAt: glyphRange.location).y
+            found.append(Line(
+                start: characters.location,
+                end: characters.location + characters.length,
+                glyphs: glyphRange,
+                top: rect.minY,
+                height: rect.height,
+                // 中文字大約從基線上方 0.88 到下方 0.12 個字高。
+                center: rect.minY + baseline - fontSize * 0.38,
+                isBlank: content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ))
+            bottom = max(bottom, rect.maxY)
+        }
+        lines = found
+        height = bottom
+        plain = engine
+    }
+
+    /// 畫一行，唸過的部分用另一個顏色。origin 是整篇左上角在目前畫布上的位置。
+    func draw(_ line: Line, spoken: Int, at origin: CGPoint, in context: CGContext, bounds: CGRect) {
+        if spoken <= line.start {
+            plain.manager.drawGlyphs(forGlyphRange: line.glyphs, at: origin)
+            return
+        }
+        if spoken >= line.end {
+            spokenEngine.manager.drawGlyphs(forGlyphRange: line.glyphs, at: origin)
+            return
+        }
+        let characters = NSRange(location: line.start, length: spoken - line.start)
+        let done = plain.manager.glyphRange(forCharacterRange: characters, actualCharacterRange: nil)
+        let edge = origin.x + plain.manager.boundingRect(forGlyphRange: done, in: plain.container).maxX
+        let cut = min(max(bounds.minX, edge), bounds.maxX)
+        context.saveGState()
+        context.clip(to: CGRect(x: bounds.minX, y: bounds.minY, width: cut - bounds.minX, height: bounds.height))
+        spokenEngine.manager.drawGlyphs(forGlyphRange: line.glyphs, at: origin)
+        context.restoreGState()
+        context.saveGState()
+        context.clip(to: CGRect(x: cut, y: bounds.minY, width: bounds.maxX - cut, height: bounds.height))
+        plain.manager.drawGlyphs(forGlyphRange: line.glyphs, at: origin)
+        context.restoreGState()
+    }
+}
 
 /// 提詞捲動狀態。與錄影狀態互相獨立，可各自啟動／暫停。
 /// 兩種捲法：固定速度往上捲，或跟著聲音（由語音辨識告訴它唸到哪個字）。
@@ -16,11 +138,12 @@ final class TeleprompterModel: ObservableObject {
 
     /// 捲動速度（pt／秒）
     var speed: CGFloat = 36
-    var contentHeight: CGFloat = 0
     var viewportHeight: CGFloat = 0
-    /// 文字實際排版的寬度與字級，由提詞 view 提供，用來算「第幾個字在第幾行」。
-    var layoutWidth: CGFloat = 0
-    var fontSize: CGFloat = 26
+    /// 文字排版的寬度與字級，由提詞 view 提供。
+    private var layoutWidth: CGFloat = 0
+    private var fontSize: CGFloat = 26
+    private var contentHeight: CGFloat = 0
+    private var cachedLayout: PromptLayout?
 
     /// 固定速度自己捲到底而停下來的，不是人按的暫停。
     private(set) var stoppedAtEnd = false
@@ -39,25 +162,6 @@ final class TeleprompterModel: ObservableObject {
     private var cursorTop: CGFloat = 0
     /// 跳到最後幾行了：已經沒得捲，但不要因此停掉播放。
     private var restsAtEnd = false
-
-    private struct Line {
-        /// 這行開頭與結束（不含）的字元位置（UTF-16）。
-        let start: Int
-        let end: Int
-        /// 這行頂端的 y。
-        let top: CGFloat
-        /// 空行，不拿來當跳轉的目的地。
-        let isBlank: Bool
-    }
-
-    private struct LineTable {
-        let text: String
-        let width: CGFloat
-        let fontSize: CGFloat
-        let lines: [Line]
-        let totalHeight: CGFloat
-    }
-    private var lineTable: LineTable?
 
     /// 捲到最後一行停在閱讀區上緣附近為止。
     private var maxOffset: CGFloat {
@@ -169,35 +273,36 @@ final class TeleprompterModel: ObservableObject {
         if let cursor {
             return min(max(0, cursor), text.utf16.count)
         }
-        guard let table = table(for: text), !table.lines.isEmpty else { return 0 }
+        guard let layout = layout(for: text), !layout.lines.isEmpty else { return 0 }
         // 一行捲出去超過一半，就算下一行。
         let y = offset + fontSize * 0.7
-        let scale = heightScale(of: table)
-        let index = table.lines.lastIndex { $0.top * scale <= y } ?? 0
-        return table.lines[textLine(near: index, in: table)].start
+        let index = layout.lines.lastIndex { $0.top <= y } ?? 0
+        return layout.lines[textLine(near: index, in: layout)].start
     }
 
     /// 下一行的開頭。已經在最後一行就是 nil。
     func nextLineStart(after utf16Offset: Int, in text: String) -> Int? {
-        guard let table = table(for: text), !table.lines.isEmpty else { return nil }
-        let current = lineIndex(containing: utf16Offset, in: table)
-        return table.lines[(current + 1)...].first { !$0.isBlank }?.start
+        guard let layout = layout(for: text), !layout.lines.isEmpty else { return nil }
+        let current = lineIndex(containing: utf16Offset, in: layout)
+        return layout.lines[(current + 1)...].first { !$0.isBlank }?.start
     }
 
     /// 上一行的開頭。已經在第一行就是 nil。
     func previousLineStart(before utf16Offset: Int, in text: String) -> Int? {
-        guard let table = table(for: text), !table.lines.isEmpty else { return nil }
-        let current = lineIndex(containing: utf16Offset, in: table)
-        return table.lines[..<current].last { !$0.isBlank }?.start
+        guard let layout = layout(for: text), !layout.lines.isEmpty else { return nil }
+        let current = lineIndex(containing: utf16Offset, in: layout)
+        return layout.lines[..<current].last { !$0.isBlank }?.start
     }
 
     /// 點在提詞區的 y（從提詞區上緣算），對應到那一行開頭的位置。
+    /// 取字的中線離手指最近的那一行：行距全在字的下面，用行的上緣切會把字上方那半截算給上一行。
     func lineStart(atViewY y: CGFloat, in text: String) -> Int? {
-        guard let table = table(for: text), !table.lines.isEmpty else { return nil }
+        guard let layout = layout(for: text), !layout.lines.isEmpty else { return nil }
         let contentY = y - Self.topPadding + offset
-        let scale = heightScale(of: table)
-        let index = table.lines.lastIndex { $0.top * scale <= contentY } ?? 0
-        return table.lines[textLine(near: index, in: table)].start
+        let nearest = layout.lines
+            .filter { !$0.isBlank }
+            .min { abs($0.center - contentY) < abs($1.center - contentY) }
+        return nearest?.start ?? layout.lines[0].start
     }
 
     /// 各段開頭的位置（UTF-16）。用空行分段；整篇沒有空行就用換行分段。
@@ -225,73 +330,45 @@ final class TeleprompterModel: ObservableObject {
         return starts
     }
 
-    // MARK: - 行表
+    // MARK: - 排版
 
     private func place(cursorAt utf16Offset: Int, in text: String) {
         cursor = utf16Offset
-        guard let table = table(for: text), !table.lines.isEmpty else {
+        guard let layout = layout(for: text), !layout.lines.isEmpty else {
             cursorTop = 0
             return
         }
-        let line = table.lines[lineIndex(containing: utf16Offset, in: table)]
-        cursorTop = max(0, line.top * heightScale(of: table))
+        cursorTop = layout.lines[lineIndex(containing: utf16Offset, in: layout)].top
     }
 
-    /// SwiftUI 實際排出來的高度和這裡算的可能差一點，按比例換算。
-    private func heightScale(of table: LineTable) -> CGFloat {
-        let actual = max(1, contentHeight - Self.topPadding)
-        return table.totalHeight > 0 ? actual / table.totalHeight : 1
-    }
-
-    private func lineIndex(containing utf16Offset: Int, in table: LineTable) -> Int {
-        table.lines.firstIndex { $0.end > utf16Offset } ?? table.lines.count - 1
+    private func lineIndex(containing utf16Offset: Int, in layout: PromptLayout) -> Int {
+        layout.lines.firstIndex { $0.end > utf16Offset } ?? layout.lines.count - 1
     }
 
     /// 空行就改成下一個有字的行，後面沒有了就往前找。
-    private func textLine(near index: Int, in table: LineTable) -> Int {
-        guard table.lines[index].isBlank else { return index }
-        if let next = table.lines.indices.first(where: { $0 > index && !table.lines[$0].isBlank }) {
+    private func textLine(near index: Int, in layout: PromptLayout) -> Int {
+        guard layout.lines[index].isBlank else { return index }
+        if let next = layout.lines.indices.first(where: { $0 > index && !layout.lines[$0].isBlank }) {
             return next
         }
-        return table.lines.indices.last(where: { $0 < index && !table.lines[$0].isBlank }) ?? index
+        return layout.lines.indices.last(where: { $0 < index && !layout.lines[$0].isBlank }) ?? index
     }
 
-    private func table(for text: String) -> LineTable? {
+    /// 畫面要畫的排版。寬度和字級由畫面決定，在這裡記下來，之後的換算都用同一份。
+    func layout(for text: String, width: CGFloat, fontSize: CGFloat) -> PromptLayout? {
+        layoutWidth = width
+        self.fontSize = fontSize
+        return layout(for: text)
+    }
+
+    private func layout(for text: String) -> PromptLayout? {
         guard layoutWidth > 0 else { return nil }
-        if let cached = lineTable, cached.text == text, cached.width == layoutWidth, cached.fontSize == fontSize {
+        if let cached = cachedLayout, cached.width == layoutWidth, cached.fontSize == fontSize, cached.text == text {
             return cached
         }
-        let style = NSMutableParagraphStyle()
-        style.lineSpacing = fontSize * 0.28
-        style.alignment = .center
-        let storage = NSTextStorage(string: text, attributes: [
-            .font: UIFont.systemFont(ofSize: fontSize, weight: .semibold),
-            .paragraphStyle: style
-        ])
-        let manager = NSLayoutManager()
-        let container = NSTextContainer(size: CGSize(width: layoutWidth, height: .greatestFiniteMagnitude))
-        container.lineFragmentPadding = 0
-        manager.addTextContainer(container)
-        storage.addLayoutManager(manager)
-        manager.ensureLayout(for: container)
-
-        let source = text as NSString
-        var lines: [Line] = []
-        var total: CGFloat = 0
-        let glyphs = NSRange(location: 0, length: manager.numberOfGlyphs)
-        manager.enumerateLineFragments(forGlyphRange: glyphs) { rect, _, _, glyphRange, _ in
-            let characters = manager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
-            let content = source.substring(with: characters)
-            lines.append(Line(
-                start: characters.location,
-                end: characters.location + characters.length,
-                top: rect.minY,
-                isBlank: content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ))
-            total = max(total, rect.maxY)
-        }
-        let built = LineTable(text: text, width: layoutWidth, fontSize: fontSize, lines: lines, totalHeight: total)
-        lineTable = built
+        let built = PromptLayout(text: text, width: layoutWidth, fontSize: fontSize, spokenColor: UIColor(Theme.good))
+        cachedLayout = built
+        contentHeight = built.height + Self.topPadding
         return built
     }
 

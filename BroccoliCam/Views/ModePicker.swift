@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// 主畫面按「提詞／陪伴」跳出來的選單。選了就關掉，直接看效果。
 struct ModeSheet: View {
@@ -10,7 +11,7 @@ struct ModeSheet: View {
                 .padding(20)
                 .padding(.top, 8)
         }
-        .presentationDetents([.height(500), .large])
+        .presentationDetents([.height(CompanionAssets.available.count > 1 ? 590 : 500), .large])
         .presentationDragIndicator(.visible)
     }
 }
@@ -43,6 +44,10 @@ struct ModePicker: View {
                 .foregroundStyle(.secondary)
                 .padding(.top, 6)
 
+            if CompanionAssets.available.count > 1 {
+                PersonPicker()
+            }
+
             LazyVGrid(columns: columns, spacing: 12) {
                 ForEach(CompanionLayout.allCases) { layout in
                     layoutButton(layout)
@@ -69,6 +74,58 @@ struct ModePicker: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// 聆聽者的頭像橫排。只換人，不會切到陪伴模式，也不關選單，可以一個一個比。
+private struct PersonPicker: View {
+    @EnvironmentObject private var settings: SettingsStore
+
+    private let side: CGFloat = 72
+
+    var body: some View {
+        HStack(spacing: 16) {
+            ForEach(CompanionAssets.available) { person in
+                personButton(person)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func personButton(_ person: CompanionPerson) -> some View {
+        let selected = CompanionAssets.resolve(settings.companionPerson) == person
+        return Button {
+            settings.companionPerson = person
+        } label: {
+            face(person)
+                .frame(width: side, height: side)
+                .clipShape(Circle())
+                .padding(4)
+                .overlay {
+                    Circle()
+                        .strokeBorder(selected ? Theme.accent : Color.clear, lineWidth: 3)
+                }
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(person.accessibilityName)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    /// 定格圖放大到臉，眼睛在圓的中間。裁法和圓形頭像的擺法一樣。
+    private func face(_ person: CompanionPerson) -> some View {
+        let height = side * 2.6
+        return ZStack(alignment: .top) {
+            Theme.accent.opacity(0.4)
+            if let image = CompanionAssets.thumbnail(person) {
+                Image(uiImage: image)
+                    .resizable()
+                    .frame(width: height * 9 / 16, height: height)
+                    .offset(y: side / 2 - height * 0.21)
+            }
+        }
+        .frame(width: side, height: side, alignment: .top)
     }
 }
 

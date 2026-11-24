@@ -496,18 +496,27 @@ final class FrameRecorder {
     }
 
     /// 寫檔器失敗後，看看已經寫出去的片段能不能播。能播就留著用。
+    /// 讀檔本身出錯不代表檔案壞了（例如媒體服務剛重啟），等一下再試；
+    /// 還是讀不了就把檔案留著，下次開 App 由 TakeStore 再看一次。
     private func salvage(_ message: String) {
         let fileURL = url
         Task {
-            let asset = AVURLAsset(url: fileURL)
-            let playable: Bool = (try? await asset.load(.isPlayable)) ?? false
-            let duration: CMTime = (try? await asset.load(.duration)) ?? .zero
-            if playable, duration.isNumeric, duration.seconds > 0.5 {
-                self.report(.finished(fileURL, note: message))
-            } else {
-                try? FileManager.default.removeItem(at: fileURL)
-                self.report(.failed(message))
+            for attempt in 0..<3 {
+                if attempt > 0 {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+                let asset = AVURLAsset(url: fileURL)
+                guard let playable: Bool = try? await asset.load(.isPlayable),
+                      let duration: CMTime = try? await asset.load(.duration) else { continue }
+                if playable, duration.isNumeric, duration.seconds > 0.5 {
+                    self.report(.finished(fileURL, note: message))
+                } else {
+                    try? FileManager.default.removeItem(at: fileURL)
+                    self.report(.failed(message))
+                }
+                return
             }
+            self.report(.failed(message))
         }
     }
 

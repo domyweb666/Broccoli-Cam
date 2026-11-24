@@ -41,6 +41,28 @@ enum CompanionLayout: String, CaseIterable, Identifiable {
     }
 }
 
+/// 三位聆聽者。不取名字，畫面上只用頭像分辨。
+enum CompanionPerson: String, CaseIterable, Identifiable {
+    case a, b, c
+
+    var id: String { rawValue }
+
+    var accessibilityName: String {
+        switch self {
+        case .a: return "聆聽者 1"
+        case .b: return "聆聽者 2"
+        case .c: return "聆聽者 3"
+        }
+    }
+}
+
+/// 播放器和反應狀態機直接看 UserDefaults 的變化，主畫面不用在中間轉手。
+/// 屬性名稱要和存的鍵一模一樣，KVO 才收得到。
+extension UserDefaults {
+    @objc dynamic var companionPerson: String? { string(forKey: "companionPerson") }
+    @objc dynamic var instantReaction: Bool { (object(forKey: "instantReaction") as? Bool) ?? true }
+}
+
 /// 構圖輔助線。只畫在預覽上，不會錄進影片。
 enum GuideStyle: String, CaseIterable, Identifiable {
     case off
@@ -137,6 +159,10 @@ final class SettingsStore: ObservableObject {
     @Published var companionMode: Bool { didSet { defaults.set(companionMode, forKey: "companionMode") } }
     /// 陪伴模式的聆聽者擺法
     @Published var companionLayout: CompanionLayout { didSet { defaults.set(companionLayout.rawValue, forKey: "companionLayout") } }
+    /// 選哪一位聆聽者
+    @Published var companionPerson: CompanionPerson { didSet { defaults.set(companionPerson.rawValue, forKey: "companionPerson") } }
+    /// 聆聽者跟著講話的停頓和音量反應。關掉就是隨機點頭
+    @Published var instantReaction: Bool { didSet { defaults.set(instantReaction, forKey: "instantReaction") } }
     /// 手機橫放時錄橫式 16:9
     @Published var autoLandscape: Bool { didSet { defaults.set(autoLandscape, forKey: "autoLandscape") } }
 
@@ -189,6 +215,8 @@ final class SettingsStore: ObservableObject {
         subtitleMaxChars = (d.object(forKey: "subtitleMaxChars") as? Double) ?? 14
         companionMode = (d.object(forKey: "companionMode") as? Bool) ?? false
         companionLayout = CompanionLayout(rawValue: d.string(forKey: "companionLayout") ?? "") ?? .fullCall
+        companionPerson = CompanionPerson(rawValue: d.string(forKey: "companionPerson") ?? "") ?? .a
+        instantReaction = (d.object(forKey: "instantReaction") as? Bool) ?? true
         autoLandscape = (d.object(forKey: "autoLandscape") as? Bool) ?? true
         scriptTextScale = (d.object(forKey: "scriptTextScale") as? Double) ?? 1.0
         segmentedRecording = (d.object(forKey: "segmentedRecording") as? Bool) ?? true

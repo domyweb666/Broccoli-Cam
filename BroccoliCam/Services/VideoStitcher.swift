@@ -23,7 +23,8 @@ enum VideoStitcher {
         let end: Double?
     }
 
-    static func stitch(_ clips: [Clip]) async throws -> URL {
+    /// 輸出到 output，這個檔名不能已經存在。失敗時會把寫到一半的檔刪掉，各段不動。
+    static func stitch(_ clips: [Clip], to output: URL) async throws {
         let composition = AVMutableComposition()
         guard let videoTrack = composition.addMutableTrack(
             withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
@@ -86,9 +87,6 @@ enum VideoStitcher {
             throw VideoStitchError.cannotExport
         }
 
-        let name = "broccoli-merged-\(Int(Date().timeIntervalSince1970)).mov"
-        let output = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-        try? FileManager.default.removeItem(at: output)
         session.outputURL = output
         session.outputFileType = .mov
         session.shouldOptimizeForNetworkUse = true
@@ -103,6 +101,5 @@ enum VideoStitcher {
             try? FileManager.default.removeItem(at: output)
             throw VideoStitchError.exportFailed(session.error?.localizedDescription ?? "未知原因")
         }
-        return output
     }
 }

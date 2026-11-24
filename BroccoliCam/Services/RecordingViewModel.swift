@@ -28,15 +28,14 @@ struct SegmentTake {
     let lastSound: Double?
 }
 
-/// 切到陪伴時收起來的分段進度。檔案不動，切回提詞原樣放回去。
-private struct ShelvedTakes {
-    let segments: [String]
-    let currentIndex: Int
-    let takes: [Int: SegmentTake]
-    let takesLandscape: Bool?
-    let pending: SegmentTake?
-    let lockedAngle: Double
-    let declinedSegments: [String]?
+extension SegmentTake {
+    init(_ saved: SavedTake, in store: TakeStore) {
+        self.init(url: store.url(saved.file), firstSound: saved.firstSound, lastSound: saved.lastSound)
+    }
+
+    var saved: SavedTake {
+        SavedTake(file: url.lastPathComponent, firstSound: firstSound, lastSound: lastSound)
+    }
 }
 
 /// 錄影狀態與流程協調：倒數 → 錄影 → （分段：留用或重錄 → 接片）→ 完成頁。
@@ -47,6 +46,12 @@ final class RecordingViewModel: ObservableObject {
         case starting
         case recording
         case finishing
+    }
+
+    /// 上次留下來、等使用者決定的東西。
+    enum Recovery {
+        case video
+        case takes
     }
 
     @Published private(set) var phase: Phase = .idle {
@@ -60,6 +65,10 @@ final class RecordingViewModel: ObservableObject {
     }
     @Published private(set) var elapsed: TimeInterval = 0
     @Published var review: RecordedVideo?
+    /// 正在問上次留下來的哪一樣。
+    @Published private(set) var recovery: Recovery?
+    /// 上次留下來幾段。
+    @Published private(set) var recoveredCount = 0
 
     // 分段錄影
     @Published private(set) var segments: [String] = []
@@ -79,8 +88,8 @@ final class RecordingViewModel: ObservableObject {
     private var waitingScript: String?
     /// 使用者選了保留時，新稿切出來的段落。同一份不再問。
     private var declinedSegments: [String]?
-    /// 切到陪伴時收起來的段落。
-    private var shelf: ShelvedTakes?
+    /// 切到陪伴時收起來的段落。檔案不動，切回提詞原樣放回去。
+    private var shelf: SavedSession?
     /// 現在的段落是照哪個模式切的。
     private var isCompanion = false
     /// 跳轉、切換之後在畫面上閃一下的字，約 1.2 秒自己消失。
@@ -92,6 +101,25 @@ final class RecordingViewModel: ObservableObject {
     var deviceAngle: Double = 0
     /// 已經錄好的段落是橫的還是直的。還沒有任何一段時是 nil。
     private var takesLandscape: Bool?
+
+    // 存檔
+    private let store = TakeStore.shared
+    /// 正在錄的檔（和寫檔失敗、等下次開 App 再看的檔）。
+    private var recordings: [SavedRecording] = []
+    /// 還沒存到照片的完成影片。
+    private var videos: [SavedVideo] = []
+    /// 接好的那支已經存到照片，各段不用再留。
+    private var stitchedSaved = false
+    /// 完成頁正在看的那支，關掉之後看要不要刪檔。
+    private var shownVideo: URL?
+    /// 上次的分段進度，使用者還沒決定要不要接著錄。
+    private var recoveredSession: SavedSession?
+    /// 讀完清單之前不能存，不然會用空的蓋掉上次的。
+    private var loaded = false
+    /// 上次留下來的還沒處理完，先不讓錄。
+    private var restoring = true
+    /// 一個視窗收起來之後隔一下再跳下一個，同時換會跳不出來。
+    private let alertGap: TimeInterval = 0.45
 
     let prompter = TeleprompterModel()
     private let follower = SpeechFollower()
@@ -156,8 +184,8 @@ final class RecordingViewModel: ObservableObject {
         camera.onRecordingFinished = { [weak self] url, note in
             self?.recordingFinished(url, damaged: note != nil)
         }
-        camera.onRecordingFailed = { [weak self] reason in
-            self?.recordingFailed(reason)
+        camera.onRecordingFailed = { [weak self] url, reason in
+            self?.recordingFailed(url, reason)
         }
         camera.onCaptureButton = { [weak self] in
             self?.hardwareButtonPressed()
@@ -186,6 +214,195 @@ final class RecordingViewModel: ObservableObject {
                 self?.recordingChanged(recording)
             }
             .store(in: &cancellables)
+        store.onLog = { [weak camera] message in
+            camera?.log(message)
+        }
+        loadSaved()
+    }
+
+    // MARK: - 存檔與接續
+
+    /// 把現在的狀態存下來，存成功之後才刪 urls。狀態一變就呼叫，內容沒變不會重寫。
+    private func persist(deleting urls: [URL] = []) {
+        guard loaded else { return }
+        store.save(manifest(), deleting: urls.map { $0.lastPathComponent })
+    }
+
+    private func manifest() -> TakeManifest {
+        var result = TakeManifest()
+        let recordingSegment = recordings.contains { $0.index != nil && !$0.failed }
+        if let recoveredSession {
+            result.session = recoveredSession
+        } else if isSegmented, !stitchedSaved, recordedCount > 0 || recordingSegment {
+            result.session = liveSession()
+        }
+        result.shelf = shelf
+        result.recordings = recordings
+        result.videos = videos
+        return result
+    }
+
+    private func liveSession() -> SavedSession {
+        SavedSession(
+            segments: segments, currentIndex: currentIndex, takes: takes.mapValues { $0.saved },
+            takesLandscape: takesLandscape, pending: pending?.saved,
+            pendingAngle: lockedAngle, declinedSegments: declinedSegments
+        )
+    }
+
+    /// 把存下來的進度放回畫面。
+    private func apply(_ saved: SavedSession) {
+        segments = saved.segments
+        currentIndex = saved.currentIndex
+        takes = saved.takes.mapValues { SegmentTake($0, in: store) }
+        takesLandscape = saved.takesLandscape
+        pending = saved.pending.map { SegmentTake($0, in: store) }
+        if saved.pending != nil { lockedAngle = saved.pendingAngle }
+        declinedSegments = saved.declinedSegments
+        prompter.reset()
+    }
+
+    private func loadSaved() {
+        Task {
+            let result = await self.store.load()
+            await MainActor.run {
+                self.recover(result)
+            }
+        }
+    }
+
+    private func recover(_ result: TakeStore.Loaded) {
+        for note in result.notes {
+            camera?.log(note)
+        }
+        let saved = result.manifest
+        recordings = saved.recordings
+        videos = saved.videos
+        // 兩個不會同時有東西：分段進度只在提詞模式，切到陪伴就整個收著。
+        recoveredSession = saved.session ?? saved.shelf
+        recoveredCount = recoveredSession?.count ?? 0
+        loaded = true
+        guard !videos.isEmpty || recoveredSession != nil else {
+            restoring = false
+            return
+        }
+        camera?.log("上次留下 \(recoveredCount) 段、\(videos.count) 支沒儲存的影片")
+        askRecovery(after: 0.6)
+    }
+
+    /// 上次留下來的一樣一樣問，都問完才讓錄。
+    private func askRecovery(after delay: TimeInterval) {
+        guard restoring, loaded else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.restoring, self.recovery == nil, self.review == nil else { return }
+            if !self.videos.isEmpty {
+                self.recovery = .video
+            } else if self.recoveredSession != nil {
+                self.recovery = .takes
+            } else {
+                self.finishRecovery()
+            }
+        }
+    }
+
+    private func finishRecovery() {
+        restoring = false
+        persist()
+        // 稿子和當時不一樣的話，走一般的換稿確認。
+        updateScript(settings?.activeScript ?? "")
+    }
+
+    /// 看上次沒儲存的影片。接好的那種連同各段一起放回來，才能回去只重錄其中一段。
+    func openRecoveredVideo() {
+        recovery = nil
+        guard let video = videos.first else {
+            askRecovery(after: alertGap)
+            return
+        }
+        if video.isStitched { takeBackSession() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + alertGap) { [weak self] in
+            guard let self else { return }
+            self.show(RecordedVideo(url: self.store.url(video.file), isStitched: video.isStitched,
+                                    script: video.script, isLandscape: video.isLandscape,
+                                    notice: video.notice))
+        }
+    }
+
+    func deleteRecoveredVideo() {
+        recovery = nil
+        if !videos.isEmpty {
+            let video = videos.removeFirst()
+            persist(deleting: [store.url(video.file)])
+        }
+        askRecovery(after: alertGap)
+    }
+
+    func resumeRecoveredTakes() {
+        recovery = nil
+        takeBackSession()
+        // 要接著錄就得看稿；停在陪伴模式的話，那些段落看起來會像不見了。
+        if settings?.companionMode == true {
+            settings?.companionMode = false
+            applyMode()
+        }
+        askRecovery(after: alertGap)
+    }
+
+    func deleteRecoveredTakes() {
+        recovery = nil
+        let files = recoveredSession?.files ?? []
+        recoveredSession = nil
+        persist(deleting: files.map { store.url($0) })
+        askRecovery(after: alertGap)
+    }
+
+    /// 上次的分段進度放回來：提詞模式直接接上，陪伴模式先收著。
+    private func takeBackSession() {
+        guard let saved = recoveredSession else { return }
+        recoveredSession = nil
+        if isCompanion {
+            shelf = saved
+        } else {
+            apply(saved)
+        }
+        persist()
+    }
+
+    /// 進完成頁。
+    private func show(_ video: RecordedVideo) {
+        let file = video.url.lastPathComponent
+        if !videos.contains(where: { $0.file == file }) {
+            videos.append(SavedVideo(file: file, isStitched: video.isStitched, script: video.script,
+                                     isLandscape: video.isLandscape, notice: video.notice))
+        }
+        shownVideo = video.url
+        review = video
+        persist()
+    }
+
+    /// 已經存到照片。檔案等完成頁關掉才刪，還要拿來做字幕。
+    func reviewSaved(_ video: RecordedVideo) {
+        videos.removeAll { $0.file == video.url.lastPathComponent }
+        if video.isStitched { stitchedSaved = true }
+        persist()
+    }
+
+    /// 使用者不要這一支了。檔案等完成頁關掉才刪，播放器還開著它。
+    func reviewDiscarded(_ video: RecordedVideo) {
+        videos.removeAll { $0.file == video.url.lastPathComponent }
+        persist()
+    }
+
+    /// 完成頁關掉了。沒存、也沒說不要的，檔案留著。
+    func reviewDismissed() {
+        if stitchedSaved { discardAllTakes() }
+        if let url = shownVideo {
+            shownVideo = nil
+            if !videos.contains(where: { $0.file == url.lastPathComponent }) {
+                persist(deleting: [url])
+            }
+        }
+        askRecovery(after: alertGap)
     }
 
     // MARK: - 稿件
@@ -220,6 +437,7 @@ final class RecordingViewModel: ObservableObject {
     func declineScriptChange() {
         scriptChange = nil
         declinedSegments = waitingScript.map { split($0) }
+        persist()
     }
 
     /// 提詞和陪伴切換。陪伴不看稿，但稿子沒有變，已錄的各段先收著，切回提詞再放回來。
@@ -238,11 +456,7 @@ final class RecordingViewModel: ObservableObject {
 
     private func shelveTakes() {
         if recordedCount > 0 {
-            shelf = ShelvedTakes(
-                segments: segments, currentIndex: currentIndex, takes: takes,
-                takesLandscape: takesLandscape, pending: pending,
-                lockedAngle: lockedAngle, declinedSegments: declinedSegments
-            )
+            shelf = liveSession()
         }
         // 檔案交給 shelf 了，先清空，discardAllTakes 才不會刪到。
         takes = [:]
@@ -258,14 +472,8 @@ final class RecordingViewModel: ObservableObject {
             return
         }
         shelf = nil
-        segments = saved.segments
-        currentIndex = saved.currentIndex
-        takes = saved.takes
-        takesLandscape = saved.takesLandscape
-        pending = saved.pending
-        if saved.pending != nil { lockedAngle = saved.lockedAngle }
-        declinedSegments = saved.declinedSegments
-        prompter.reset()
+        apply(saved)
+        persist()
     }
 
     /// 有等著套用的模式或新稿就再看一次能不能套。
@@ -287,6 +495,12 @@ final class RecordingViewModel: ObservableObject {
 
     /// 錄影鈕：待機 → 倒數／開始；倒數中 → 取消；錄影中 → 停止。
     func primaryTapped(countdown: Int, autoPrompt: Bool) {
+        if restoring {
+            // 上次留下來的還沒決定。視窗沒跳出來（當時有別的頁面開著）的話，在這裡再問一次。
+            recovery = nil
+            askRecovery(after: 0.1)
+            return
+        }
         guard !isMerging, pending == nil else { return }
         switch phase {
         case .idle:
@@ -315,7 +529,7 @@ final class RecordingViewModel: ObservableObject {
 
     /// 音量鍵或藍牙遙控器：等同錄影鈕；剛錄完一段時等同「留用」。
     private func hardwareButtonPressed() {
-        guard hardwareEnabled, review == nil, !isMerging, let settings else { return }
+        guard hardwareEnabled, review == nil, !isMerging, !restoring, let settings else { return }
         if pending != nil {
             acceptPending()
         } else {
@@ -365,26 +579,23 @@ final class RecordingViewModel: ObservableObject {
 
     /// 留用剛錄的這段，跳到下一個還沒錄的段落；全部錄完就接片。
     func acceptPending() {
-        guard let take = pending else { return }
-        if let old = takes[currentIndex] {
-            try? FileManager.default.removeItem(at: old.url)
-        }
+        guard let take = pending, !restoring else { return }
+        let replaced = takes[currentIndex]
         takes[currentIndex] = take
         takesLandscape = lockedAngle != 0
         pending = nil
         prompter.reset()
-        if let next = (0..<segments.count).first(where: { takes[$0] == nil }) {
-            currentIndex = next
-        } else {
-            mergeAll()
-        }
+        let next = (0..<segments.count).first { takes[$0] == nil }
+        if let next { currentIndex = next }
+        persist(deleting: replaced.map { [$0.url] } ?? [])
+        if next == nil { mergeAll() }
     }
 
     /// 丟掉剛錄的這段，留在同一段準備重錄。
     func retakePending() {
-        guard let take = pending else { return }
-        try? FileManager.default.removeItem(at: take.url)
+        guard let take = pending, !restoring else { return }
         pending = nil
+        persist(deleting: [take.url])
         prompter.reset()
     }
 
@@ -394,12 +605,13 @@ final class RecordingViewModel: ObservableObject {
         let target = min(segments.count - 1, max(0, currentIndex + delta))
         guard target != currentIndex else { return }
         currentIndex = target
+        persist()
         prompter.reset()
     }
 
     /// 把各段照順序接成一支影片，完成後進完成頁。
     func mergeAll() {
-        guard allRecorded, !isMerging, pending == nil else { return }
+        guard allRecorded, !isMerging, pending == nil, !restoring else { return }
         let trim = settings?.trimSilence ?? true
         let clips: [VideoStitcher.Clip] = (0..<segments.count).compactMap { index in
             guard let take = takes[index] else { return nil }
@@ -412,16 +624,17 @@ final class RecordingViewModel: ObservableObject {
             return VideoStitcher.Clip(url: take.url, start: start, end: end)
         }
         isMerging = true
+        let output = store.url(TakeStore.newFileName(merged: true))
         camera?.log("開始接片：\(clips.count) 段，裁靜音 \(trim ? "開" : "關")")
         Task {
             do {
-                let url = try await VideoStitcher.stitch(clips)
+                try await VideoStitcher.stitch(clips, to: output)
                 await MainActor.run {
                     self.isMerging = false
                     self.camera?.log("接片完成")
-                    self.review = RecordedVideo(url: url, isStitched: true,
-                                                script: self.segments.joined(separator: "\n"),
-                                                isLandscape: self.takesLandscape ?? false)
+                    self.show(RecordedVideo(url: output, isStitched: true,
+                                            script: self.segments.joined(separator: "\n"),
+                                            isLandscape: self.takesLandscape ?? false))
                 }
             } catch {
                 await MainActor.run {
@@ -435,21 +648,19 @@ final class RecordingViewModel: ObservableObject {
 
     /// 丟掉所有已錄的段落，回到第一段。
     func discardAllTakes() {
-        for take in takes.values {
-            try? FileManager.default.removeItem(at: take.url)
-        }
-        if let take = pending {
-            try? FileManager.default.removeItem(at: take.url)
-        }
+        var files = takes.values.map { $0.url }
+        if let take = pending { files.append(take.url) }
         takes = [:]
         takesLandscape = nil
         pending = nil
         currentIndex = 0
+        stitchedSaved = false
         if let waiting = waitingScript {
             waitingScript = nil
             declinedSegments = nil
             segments = split(waiting)
         }
+        persist(deleting: files)
         prompter.reset()
     }
 
@@ -491,10 +702,19 @@ final class RecordingViewModel: ObservableObject {
     private func beginRecording() {
         phase = .starting
         elapsed = 0
-        camera?.startRecording(landscape: lockedAngle != 0)
+        // 先記下要寫哪個檔、是哪一段，存好了相機才開錄。錄到一半被滑掉，下次才找得回來。
+        let file = TakeStore.newFileName()
+        recordings.append(SavedRecording(file: file, index: isSegmented ? currentIndex : nil,
+                                         script: segments.first ?? "", angle: lockedAngle))
+        persist()
+        let store = self.store
+        camera?.startRecording(landscape: lockedAngle != 0, to: store.url(file)) {
+            store.flush()
+        }
         // 3 秒內沒有真的開始錄，就回到待機，不要卡住。
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.phase == .starting else { return }
+            guard let self, self.phase == .starting, self.recordings.last?.file == file else { return }
+            self.camera?.cancelStart()
             self.camera?.log("錄影未在 3 秒內開始")
             self.phase = .idle
             self.recordingError = "相機沒有開始錄，請再試一次"
@@ -579,13 +799,15 @@ final class RecordingViewModel: ObservableObject {
 
     private func recordingFinished(_ url: URL, damaged: Bool) {
         phase = .idle
+        recordings.removeAll { $0.file == url.lastPathComponent }
         let notice: String? = damaged ? "結尾有一小段沒存到" : nil
         if isSegmented {
             pending = SegmentTake(url: url, firstSound: firstSound, lastSound: lastSound)
             recordingError = notice
+            persist()
         } else {
-            review = RecordedVideo(url: url, script: segments.first ?? "", isLandscape: lockedAngle != 0,
-                                   notice: notice)
+            show(RecordedVideo(url: url, script: segments.first ?? "", isLandscape: lockedAngle != 0,
+                               notice: notice))
             // 跟隨會從目前讀到的位置開始，下一次重錄要從頭。
             prompter.reset()
         }
@@ -803,8 +1025,18 @@ final class RecordingViewModel: ObservableObject {
         showNote("改回固定速度")
     }
 
-    private func recordingFailed(_ reason: String) {
+    private func recordingFailed(_ url: URL, _ reason: String) {
         phase = .idle
         recordingError = reason
+        let file = url.lastPathComponent
+        if let index = recordings.firstIndex(where: { $0.file == file }) {
+            if FileManager.default.fileExists(atPath: url.path) {
+                // 檔案還在只是現在打不開，下次開 App 再看一次。
+                recordings[index].failed = true
+            } else {
+                recordings.remove(at: index)
+            }
+        }
+        persist()
     }
 }

@@ -31,16 +31,20 @@ private struct CompanionVideoView: UIViewRepresentable {
 
     final class VideoView: UIView {
         let stillView = UIImageView()
-        let videoLayers = [AVPlayerLayer(), AVPlayerLayer()]
+        let videoLayers: [AVPlayerLayer]
         var crop: CompanionView.Crop = .top {
             didSet {
                 if crop != oldValue { setNeedsLayout() }
             }
         }
         private var shownFront = -1
+        /// 疊放順序，最後一個在最上面。
+        private var stacking: [Int]
 
-        override init(frame: CGRect) {
-            super.init(frame: frame)
+        init(layerCount: Int) {
+            videoLayers = (0..<layerCount).map { _ in AVPlayerLayer() }
+            stacking = Array(0..<layerCount)
+            super.init(frame: .zero)
             clipsToBounds = true
             // 和定格圖背景差不多的顏色，第一次載入前不會閃黑。
             backgroundColor = UIColor(red: 0.73, green: 0.67, blue: 0.70, alpha: 1)
@@ -93,26 +97,68 @@ private struct CompanionVideoView: UIViewRepresentable {
             CATransaction.commit()
         }
 
-        /// 把指定的那台播放器淡入、另一台淡出。
+        /// 換定格圖。播放中被影片蓋住看不到；只看得到定格圖時用淡化換。
+        func setStill(_ image: UIImage?, animated: Bool) {
+            guard stillView.image !== image else { return }
+            guard animated else {
+                stillView.image = image
+                return
+            }
+            UIView.transition(with: stillView, duration: CompanionClipPlayer.fade,
+                              options: .transitionCrossDissolve) {
+                self.stillView.image = image
+            }
+        }
+
+        /// 把指定的那台播放器疊到最上面淡入，舊的留在底下不動，等蓋滿了再拿掉。
+        /// 兩台同時一進一出的話，中間會透出底色，換人時看起來會閃。
         func show(front: Int, animated: Bool) {
             guard front != shownFront else { return }
             shownFront = front
-            CATransaction.begin()
-            if animated {
-                CATransaction.setAnimationDuration(CompanionClipPlayer.fade)
-            } else {
-                CATransaction.setDisableActions(true)
+
+            guard videoLayers.indices.contains(front) else {
+                hideOthers(than: front)
+                return
             }
-            for (index, videoLayer) in videoLayers.enumerated() {
-                videoLayer.opacity = index == front ? 1 : 0
+            stacking.removeAll { $0 == front }
+            stacking.append(front)
+
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for (depth, index) in stacking.enumerated() {
+                videoLayers[index].zPosition = CGFloat(depth + 1)
+            }
+            CATransaction.setCompletionBlock { [weak self] in
+                guard let self, self.shownFront == front else { return }
+                self.hideOthers(than: front)
+            }
+            let top = videoLayers[front]
+            top.opacity = 1
+            if animated {
+                let fadeIn = CABasicAnimation(keyPath: "opacity")
+                fadeIn.fromValue = 0
+                fadeIn.toValue = 1
+                fadeIn.duration = CompanionClipPlayer.fade
+                fadeIn.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                top.add(fadeIn, forKey: "fadeIn")
+            }
+            CATransaction.commit()
+        }
+
+        private func hideOthers(than front: Int) {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            for (index, videoLayer) in videoLayers.enumerated() where index != front {
+                videoLayer.removeAnimation(forKey: "fadeIn")
+                videoLayer.opacity = 0
             }
             CATransaction.commit()
         }
     }
 
     func makeUIView(context: Context) -> VideoView {
-        let view = VideoView()
-        view.stillView.image = player.still
+        let view = VideoView(layerCount: player.players.count)
+        view.setStill(player.still, animated: false)
         view.crop = crop
         for (index, videoLayer) in view.videoLayers.enumerated() {
             videoLayer.player = player.players[index]
@@ -123,6 +169,7 @@ private struct CompanionVideoView: UIViewRepresentable {
 
     func updateUIView(_ uiView: VideoView, context: Context) {
         uiView.crop = crop
+        uiView.setStill(player.still, animated: true)
         uiView.show(front: player.front, animated: true)
     }
 }

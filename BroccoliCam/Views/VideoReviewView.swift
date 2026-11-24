@@ -8,6 +8,10 @@ struct VideoReviewView: View {
     @EnvironmentObject private var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
     let video: RecordedVideo
+    /// 存到照片成功。
+    var onSaved: () -> Void = {}
+    /// 使用者不要這一支了。檔案由外面在這一頁關掉之後刪，這裡不刪。
+    var onDiscard: () -> Void = {}
     /// 丟掉所有已錄的段落（分段錄影用）。
     var onDiscardAll: () -> Void = {}
 
@@ -70,6 +74,8 @@ struct VideoReviewView: View {
                             .frame(maxWidth: .infinity, minHeight: 52)
                             .background(.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
+                    // 正在複製到照片，這時候丟掉會兩頭空。
+                    .disabled(saveState == .saving)
 
                     Button {
                         save()
@@ -100,14 +106,17 @@ struct VideoReviewView: View {
             if video.isStitched {
                 // 各段都還留著，回去只重錄想改的那一段。
                 Button("回去重錄其中一段") {
+                    onDiscard()
                     close()
                 }
                 Button("全部丟掉重來", role: .destructive) {
+                    onDiscard()
                     onDiscardAll()
                     close()
                 }
             } else {
                 Button("丟掉並重錄", role: .destructive) {
+                    onDiscard()
                     close()
                 }
             }
@@ -136,7 +145,6 @@ struct VideoReviewView: View {
         .onDisappear {
             player?.pause()
             player = nil
-            try? FileManager.default.removeItem(at: video.url)
         }
         .sheet(item: $sharedSubtitle) { file in
             ShareSheet(items: [file.url])
@@ -225,6 +233,7 @@ struct VideoReviewView: View {
             switch result {
             case .success:
                 saveState = .saved
+                onSaved()
                 camera.log("已儲存到照片圖庫")
             case .failure(let error):
                 saveState = .failed(error.localizedDescription)
