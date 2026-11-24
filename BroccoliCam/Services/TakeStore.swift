@@ -75,7 +75,7 @@ struct TakeManifest: Codable, Equatable {
 /// 2. 刪檔一律排在「不再提到它的清單」寫成功之後。清單沒寫成功就先欠著不刪。
 ///
 /// 寫檔、刪檔都在同一條佇列照順序做，不卡主執行緒。
-final class TakeStore {
+final class TakeStore: @unchecked Sendable {
     static let shared = TakeStore()
 
     struct Loaded {
