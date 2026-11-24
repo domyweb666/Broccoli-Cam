@@ -4,6 +4,7 @@ import SwiftUI
 struct RecordingView: View {
     @EnvironmentObject private var camera: CameraService
     @EnvironmentObject private var settings: SettingsStore
+    @EnvironmentObject private var library: ScriptLibrary
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel = RecordingViewModel()
     @StateObject private var orientation = OrientationMonitor()
@@ -13,62 +14,162 @@ struct RecordingView: View {
     @State private var showScript = false
     @State private var showSettings = false
     @State private var showModes = false
+    @State private var showLook = false
 
-    // body 拆成三層（版面、狀態監聽、彈出視窗），一整串寫在一起編譯器會算不完。
+    // body 拆成好幾層（版面、狀態監聽、彈出視窗），一整串寫在一起編譯器會算不完。
     var body: some View {
         presented
             .statusBarHidden(true)
             .persistentSystemOverlays(.hidden)
     }
 
-    /// 版面：預覽、控制列、橫放時的側邊列。
+    /// 版面：預覽、控制列、側邊的快速開關、橫放時的側邊列、畫面優化面板。
     private var layout: some View {
         GeometryReader { geo in
-            let previewHeight = min(geo.size.width * 16 / 9, geo.size.height)
-            let previewWidth = previewHeight * 9 / 16
-
-            ZStack(alignment: .top) {
-                Color.black.ignoresSafeArea()
-
-                PreviewStack(
-                    prompter: viewModel.prompter,
-                    clipPlayer: clipPlayer,
-                    phase: viewModel.phase,
-                    text: viewModel.currentText,
-                    isMerging: viewModel.isMerging,
-                    angle: uiAngle,
-                    size: CGSize(width: previewWidth, height: previewHeight),
-                    bottomInset: controlsOverlap(screenHeight: geo.size.height, previewHeight: previewHeight)
-                )
-                .frame(width: previewWidth, height: previewHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-                VStack(spacing: 10) {
-                    Spacer()
-                    if uiAngle == 0 {
-                        statusAndSegments
-                    }
-                    ControlBar(
-                        viewModel: viewModel,
-                        prompter: viewModel.prompter,
-                        angle: uiAngle,
-                        showScript: $showScript,
-                        showSettings: $showSettings
-                    )
-                }
-                .padding(.bottom, 6)
-
-                if uiAngle != 0 {
-                    sideStrip(previewHeight: previewHeight)
-                }
-
-                if settings.showDebug {
-                    DebugOverlayView()
-                        .padding(.top, previewHeight * 0.34)
-                }
-            }
-            .frame(width: geo.size.width, height: geo.size.height)
+            screen(in: geo.size)
         }
+        .background {
+            remoteCatcher
+        }
+    }
+
+    private func screen(in screen: CGSize) -> some View {
+        let previewHeight: CGFloat = min(screen.width * 16 / 9, screen.height)
+        let preview = CGSize(width: previewHeight * 9 / 16, height: previewHeight)
+
+        return ZStack(alignment: .top) {
+            Color.black.ignoresSafeArea()
+
+            previewStack(preview, screenHeight: screen.height)
+
+            sideControls(preview, screenHeight: screen.height)
+
+            bottomControls
+
+            if uiAngle != 0 {
+                sideStrip(previewHeight: previewHeight)
+            }
+
+            if settings.showDebug {
+                DebugOverlayView()
+                    .padding(.top, previewHeight * 0.34)
+            }
+
+            if showLook {
+                lookPanel(height: screen.height * 0.38)
+            }
+        }
+        .frame(width: screen.width, height: screen.height)
+        .animation(.easeOut(duration: 0.25), value: showLook)
+    }
+
+    private func previewStack(_ preview: CGSize, screenHeight: CGFloat) -> some View {
+        PreviewStack(
+            prompter: viewModel.prompter,
+            clipPlayer: clipPlayer,
+            phase: viewModel.phase,
+            text: viewModel.currentText,
+            isMerging: viewModel.isMerging,
+            angle: uiAngle,
+            size: preview,
+            bottomInset: controlsOverlap(screenHeight: screenHeight, previewHeight: preview.height),
+            jumpNote: viewModel.jumpNote,
+            onTapOffset: { offset in
+                viewModel.jumpTo(utf16Offset: offset)
+            }
+        )
+        .frame(width: preview.width, height: preview.height)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var bottomControls: some View {
+        VStack(spacing: 10) {
+            Spacer()
+            if uiAngle == 0 {
+                statusAndSegments
+            }
+            ControlBar(
+                viewModel: viewModel,
+                prompter: viewModel.prompter,
+                angle: uiAngle,
+                showScript: $showScript,
+                showSettings: $showSettings
+            )
+        }
+        .padding(.bottom, 6)
+        .accessibilityHidden(showLook)
+    }
+
+    /// 預覽兩側的快速開關和跳轉鍵。
+    /// 直放：開關在左下（自己的小窗在右下），跳轉鍵在提詞右下方。
+    /// 橫放：都排在使用者看到的上緣，下緣是計時和分段列。
+    private func sideControls(_ preview: CGSize, screenHeight: CGFloat) -> some View {
+        let sideways = uiAngle != 0
+        let bandBottom: CGFloat = PromptBand.bottom(previewHeight: preview.height, angle: uiAngle)
+        let bottom: CGFloat = sideways
+            ? sidewaysOverlap(screenHeight: screenHeight, previewHeight: preview.height) + 10
+            : controlsOverlap(screenHeight: screenHeight, previewHeight: preview.height) + 10
+        // 跳轉鍵在直放時和開關分兩邊；橫放時排在同一側的上面，要多留一列。
+        let room: CGFloat = preview.height - bandBottom - bottom - (sideways ? 60 : 0)
+        let side: CGFloat = room >= QuickToggles.fullHeight(side: 48) ? 48 : 44
+        let togglesOnRight = uiAngle > 0
+        let keysOnRight = uiAngle >= 0
+
+        return ZStack {
+            if !showLook {
+                QuickToggles(
+                    isBusy: viewModel.isBusy,
+                    angle: uiAngle,
+                    side: side,
+                    onVoice: { viewModel.toggleVoiceFollow() },
+                    onLook: { showLook = true }
+                )
+                .padding(.horizontal, 6)
+                .padding(.bottom, bottom)
+                .frame(width: preview.width, height: preview.height,
+                       alignment: togglesOnRight ? .bottomTrailing : .bottomLeading)
+                .transition(.opacity)
+            }
+
+            if settings.usesPrompter {
+                JumpKeys(angle: uiAngle, side: side) { forward in
+                    viewModel.jump(forward: forward)
+                }
+                .padding(.horizontal, 8)
+                .padding(.top, bandBottom + 8)
+                .frame(width: preview.width, height: preview.height,
+                       alignment: keysOnRight ? .topTrailing : .topLeading)
+            }
+        }
+        .frame(width: preview.width, height: preview.height)
+    }
+
+    private func lookPanel(height: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            LookPanel(
+                isBusy: viewModel.isBusy,
+                isRecording: viewModel.phase == .recording,
+                onClose: { showLook = false }
+            )
+            .frame(height: height)
+        }
+        .transition(.move(edge: .bottom))
+    }
+
+    /// 藍牙踏板、翻頁器。有東西蓋在主畫面上的時候放掉，才不會搶走打字。
+    private var remoteCatcher: some View {
+        RemoteKeyCatcher(isActive: remoteActive) { key in
+            guard let action = settings.remoteBindings.action(for: key) else { return }
+            viewModel.perform(action)
+        }
+        .frame(width: 1, height: 1)
+        .accessibilityHidden(true)
+    }
+
+    private var remoteActive: Bool {
+        if showScript || showSettings || showModes { return false }
+        return viewModel.review == nil && viewModel.mergeError == nil && viewModel.orientationError == nil
     }
 
     /// 橫放：計時、收音、分段列轉 90 度，沿著使用者看到的下緣排，避開提詞那一側。
@@ -86,80 +187,130 @@ struct RecordingView: View {
             .frame(maxWidth: .infinity, alignment: edge)
     }
 
-    /// 狀態監聽：設定、方向、前後景變了要做的事。
+    /// 狀態監聽：方向、哪些視窗開著。
     private var observed: some View {
-        cameraObserved
+        scriptObserved
             .onChange(of: orientation.angle) { _, _ in
                 viewModel.deviceAngle = deviceAngle
             }
             .onChange(of: settings.autoLandscape) { _, _ in
                 viewModel.deviceAngle = deviceAngle
             }
+            .onChange(of: showScript) { _, _ in updateHardwareEnabled() }
+            .onChange(of: showSettings) { _, _ in updateHardwareEnabled() }
+            .onChange(of: showModes) { _, _ in updateHardwareEnabled() }
+            .onChange(of: viewModel.pending != nil) { _, waiting in
+                // 剛錄完一段，留用／重錄的按鈕在面板底下，把面板收起來。
+                if waiting { showLook = false }
+            }
+    }
+
+    /// 和稿子、提詞有關的監聽。
+    private var scriptObserved: some View {
+        formatObserved
             .onChange(of: settings.companionMode) { _, _ in
                 viewModel.updateScript(settings.activeScript)
                 viewModel.prompter.reset()
                 updateCompanion()
             }
+            .onChange(of: settings.script) { _, _ in
+                // 腳本頁開著時不跟著打字更新，不然改一個字已錄的各段就作廢，關掉那一頁再一次算。
+                if !showScript { viewModel.updateScript(settings.activeScript) }
+            }
+            .onChange(of: settings.segmentedRecording) { _, _ in
+                viewModel.updateScript(settings.activeScript)
+            }
+            .onChange(of: settings.voiceFollow) { _, _ in
+                viewModel.applyVoiceFollowSetting()
+            }
             .onChange(of: settings.speed) { _, speed in
                 viewModel.prompter.speed = CGFloat(speed)
             }
-            .onChange(of: showScript) { _, _ in updateHardwareEnabled() }
-            .onChange(of: showSettings) { _, _ in updateHardwareEnabled() }
-            .onChange(of: showModes) { _, _ in updateHardwareEnabled() }
     }
 
-    /// 和相機有關的監聽。
-    private var cameraObserved: some View {
+    /// 影片格式和畫面優化的監聽。
+    private var formatObserved: some View {
+        lifecycleObserved
+            .onChange(of: settings.resolution) { _, resolution in
+                // 換畫質後，幀率若不支援就退回可用的值。
+                let supported = camera.availableFPS[resolution] ?? [30]
+                if !supported.contains(settings.fps) {
+                    settings.fps = supported.first ?? 30
+                }
+                startCamera()
+            }
+            .onChange(of: settings.fps) { _, _ in startCamera() }
+            .onChange(of: settings.mirrorOutput) { _, _ in startCamera() }
+            .onChange(of: settings.stabilization) { _, _ in startCamera() }
+            .onChange(of: camera.availableFPS) { _, map in
+                fixFormat(map)
+            }
+            .onChange(of: camera.availableStabilizations) { _, _ in
+                fixStabilization()
+            }
+            .onChange(of: camera.isSessionRunning) { _, running in
+                // 只支援「關」的裝置，清單從頭到尾沒變過，上面那個不會觸發。相機跑起來時清單一定是真的。
+                if running { fixStabilization() }
+            }
+            .onChange(of: settings.look) { _, _ in applyLook() }
+            .onChange(of: settings.lookEnabled) { _, _ in applyLook() }
+    }
+
+    /// 出現、消失、前後景。
+    private var lifecycleObserved: some View {
         layout
-        .onAppear {
-            viewModel.attach(camera, settings: settings)
-            viewModel.updateScript(settings.activeScript)
-            viewModel.prompter.speed = CGFloat(settings.speed)
-            viewModel.deviceAngle = deviceAngle
-            UIApplication.shared.isIdleTimerDisabled = true
-            startCamera()
-            updateCompanion()
-            askSpeechIfNeeded()
-        }
-        .onDisappear {
-            UIApplication.shared.isIdleTimerDisabled = false
-            companion.stop()
-            clipPlayer.stop()
-        }
-        .onChange(of: scenePhase) { _, phase in
-            switch phase {
-            case .active:
-                if viewModel.review == nil { startCamera() }
-                clipPlayer.resume()
-            case .background:
-                viewModel.interrupt()
-                camera.stop()
-            default:
-                break
+            .onAppear(perform: appeared)
+            .onDisappear {
+                UIApplication.shared.isIdleTimerDisabled = false
+                companion.stop()
+                clipPlayer.stop()
             }
-        }
-        .onChange(of: settings.resolution) { _, resolution in
-            // 換畫質後，幀率若不支援就退回可用的值。
-            let supported = camera.availableFPS[resolution] ?? [30]
-            if !supported.contains(settings.fps) {
-                settings.fps = supported.first ?? 30
+            .onChange(of: scenePhase) { _, phase in
+                sceneChanged(phase)
             }
-            startCamera()
-        }
-        .onChange(of: settings.fps) { _, _ in startCamera() }
-        .onChange(of: settings.mirrorOutput) { _, _ in startCamera() }
-        .onChange(of: settings.voiceFollow) { _, _ in startCamera() }
-        .onChange(of: camera.availableFPS) { _, map in
-            // 第一次取得裝置能力後，修正存下來但此裝置不支援的設定。
-            if map[settings.resolution] == nil {
-                settings.resolution = .hd1080
-            } else if let list = map[settings.resolution], !list.contains(settings.fps) {
-                settings.fps = list.first ?? 30
-            }
+    }
+
+    private func appeared() {
+        viewModel.attach(camera, settings: settings)
+        viewModel.updateScript(settings.activeScript)
+        viewModel.prompter.speed = CGFloat(settings.speed)
+        viewModel.deviceAngle = deviceAngle
+        UIApplication.shared.isIdleTimerDisabled = true
+        startCamera()
+        updateCompanion()
+        askSpeechIfNeeded()
+    }
+
+    private func sceneChanged(_ phase: ScenePhase) {
+        switch phase {
+        case .active:
+            if viewModel.review == nil { startCamera() }
+            clipPlayer.resume()
+        case .background:
+            viewModel.interrupt()
+            camera.stop()
+        default:
+            break
         }
     }
 
-    /// 彈出視窗：提示、稿件、設定、完成頁。
+    /// 第一次取得裝置能力後，修正存下來但此裝置不支援的設定。
+    private func fixFormat(_ map: [VideoResolution: [Int]]) {
+        if map[settings.resolution] == nil {
+            settings.resolution = .hd1080
+        } else if let list = map[settings.resolution], !list.contains(settings.fps) {
+            settings.fps = list.first ?? 30
+        }
+    }
+
+    /// 存下來的防抖強度現在的格式不支援，就退回關。
+    private func fixStabilization() {
+        if !camera.availableStabilizations.contains(settings.stabilization) {
+            settings.stabilization = .off
+        }
+    }
+
+    /// 彈出視窗：提示、腳本、設定、完成頁。
     private var presented: some View {
         observed
         .alert("接片沒有成功", isPresented: mergeErrorShown) {
@@ -173,14 +324,16 @@ struct RecordingView: View {
             Text(viewModel.orientationError ?? "")
         }
         .sheet(isPresented: $showScript, onDismiss: {
+            // 打字是延遲併入的，先寫回去再切段，不然會漏最後幾個字。
+            library.flush()
             viewModel.updateScript(settings.activeScript)
             viewModel.prompter.reset()
             askSpeechIfNeeded()
         }) {
-            ScriptEditorView()
+            ScriptListView()
         }
         .sheet(isPresented: $showSettings) {
-            SettingsView()
+            SettingsView(hasTakes: hasTakes)
         }
         .sheet(isPresented: $showModes) {
             ModeSheet()
@@ -248,6 +401,16 @@ struct RecordingView: View {
         return ScriptSegments.estimatedSeconds(viewModel.currentText, charsPerMinute: settings.speechRate)
     }
 
+    /// 橫放時預覽底下只有控制列，狀態列在側邊。
+    private func sidewaysOverlap(screenHeight: CGFloat, previewHeight: CGFloat) -> CGFloat {
+        max(0, 100 - (screenHeight - previewHeight))
+    }
+
+    /// 有已經錄好、還沒接起來的段落。改分段設定會讓它們作廢。
+    private var hasTakes: Bool {
+        !viewModel.takes.isEmpty || viewModel.pending != nil
+    }
+
     private var mergeErrorShown: Binding<Bool> {
         Binding(
             get: { viewModel.mergeError != nil },
@@ -269,7 +432,26 @@ struct RecordingView: View {
 
     private func startCamera() {
         camera.start(resolution: settings.resolution, fps: settings.fps, mirrorOutput: settings.mirrorOutput,
-                     speechTap: settings.voiceFollow)
+                     stabilization: settings.stabilization)
+        applyLook()
+    }
+
+    private func applyLook() {
+        camera.setLook(settings.look, enabled: settings.lookEnabled)
+    }
+}
+
+/// 提詞區塊的大小。預覽和旁邊的跳轉鍵都要知道它到哪裡。
+private enum PromptBand {
+    static let top: CGFloat = 8
+
+    /// 橫放時提詞變成鏡頭旁邊的一直欄，欄寬放大一點，一行才放得下夠多字。
+    static func height(previewHeight: CGFloat, angle: Double) -> CGFloat {
+        previewHeight * (angle == 0 ? 0.32 : 0.40)
+    }
+
+    static func bottom(previewHeight: CGFloat, angle: Double) -> CGFloat {
+        top + height(previewHeight: previewHeight, angle: angle)
     }
 }
 
@@ -288,6 +470,10 @@ private struct PreviewStack: View {
     let size: CGSize
     /// 控制列蓋進預覽區的高度，視訊通話的自己小窗放在這之上。
     let bottomInset: CGFloat
+    /// 跳轉後短暫顯示的字；nil 就不顯示。
+    let jumpNote: String?
+    /// 點提詞的某一行。
+    let onTapOffset: (Int) -> Void
 
     /// 陪伴模式下聆聽者的擺法；提詞模式是 nil。
     /// 橫放時只有圓形頭像和頂部小窗對得上視線（鏡頭在側邊），其他擺法改用頂部小窗。
@@ -377,11 +563,41 @@ private struct PreviewStack: View {
     /// 眼神條的高度（佔畫面高度的比例）。
     private static let eyeStripHeight: CGFloat = 0.12
 
-    /// 有稿件時，構圖框只在開始提詞前顯示供對位；提詞開始後淡出。
-    private var showGuide: Bool {
-        guard settings.showGuide else { return false }
-        if settings.usesPrompter && (prompter.isPlaying || prompter.offset > 0) { return false }
-        return true
+    /// 提詞已經開始了。
+    private var prompting: Bool {
+        settings.usesPrompter && (prompter.isPlaying || prompter.offset > 0)
+    }
+
+    /// 有稿件時，頭像框只在開始提詞前顯示供對位；提詞開始後淡出。
+    private var showHeadGuide: Bool {
+        settings.guideStyle == .head && !prompting
+    }
+
+    private var showGridGuide: Bool {
+        settings.guideStyle == .grid
+    }
+
+    /// 九宮格在提詞開始後留著，濃淡降一半。
+    private var gridStrength: Double {
+        prompting ? settings.guideOpacity / 2 : settings.guideOpacity
+    }
+
+    /// 頭像框上方要讓開多少（佔畫面高度的比例）。
+    private var guideTopReserve: CGFloat {
+        let usual: CGFloat = 0.06
+        guard let layout, size.height > 0 else { return usual }
+        switch layout {
+        case .eyeStrip:
+            return Self.eyeStripHeight + 0.02
+        case .circle, .topCard:
+            // 橫放時聆聽者在使用者看到的左側中間，離置中的頭像框還有一段，不會蓋到，不用往下讓。
+            guard angle == 0 else { return usual }
+            let place = placement(layout)
+            return (place.center.y + place.size.height / 2 + 8) / size.height
+        case .fullCall, .fullFrame, .alignFirst:
+            // 自己的畫面和聆聽者沒有上下重疊。
+            return usual
+        }
     }
 
     var body: some View {
@@ -392,71 +608,119 @@ private struct PreviewStack: View {
                 companionLayer(placement(layout))
             }
 
-            if showGuide {
-                let cam = cameraRect
-                FramingGuideView(faces: camera.faces, scale: CGFloat(settings.guideScale), angle: angle,
-                                 topReserve: layout == .eyeStrip ? Self.eyeStripHeight + 0.02 : 0.06)
-                    .turned(angle, width: cam.width, height: cam.height)
-                    .position(x: cam.midX, y: cam.midY)
-                    .transition(.opacity)
-                    .zIndex(2)
-            }
+            guideLayers
 
             if settings.usesPrompter {
-                // 橫放時提詞變成鏡頭旁邊的一直欄，欄寬放大一點，一行才放得下夠多字。
-                let bandWidth = size.width * 0.84
-                let bandHeight = size.height * (angle == 0 ? 0.32 : 0.40)
-                TeleprompterView(
-                    model: prompter,
-                    text: text,
-                    fontSize: CGFloat(settings.fontSize),
-                    backgroundOpacity: settings.promptBackground
-                )
-                .turned(angle, width: bandWidth, height: bandHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .padding(.top, 8)
-                .zIndex(3)
+                prompterLayer
             }
 
-            if case .countdown(let remaining) = phase {
-                Text("\(remaining)")
-                    .font(.system(size: 120, weight: .bold, design: .rounded))
+            jumpNoteLayer
+
+            noticeLayers
+        }
+        .animation(.easeInOut(duration: 0.3), value: showHeadGuide)
+        .animation(.easeInOut(duration: 0.3), value: showGridGuide)
+        .animation(.easeInOut(duration: 0.3), value: gridStrength)
+    }
+
+    /// 構圖線，畫在自己的畫面上。
+    @ViewBuilder
+    private var guideLayers: some View {
+        let cam = cameraRect
+        if showHeadGuide {
+            FramingGuideView(faces: camera.faces, scale: CGFloat(settings.guideScale), angle: angle,
+                             topReserve: guideTopReserve, strength: settings.guideOpacity)
+                .turned(angle, width: cam.width, height: cam.height)
+                .position(x: cam.midX, y: cam.midY)
+                .transition(.opacity)
+                .zIndex(2)
+        }
+        if showGridGuide {
+            GridGuideView(strength: gridStrength)
+                .frame(width: cam.width, height: cam.height)
+                .position(x: cam.midX, y: cam.midY)
+                .transition(.opacity)
+                .zIndex(2)
+        }
+    }
+
+    private var prompterLayer: some View {
+        TeleprompterView(
+            model: prompter,
+            text: text,
+            fontSize: CGFloat(settings.fontSize),
+            backgroundOpacity: settings.promptBackground,
+            onTapOffset: onTapOffset
+        )
+        .turned(angle, width: size.width * 0.84, height: PromptBand.height(previewHeight: size.height, angle: angle))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(.top, PromptBand.top)
+        .zIndex(3)
+    }
+
+    /// 跳轉後的小膠囊，畫面中央偏上。橫放時「上」是手機的右邊（90）或左邊（-90），而且要讓開提詞那一欄。
+    private var jumpNoteLayer: some View {
+        let x: CGFloat = angle == 0 ? 0.5 : (angle > 0 ? 0.72 : 0.28)
+        let y: CGFloat = angle == 0 ? 0.40 : 0.64
+        return ZStack {
+            if let jumpNote {
+                Text(jumpNote)
+                    .font(.headline)
                     .foregroundStyle(.white)
-                    .shadow(color: .black.opacity(0.5), radius: 8)
-                    .rotationEffect(.degrees(angle))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .zIndex(6)
+                    .lineLimit(1)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(.black.opacity(0.65), in: Capsule())
+                    .transition(.opacity)
             }
+        }
+        .rotationEffect(.degrees(angle))
+        .animation(.easeInOut(duration: 0.2), value: jumpNote)
+        .position(x: size.width * x, y: size.height * y)
+        .allowsHitTesting(false)
+        .zIndex(5)
+    }
 
-            if isMerging {
-                VStack(spacing: 12) {
-                    ProgressView()
-                        .tint(.white)
-                        .controlSize(.large)
-                    Text("正在把各段接起來…")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.white)
-                }
-                .padding(22)
-                .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    /// 倒數、接片中、相機中斷。
+    @ViewBuilder
+    private var noticeLayers: some View {
+        if case .countdown(let remaining) = phase {
+            Text("\(remaining)")
+                .font(.system(size: 120, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.5), radius: 8)
                 .rotationEffect(.degrees(angle))
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .zIndex(6)
-            }
-
-            if let note = camera.interruptionText {
-                Text(note)
-                    .font(.footnote.weight(.medium))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(.black.opacity(0.7), in: Capsule())
-                    .rotationEffect(.degrees(angle))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .zIndex(6)
-            }
         }
-        .animation(.easeInOut(duration: 0.3), value: showGuide)
+
+        if isMerging {
+            VStack(spacing: 12) {
+                ProgressView()
+                    .tint(.white)
+                    .controlSize(.large)
+                Text("正在把各段接起來…")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white)
+            }
+            .padding(22)
+            .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .rotationEffect(.degrees(angle))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .zIndex(6)
+        }
+
+        if let note = camera.interruptionText {
+            Text(note)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.black.opacity(0.7), in: Capsule())
+                .rotationEffect(.degrees(angle))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .zIndex(6)
+        }
     }
 
     /// 前鏡頭預覽從頭到尾是同一個 view，換擺法只改外框。前後順序用 zIndex 調，不搬動 view。
@@ -601,7 +865,7 @@ private struct ControlBar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            BarButton(title: "稿件", systemImage: "doc.text", angle: angle) {
+            BarButton(title: "腳本", systemImage: "doc.text", angle: angle) {
                 showScript = true
             }
             .disabled(viewModel.isBusy || settings.companionMode)

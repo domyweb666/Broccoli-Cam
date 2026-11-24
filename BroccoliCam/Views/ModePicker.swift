@@ -72,7 +72,8 @@ struct ModePicker: View {
     }
 }
 
-private struct ModeCard: ViewModifier {
+/// 大顆選項的外觀。模式和構圖線的選單共用。
+struct ModeCard: ViewModifier {
     let selected: Bool
     let height: CGFloat
 

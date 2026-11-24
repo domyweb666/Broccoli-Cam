@@ -11,6 +11,8 @@ struct FramingGuideView: View {
     var angle: Double = 0
     /// 上方被聆聽者佔掉的高度（佔畫面高度的比例），頭頂要在這之下。
     var topReserve: CGFloat = 0.06
+    /// 線的濃淡 0.2–1。
+    var strength: Double = 0.85
 
     /// 目前頭像框的寬（佔短邊的比例）。看不到臉時維持上一次的大小。
     @State private var fraction: CGFloat = 0.46
@@ -19,12 +21,17 @@ struct FramingGuideView: View {
     private static let maxFraction: CGFloat = 0.68
     /// 頭的中心放在畫面高度的這個位置，眼睛會落在上方四成左右。
     private static let centerY: CGFloat = 0.40
+    /// 為了避開聆聽者往下讓，頭的中心最低到這裡；再低構圖就不對了，改成縮小頭像框。
+    private static let lowestCenterY: CGFloat = 0.56
 
     /// 頭部輪廓在預覽座標中的位置。臉部比對也用同一個矩形。
     static func headRect(in size: CGSize, fraction: CGFloat, scale: CGFloat, topReserve: CGFloat) -> CGRect {
         let aspect = FaceDetectionService.headAspect
         // 橫式畫面的高度短，再夾一次才不會超出去。
-        let width = min(min(size.width, size.height) * fraction * scale, size.height * 0.62 / aspect)
+        let wanted = min(min(size.width, size.height) * fraction * scale, size.height * 0.62 / aspect)
+        // 頭頂在 topReserve 之下、中心不低於 lowestCenterY，兩個都要成立時頭最高只能這麼高。
+        let tallest = max(0, size.height * (lowestCenterY - topReserve) * 2)
+        let width = min(wanted, tallest / aspect)
         let height = width * aspect
         let midY = max(size.height * centerY, size.height * topReserve + height / 2)
         return CGRect(x: (size.width - width) / 2, y: midY - height / 2, width: width, height: height)
@@ -44,7 +51,8 @@ struct FramingGuideView: View {
     private func outline(in size: CGSize) -> some View {
         let head = Self.headRect(in: size, fraction: fraction, scale: scale, topReserve: topReserve)
         let isGood = FaceDetectionService.status(face: turnedFace(in: size), guide: head) == .good
-        let color: Color = isGood ? Theme.good : Color.white.opacity(0.85)
+        // 變綠是回饋，比平常的線再清楚一點；預設濃淡 0.85 時綠線就是原本的不透明。
+        let color: Color = isGood ? Theme.good.opacity(min(1, strength + 0.15)) : Color.white.opacity(strength)
         // 視訊通話的小窗也會畫頭像框，線要跟著變細。
         let line: CGFloat = max(0.5, min(1, min(size.width, size.height) / 300))
         let stroke = StrokeStyle(lineWidth: max(1, 2 * line), dash: [8 * line, 7 * line])

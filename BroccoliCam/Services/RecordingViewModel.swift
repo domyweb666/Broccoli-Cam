@@ -43,6 +43,8 @@ final class RecordingViewModel: ObservableObject {
     @Published var mergeError: String?
     /// 這一段的手機擺法和前面幾段不一樣時的提示。
     @Published var orientationError: String?
+    /// 跳轉、切換之後在畫面上閃一下的字，約 1.2 秒自己消失。
+    @Published private(set) var jumpNote: String?
     /// 按下錄影那一刻介面轉的角度，錄影中不跟著手機晃動改變。
     @Published private(set) var lockedAngle: Double = 0
 
@@ -62,6 +64,7 @@ final class RecordingViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var countdownTimer: Timer?
     private var elapsedTimer: Timer?
+    private var noteTimer: Timer?
     private var startDate: Date?
     private var autoPrompt = false
 
@@ -72,6 +75,8 @@ final class RecordingViewModel: ObservableObject {
     private var heldByPause = false
     /// 語音跟隨開著的時候，累計「有在講話」的次數（每次 0.1 秒）。
     private var followSpeakingTicks = 0
+    /// 正在問語音辨識的權限，問完之前不重複問。
+    private var askingSpeech = false
 
     /// 判定「有聲音」的門檻（dBFS），比說話偵測寬鬆，寧可少裁。
     private let soundFloor: Float = -45
@@ -120,8 +125,19 @@ final class RecordingViewModel: ObservableObject {
             guard let self else { return }
             self.prompter.follow(utf16Offset: offset, in: self.currentText)
         }
+        follower.onGaveUp = { [weak self] in
+            guard let self, self.prompter.isFollowing else { return }
+            self.fallBackToFixedSpeed()
+        }
         follower.onLog = { [weak camera] message in
             camera?.log(message)
+        }
+        // 跟隨中按了「回開頭」：提詞停在開頭，語音也回到開頭等。
+        prompter.onReset = { [weak self] in
+            guard let self, self.prompter.isFollowing else { return }
+            self.follower.suspend()
+            self.follower.seek(toUTF16: 0)
+            self.followSpeakingTicks = 0
         }
         camera.$isRecording
             .removeDuplicates()
@@ -133,9 +149,9 @@ final class RecordingViewModel: ObservableObject {
 
     // MARK: - 稿件
 
-    /// 稿件內容變了就重新切段；分段不同時，已錄的各段作廢。
+    /// 稿件內容、分段開關變了就重新切段；切出來不同時，已錄的各段作廢。
     func updateScript(_ script: String) {
-        let next = ScriptSegments.split(script)
+        let next = ScriptSegments.segments(of: script, segmented: settings?.segmentedRecording ?? true)
         guard next != segments else { return }
         discardAllTakes()
         segments = next
@@ -186,7 +202,25 @@ final class RecordingViewModel: ObservableObject {
 
     func togglePrompter() {
         heldByPause = false
-        prompter.toggle()
+        guard phase == .recording else {
+            prompter.toggle()
+            return
+        }
+        if prompter.isPlaying {
+            prompter.pause()
+            // 暫停中講的話不算在稿子裡。
+            if prompter.isFollowing { follower.suspend() }
+        } else if prompter.isFollowing {
+            prompter.play()
+            let here = prompter.readingOffset(in: currentText)
+            prompter.jump(toUTF16: here, in: currentText)
+            follower.resume(atUTF16: here)
+            followSpeakingTicks = 0
+        } else {
+            // 先播再跟：捲到底再按會先回開頭，跟隨才會從開頭開始。
+            prompter.play()
+            startFollowingIfWanted()
+        }
     }
 
     /// App 進背景等情況：有在錄就收尾，倒數就取消。
@@ -357,8 +391,10 @@ final class RecordingViewModel: ObservableObject {
             RunLoop.main.add(timer, forMode: .common)
             elapsedTimer = timer
             if autoPrompt {
-                startFollowingIfWanted()
                 prompter.play()
+            }
+            if prompter.isPlaying {
+                startFollowingIfWanted()
             }
         } else {
             elapsedTimer?.invalidate()
@@ -391,10 +427,10 @@ final class RecordingViewModel: ObservableObject {
         if prompter.isFollowing {
             // 跟著聲音走的時候不用「停頓等人」，沒唸就不會動。
             // 講了一陣子卻一個字都沒對上，代表辨識沒作用，退回固定速度。
-            if speaking { followSpeakingTicks += 1 }
+            if speaking && prompter.isPlaying { followSpeakingTicks += 1 }
             if followSpeakingTicks > 60 && follower.matchCount == 0 {
                 camera?.log("語音跟隨沒有對上稿子，改回固定速度")
-                stopFollowing()
+                fallBackToFixedSpeed()
             }
         } else if settings?.waitOnPause ?? false {
             if wasSpeaking && !speaking && prompter.isPlaying {
@@ -414,29 +450,221 @@ final class RecordingViewModel: ObservableObject {
             pending = SegmentTake(url: url, firstSound: firstSound, lastSound: lastSound)
         } else {
             review = RecordedVideo(url: url, script: segments.first ?? "", isLandscape: lockedAngle != 0)
+            // 跟隨會從目前讀到的位置開始，下一次重錄要從頭。
+            prompter.reset()
+        }
+    }
+
+    // MARK: - 跳轉
+
+    /// 往下或往上跳。分段錄影沒在錄時是換段；錄影中、或整篇一鏡到底時，在提詞裡跳一段或一行。
+    func jump(forward: Bool) {
+        guard settings?.usesPrompter ?? false, !isMerging, pending == nil, phase != .finishing else { return }
+        if isSegmented && phase == .idle {
+            jumpSegment(forward: forward)
+            return
+        }
+        let text = currentText
+        guard !text.isEmpty else { return }
+        let starts = TeleprompterModel.paragraphStarts(of: text)
+        // 只有一個段落，逐段等於不能跳，改成逐行。
+        if settings?.jumpMode == .paragraph && starts.count > 1 {
+            jumpParagraph(forward: forward, starts: starts, in: text)
+        } else {
+            jumpLine(forward: forward, in: text)
+        }
+    }
+
+    /// 點了提詞裡的某一行。
+    func jumpTo(utf16Offset: Int) {
+        guard settings?.usesPrompter ?? false, !isMerging, phase != .finishing else { return }
+        moveReading(to: utf16Offset)
+    }
+
+    private func jumpSegment(forward: Bool) {
+        let target = currentIndex + (forward ? 1 : -1)
+        guard segments.indices.contains(target) else {
+            showNote(forward ? "到結尾了" : "到開頭了")
+            return
+        }
+        step(forward ? 1 : -1)
+        showNote("第 \(currentIndex + 1) 段")
+    }
+
+    private func jumpParagraph(forward: Bool, starts: [Int], in text: String) {
+        let here = prompter.readingOffset(in: text)
+        let current = starts.lastIndex { $0 <= here } ?? 0
+        let target: Int
+        if forward {
+            guard current + 1 < starts.count else {
+                showNote("到結尾了")
+                return
+            }
+            target = current + 1
+        } else if current == 0 {
+            moveReading(to: starts[0])
+            showNote("到開頭了")
+            return
+        } else {
+            // 已經唸進這段了就先回這段開頭，還在開頭附近才到上一段。
+            target = spokenCount(from: starts[current], to: here, in: text) > 3 ? current : current - 1
+        }
+        moveReading(to: starts[target])
+        // 分段錄影裡的是「這一段裡的小段」，不要和分段列的第幾段混在一起。
+        showNote(isSegmented ? "第 \(target + 1) 小段" : "第 \(target + 1) 段")
+    }
+
+    private func jumpLine(forward: Bool, in text: String) {
+        let here = prompter.readingOffset(in: text)
+        if forward {
+            guard let next = prompter.nextLineStart(after: here, in: text) else {
+                showNote("到結尾了")
+                return
+            }
+            moveReading(to: next)
+            showNote("下一行")
+        } else {
+            guard let previous = prompter.previousLineStart(before: here, in: text) else {
+                moveReading(to: 0)
+                showNote("到開頭了")
+                return
+            }
+            moveReading(to: previous)
+            showNote("上一行")
+        }
+    }
+
+    /// 這兩個位置之間有幾個會唸出來的字。
+    private func spokenCount(from start: Int, to end: Int, in text: String) -> Int {
+        guard end > start else { return 0 }
+        return SpokenKeys.keys(of: text).filter { $0.utf16Offset >= start && $0.utf16Offset < end }.count
+    }
+
+    /// 提詞捲過去，語音跟隨也從那裡接著聽。
+    private func moveReading(to utf16Offset: Int) {
+        prompter.jump(toUTF16: utf16Offset, in: currentText)
+        guard prompter.isFollowing else { return }
+        follower.seek(toUTF16: utf16Offset)
+        followSpeakingTicks = 0
+    }
+
+    private func showNote(_ text: String) {
+        jumpNote = text
+        noteTimer?.invalidate()
+        let timer = Timer(timeInterval: 1.2, repeats: false) { [weak self] _ in
+            self?.jumpNote = nil
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        noteTimer = timer
+    }
+
+    // MARK: - 藍牙控制
+
+    /// 踏板、翻頁器、實體鍵盤按下去要做的事。
+    func perform(_ action: RemoteAction) {
+        guard hardwareEnabled, review == nil, !isMerging, let settings else { return }
+        switch action {
+        case .next:
+            jump(forward: true)
+        case .previous:
+            jump(forward: false)
+        case .playPause:
+            guard settings.usesPrompter else { return }
+            togglePrompter()
+        case .toggleVoice:
+            toggleVoiceFollow()
+        case .toggleJumpMode:
+            let next: JumpMode = settings.jumpMode == .paragraph ? .line : .paragraph
+            settings.jumpMode = next
+            showNote(next.label)
+        case .record:
+            hardwareButtonPressed()
         }
     }
 
     // MARK: - 語音跟隨
 
-    /// 設定有開、有授權、辨識可用，提詞就改成跟著聲音走；任何一項不成立就維持固定速度。
+    /// 開關語音跟隨。還沒有權限就先問，沒給就維持關著。
+    func toggleVoiceFollow() {
+        guard let settings else { return }
+        if settings.voiceFollow {
+            setVoiceFollow(false)
+            return
+        }
+        if SpeechFollower.isAuthorized {
+            setVoiceFollow(true)
+            return
+        }
+        guard !askingSpeech else { return }
+        askingSpeech = true
+        SpeechFollower.requestAuthorization { [weak self] granted in
+            guard let self else { return }
+            self.askingSpeech = false
+            if granted {
+                self.setVoiceFollow(true)
+            } else {
+                if self.settings?.voiceFollow == true { self.settings?.voiceFollow = false }
+                self.showNote("沒有語音辨識權限")
+            }
+        }
+    }
+
+    private func setVoiceFollow(_ on: Bool) {
+        settings?.voiceFollow = on
+        applyVoiceFollowSetting()
+        if on && phase == .recording && prompter.isPlaying && !prompter.isFollowing {
+            showNote("語音辨識現在不能用")
+        } else {
+            showNote(on ? "語音跟隨 開" : "語音跟隨 關")
+        }
+    }
+
+    /// 設定改了：錄影中立刻開始或停止跟隨。不在錄影就不用做什麼，開錄時會照設定。重複呼叫沒有關係。
+    func applyVoiceFollowSetting() {
+        guard phase == .recording else { return }
+        guard settings?.voiceFollow ?? false else {
+            guard prompter.isFollowing else { return }
+            // 改回固定速度，播放中的繼續播。
+            heldByPause = false
+            stopFollowing()
+            return
+        }
+        guard !prompter.isFollowing else { return }
+        // 停頓等人、自己捲到底停下來的，都算正在播；人按的暫停不算，按繼續時才會跟。
+        guard prompter.isPlaying || heldByPause || prompter.stoppedAtEnd else { return }
+        startFollowingIfWanted()
+        guard prompter.isFollowing else { return }
+        heldByPause = false
+        prompter.play()
+    }
+
+    /// 設定有開、有授權、辨識可用，提詞就改成從目前讀到的位置跟著聲音走；任何一項不成立就維持固定速度。
     private func startFollowingIfWanted() {
         followSpeakingTicks = 0
-        guard settings?.voiceFollow ?? false, let camera else { return }
-        guard follower.start(text: currentText) else {
+        let text = currentText
+        guard settings?.voiceFollow ?? false, !text.isEmpty, let camera else { return }
+        let here = prompter.readingOffset(in: text)
+        guard follower.start(text: text, from: here) else {
             camera.log("語音跟隨無法啟動，使用固定速度")
             return
         }
         camera.audioSampleHandler = { [weak follower] buffer in
             follower?.append(buffer)
         }
-        prompter.setFollowing(true)
+        // 已經讀到結尾時 follower 會從頭開始，提詞跟著它。
+        prompter.startFollowing(from: min(here, follower.currentOffset), in: text)
     }
 
     private func stopFollowing() {
         camera?.audioSampleHandler = nil
         follower.stop()
-        prompter.setFollowing(false)
+        prompter.stopFollowing()
+    }
+
+    private func fallBackToFixedSpeed() {
+        heldByPause = false
+        stopFollowing()
+        showNote("改回固定速度")
     }
 
     private func recordingFailed() {

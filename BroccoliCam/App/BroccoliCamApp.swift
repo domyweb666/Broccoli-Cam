@@ -2,13 +2,24 @@ import SwiftUI
 
 @main
 struct BroccoliCamApp: App {
-    @StateObject private var settings = SettingsStore()
+    @StateObject private var settings: SettingsStore
+    @StateObject private var library: ScriptLibrary
     @StateObject private var camera = CameraService()
+
+    /// ScriptLibrary 要跟畫面用同一個 SettingsStore，而且讀檔時就會寫回 script，
+    /// 所以兩個都在這裡先建好，不等到畫面更新時才建。
+    init() {
+        let settings = SettingsStore()
+        let library = ScriptLibrary(settings: settings)
+        _settings = StateObject(wrappedValue: settings)
+        _library = StateObject(wrappedValue: library)
+    }
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(settings)
+                .environmentObject(library)
                 .environmentObject(camera)
                 .preferredColorScheme(.dark)
                 .tint(Theme.accent)
@@ -26,6 +37,7 @@ enum Theme {
 /// App 開啟後直接到相機；只有還沒授權時才先說明權限。
 struct RootView: View {
     @EnvironmentObject private var camera: CameraService
+    @EnvironmentObject private var library: ScriptLibrary
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -42,6 +54,9 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 camera.refreshAuthorization()
+            } else {
+                // 從背景可能直接被滑掉，一離開前景就把腳本寫進檔案。
+                library.flush()
             }
         }
     }
