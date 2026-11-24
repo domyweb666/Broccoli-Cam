@@ -83,6 +83,8 @@ final class CaptionEditorModel: ObservableObject {
     @Published private(set) var originalPhoto: Photo = .idle
     /// 存檔沒成功的訊息，存成功就消失。
     @Published var saveError: String?
+    /// 沒辨識到的提示被使用者關掉了。
+    @Published private var hidesProblem = false
     /// 畫面上閃一下的字。
     @Published private(set) var note: String?
     /// 整支平移了幾秒。nil 是沒在平移。
@@ -134,6 +136,12 @@ final class CaptionEditorModel: ObservableObject {
         case .running, .hot: return true
         default: return false
         }
+    }
+    /// 整支沒辨識到的原因。那些句子都看過了就不用再提醒。
+    var recognitionProblem: String? {
+        guard !hidesProblem, let raw = project.recognition?.problem,
+              project.lines.contains(where: { $0.status == .unrecognized && !$0.isConfirmed }) else { return nil }
+        return CaptionProblem(rawValue: raw)?.label
     }
     /// 第一次對字幕，還沒有任何結果。
     var isFirstRecognition: Bool { project.recognition == nil && project.lines.isEmpty }
@@ -271,9 +279,14 @@ final class CaptionEditorModel: ObservableObject {
         var next = project
         next.lines = CaptionEditing.cleaned(result.lines, duration: next.duration)
         next.recognition = result.recognition
+        hidesProblem = false
         commit(next)
         // 打開時的備份是空的，第一次對好就換上。重新對的不換，備份留著打開時的字。
         saveNow(force: true, backup: isFirst)
+    }
+
+    func hideRecognitionProblem() {
+        hidesProblem = true
     }
 
     private func recognitionMoved(_ value: Double, ticket: Int) {

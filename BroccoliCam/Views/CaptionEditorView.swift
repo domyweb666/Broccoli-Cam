@@ -220,6 +220,11 @@ struct CaptionEditorView: View {
                     ScriptErrorBanner(message: message) {
                         model.saveError = nil
                     }
+                } else if !keyboardUp, let problem = model.recognitionProblem {
+                    // 打字時讓位給句子。
+                    ScriptErrorBanner(message: problem) {
+                        model.hideRecognitionProblem()
+                    }
                 }
                 middle
                 if !keyboardUp {

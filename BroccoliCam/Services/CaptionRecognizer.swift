@@ -240,7 +240,7 @@ final class SystemCaptionRecognizer: CaptionRecognizing {
 /// 測試用：模擬器沒有中文辨識，照稿子編出聽到的字和時間。
 /// UserDefaults 的 debugFakeCaptions 寫情境，用逗號隔開：normal、missing（漏第二句）、extra（第一句後面多講）、
 /// repeat（第一句講兩次）、misheard（最後一句一半聽錯）、fail（後半辨識失敗）、silent（什麼都沒聽到）、
-/// offline（不能辨識）、mixed（漏、多、重講、聽錯一次來）。
+/// offline（沒有網路）、unavailable（不能辨識）、timeout（整支等不到回應）、mixed（漏、多、重講、聽錯一次來）。
 struct FakeCaptionRecognizer: CaptionRecognizing {
     static var scenario: Set<String>? {
         guard let text = UserDefaults.standard.string(forKey: "debugFakeCaptions"), !text.isEmpty else { return nil }
@@ -253,11 +253,13 @@ struct FakeCaptionRecognizer: CaptionRecognizing {
     private let words: [CaptionWord]
     private let start: Double
     private let fails: Bool
+    private let neverAnswers: Bool
 
     /// start 是這一段在影片檔裡的起點，duration 是長度。
     init(script: String, start: Double, duration: Double, scenario: Set<String>) {
         self.start = start
         fails = scenario.contains("fail")
+        neverAnswers = scenario.contains("timeout")
         info = CaptionRecognizerInfo(engine: "假辨識", onDevice: true,
                                      maxSeconds: fails ? max(2, duration * 0.6) : nil)
         words = scenario.contains("silent") ? [] : Self.speak(script, duration: duration, scenario: scenario)
@@ -266,6 +268,7 @@ struct FakeCaptionRecognizer: CaptionRecognizing {
     func transcribe(asset: AVAsset, range: CMTimeRange) async throws -> [HeardWord] {
         // 看得到進度條、來得及按取消。
         try await Task.sleep(nanoseconds: 1_200_000_000)
+        if neverAnswers { throw CaptionRecognizerError.timedOut }
         let lower = range.start.seconds - start
         let upper = lower + range.duration.seconds
         if fails, lower > 0.05 || range.duration.seconds < 1.9 { throw CaptionRecognizerError.timedOut }

@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import Network
 import Speech
 
 /// 影片和稿子變成一句一句的字幕。逐段比：每段只拿自己的稿子對自己的聲音，重錄造成的錯位不會跨段。
@@ -78,8 +79,41 @@ enum CaptionBuilder {
             if let lastError { throw SubtitleError.failed(lastError.localizedDescription) }
             throw SubtitleError.nothingToWrite
         }
+        if engine.isOff || lines.allSatisfy({ $0.status == .unrecognized }) {
+            recognition.problem = await problem(engine, lastError, onDevice: recognition.onDevice).rawValue
+        }
         progress(1)
         return (lines, recognition)
+    }
+
+    /// 整支都沒聽到，是卡在哪裡。查得出來的才講，不要什麼都說成沒網路。
+    private static func problem(_ engine: Engine, _ error: Error?, onDevice: Bool) async -> CaptionProblem {
+        if engine.isOff {
+            #if targetEnvironment(simulator)
+            if let scenario = FakeCaptionRecognizer.scenario {
+                return scenario.contains("offline") ? .noNetwork : .unavailable
+            }
+            #endif
+            let online = await isOnline()
+            return SystemCaptionRecognizer.needsNetwork && !online ? .noNetwork : .unavailable
+        }
+        // 沒有錯誤卻整支沒辨識，是有稿子的段落沒有聲音。
+        guard let error else { return .noSound }
+        if case CaptionRecognizerError.cannotReadAudio = error { return .noSound }
+        if !onDevice {
+            let online = await isOnline()
+            if !online || (error as NSError).code == NSURLErrorNotConnectedToInternet { return .noNetwork }
+        }
+        if case CaptionRecognizerError.timedOut = error { return .timedOut }
+        return .failed
+    }
+
+    /// 現在連不連得上網。
+    private static func isOnline() async -> Bool {
+        for await path in NWPathMonitor() {
+            return path.status == .satisfied
+        }
+        return true
     }
 
     private static func hasWords(_ script: String) -> Bool {
@@ -126,7 +160,8 @@ enum CaptionBuilder {
         static func prepare() async throws -> Engine {
             #if targetEnvironment(simulator)
             if let scenario = FakeCaptionRecognizer.scenario {
-                return scenario.contains("offline") ? .off : .fake(scenario)
+                let off = scenario.contains("offline") || scenario.contains("unavailable")
+                return off ? .off : .fake(scenario)
             }
             #endif
             guard await authorize() else { throw SubtitleError.notAuthorized }

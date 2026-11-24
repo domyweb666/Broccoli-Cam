@@ -119,6 +119,23 @@ struct CaptionRecognition: Codable, Equatable {
     var failedRanges: [ClosedRange<Double>] = []
     /// 稿子有多少比例的字找到了時間。沒有稿子是 nil。
     var coverage: Double?
+    /// 整支都沒辨識到的原因（CaptionProblem）。部分失敗不寫。存成字串，之後加新的原因舊版也讀得進來。
+    var problem: String?
+}
+
+/// 整支都沒辨識到的原因。
+enum CaptionProblem: String {
+    case noNetwork, unavailable, timedOut, noSound, failed
+
+    var label: String {
+        switch self {
+        case .noNetwork: return "沒有網路，這次沒辨識到聲音"
+        case .unavailable: return "這支手機現在不能辨識中文，這次沒辨識到聲音"
+        case .timedOut: return "語音辨識沒有回應，這次沒辨識到聲音"
+        case .noSound: return "讀不到影片的聲音，這次沒辨識到"
+        case .failed: return "語音辨識失敗，這次沒辨識到聲音"
+        }
+    }
 }
 
 enum CaptionResolution: String, Codable, CaseIterable, Identifiable {
