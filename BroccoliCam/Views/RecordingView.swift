@@ -170,6 +170,7 @@ struct RecordingView: View {
     private var remoteActive: Bool {
         if showScript || showSettings || showModes { return false }
         return viewModel.review == nil && viewModel.mergeError == nil && viewModel.orientationError == nil
+            && viewModel.recordingError == nil && viewModel.scriptChange == nil
     }
 
     /// 橫放：計時、收音、分段列轉 90 度，沿著使用者看到的下緣排，避開提詞那一側。
@@ -199,6 +200,12 @@ struct RecordingView: View {
             .onChange(of: showScript) { _, _ in updateHardwareEnabled() }
             .onChange(of: showSettings) { _, _ in updateHardwareEnabled() }
             .onChange(of: showModes) { _, _ in updateHardwareEnabled() }
+            .onChange(of: viewModel.phase) { _, phase in
+                // 面板會蓋住停止鈕；一鍵優化跑到一半就開錄也在這裡停掉。
+                guard phase != .idle else { return }
+                showLook = false
+                camera.cancelOptimize()
+            }
             .onChange(of: viewModel.pending != nil) { _, waiting in
                 // 剛錄完一段，留用／重錄的按鈕在面板底下，把面板收起來。
                 if waiting { showLook = false }
@@ -209,7 +216,7 @@ struct RecordingView: View {
     private var scriptObserved: some View {
         formatObserved
             .onChange(of: settings.companionMode) { _, _ in
-                viewModel.updateScript(settings.activeScript)
+                viewModel.updateScript(settings.activeScript, force: true)
                 viewModel.prompter.reset()
                 updateCompanion()
             }
@@ -218,7 +225,8 @@ struct RecordingView: View {
                 if !showScript { viewModel.updateScript(settings.activeScript) }
             }
             .onChange(of: settings.segmentedRecording) { _, _ in
-                viewModel.updateScript(settings.activeScript)
+                // 設定頁已經問過會不會刪掉已錄的。
+                viewModel.updateScript(settings.activeScript, force: true)
             }
             .onChange(of: settings.voiceFollow) { _, _ in
                 viewModel.applyVoiceFollowSetting()
@@ -244,13 +252,6 @@ struct RecordingView: View {
             .onChange(of: settings.stabilization) { _, _ in startCamera() }
             .onChange(of: camera.availableFPS) { _, map in
                 fixFormat(map)
-            }
-            .onChange(of: camera.availableStabilizations) { _, _ in
-                fixStabilization()
-            }
-            .onChange(of: camera.isSessionRunning) { _, running in
-                // 只支援「關」的裝置，清單從頭到尾沒變過，上面那個不會觸發。相機跑起來時清單一定是真的。
-                if running { fixStabilization() }
             }
             .onChange(of: settings.look) { _, _ in applyLook() }
             .onChange(of: settings.lookEnabled) { _, _ in applyLook() }
@@ -303,13 +304,6 @@ struct RecordingView: View {
         }
     }
 
-    /// 存下來的防抖強度現在的格式不支援，就退回關。
-    private func fixStabilization() {
-        if !camera.availableStabilizations.contains(settings.stabilization) {
-            settings.stabilization = .off
-        }
-    }
-
     /// 彈出視窗：提示、腳本、設定、完成頁。
     private var presented: some View {
         observed
@@ -322,6 +316,15 @@ struct RecordingView: View {
             Button("好") {}
         } message: {
             Text(viewModel.orientationError ?? "")
+        }
+        .alert("錄影有狀況", isPresented: recordingErrorShown) {
+            Button("好") {}
+        } message: {
+            Text(viewModel.recordingError ?? "")
+        }
+        .alert("換稿會刪掉已錄的 \(viewModel.scriptChange?.count ?? 0) 段", isPresented: scriptChangeShown) {
+            Button("換稿", role: .destructive) { viewModel.acceptScriptChange() }
+            Button("保留已錄的", role: .cancel) { viewModel.declineScriptChange() }
         }
         .sheet(isPresented: $showScript, onDismiss: {
             // 打字是延遲併入的，先寫回去再切段，不然會漏最後幾個字。
@@ -340,6 +343,7 @@ struct RecordingView: View {
         }
         .fullScreenCover(item: $viewModel.review, onDismiss: {
             startCamera()
+            viewModel.reconsiderScript()
         }) { video in
             VideoReviewView(video: video, onDiscardAll: {
                 viewModel.discardAllTakes()
@@ -376,6 +380,23 @@ struct RecordingView: View {
             set: { shown in
                 if !shown { viewModel.orientationError = nil }
             }
+        )
+    }
+
+    private var recordingErrorShown: Binding<Bool> {
+        Binding(
+            get: { viewModel.recordingError != nil },
+            set: { shown in
+                if !shown { viewModel.recordingError = nil }
+            }
+        )
+    }
+
+    /// 兩顆按鈕都會自己清掉，這裡不用再動。
+    private var scriptChangeShown: Binding<Bool> {
+        Binding(
+            get: { viewModel.scriptChange != nil },
+            set: { _ in }
         )
     }
 

@@ -42,6 +42,10 @@ final class FramePipeline: NSObject {
         var gpuAllowed = true
         /// 過熱，降噪和柔膚先不做。
         var heavySkipped = false
+        /// 錄影中算不完，這一段剩下的時間降噪和柔膚都不做。
+        var tooSlow = false
+
+        var skipsHeavy: Bool { heavySkipped || tooSlow }
 
         /// 這組設定會動到畫面（按住比對的時候也算，才不會在原生預覽和處理過的預覽之間跳來跳去）。
         var changesPixels: Bool { lookEnabled && !look.needsNoPixelWork }
@@ -62,6 +66,10 @@ final class FramePipeline: NSObject {
     private var requests: [SampleRequest] = []
     private var counts = Counts()
     private var lastFrameSize: CGSize = .zero
+    /// 錄影中每一秒統計一次來不及的影格。
+    private var paceStart: CFTimeInterval = 0
+    private var paceFrames = 0
+    private var paceLate = 0
     private var lastFrameAt: CFTimeInterval = 0
     private var lastFrameTime: CMTime = .invalid
 
@@ -70,6 +78,9 @@ final class FramePipeline: NSObject {
     private lazy var filter = LookFilter()
     private var smoothedFace: CGRect?
     private var faceStrength: CGFloat = 0
+
+    /// 錄影中算不完、開始略過降噪和柔膚（videoQueue 回呼，只能做「丟到別的佇列」）。
+    var onTooSlow: (() -> Void)?
 
     /// 臉不見多久之後才開始淡出柔膚（秒）。
     private static let faceHold: CFTimeInterval = 1.2
@@ -193,14 +204,51 @@ final class FramePipeline: NSObject {
     func setRecorder(_ next: FrameRecorder) {
         lock.lock()
         currentRecorder = next
+        settings.tooSlow = false
+        // 剛開錄的第一秒本來就會掉幾格，不算。
+        paceStart = CACurrentMediaTime() + 1
+        paceFrames = 0
+        paceLate = 0
         lock.unlock()
     }
 
     /// 這支錄完了，放掉。中間如果已經換成新的一支就不動。
     func clearRecorder(_ old: FrameRecorder) {
         lock.lock()
-        if currentRecorder === old { currentRecorder = nil }
+        if currentRecorder === old {
+            currentRecorder = nil
+            settings.tooSlow = false
+        }
         lock.unlock()
+    }
+
+    /// 每進來（或丟掉）一格記一次，一秒結算：來不及超過 5% 而且開著吃重的處理，就先不做那些。
+    /// 一段錄影裡不再自動打開，免得畫面一下有一下沒有。
+    private func notePace(late: Bool) {
+        lock.lock()
+        let now = CACurrentMediaTime()
+        guard currentRecorder != nil, !settings.tooSlow, now >= paceStart else {
+            lock.unlock()
+            return
+        }
+        if late {
+            paceLate += 1
+        } else {
+            paceFrames += 1
+        }
+        guard now - paceStart >= 1 else {
+            lock.unlock()
+            return
+        }
+        let total = paceFrames + paceLate
+        let slow = total >= 10 && Double(paceLate) > Double(total) * 0.05
+        paceStart = now
+        paceFrames = 0
+        paceLate = 0
+        let skip = slow && settings.lookEnabled && LookFilter.usesHeavy(settings.look)
+        if skip { settings.tooSlow = true }
+        lock.unlock()
+        if skip { onTooSlow?() }
     }
 
     // MARK: - 取一張原始影格（分析用）
@@ -267,7 +315,7 @@ final class FramePipeline: NSObject {
         guard status == kCVReturnSuccess, let buffer = made else { return nil }
 
         let transform = CGAffineTransform(scaleX: CGFloat(width) / fullWidth, y: CGFloat(height) / fullHeight)
-        let small: CIImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let small: CIImage = CameraGPU.image(pixelBuffer)
             .clampedToExtent()
             .transformed(by: transform, highQualityDownsample: true)
         let bounds = CGRect(x: 0, y: 0, width: width, height: height)
@@ -316,12 +364,15 @@ final class FramePipeline: NSObject {
         let recorder: FrameRecorder? = currentRecorder
         lock.unlock()
 
+        notePace(late: false)
         let canDraw: Bool = now.gpuAllowed && CameraGPU.isAvailable
         serveRequests(pixelBuffer, at: time, gpuAllowed: canDraw)
         updateFace()
 
-        let wantsLook: Bool = now.changesPixels && !now.bypassed
-        let filtering: Bool = canDraw && wantsLook && LookFilter.hasWork(now.look, skipHeavy: now.heavySkipped)
+        let filtering: Bool = canDraw && now.changesPixels
+            && LookFilter.hasWork(now.look, skipHeavy: now.skipsHeavy)
+        // 按住比對只影響預覽，錄下來的不能跟著變。
+        let compareOnly: Bool = filtering && now.bypassed
 
         // 已經算好、可以直接拿去預覽的那張（原點在 0,0、直立）。
         var finished: CIImage?
@@ -330,11 +381,11 @@ final class FramePipeline: NSObject {
             if !filtering && ticket.turn == 0 && sameSize {
                 // 不用處理就原封不動寫進去：零 GPU，畫質和相機給的一樣。
                 recorder.append(pixelBuffer, at: time)
-                finished = CIImage(cvPixelBuffer: pixelBuffer)
+                finished = CameraGPU.image(pixelBuffer)
             } else if canDraw, let output = render(pixelBuffer, ticket: ticket, settings: now, filtering: filtering) {
                 recorder.append(output, at: time)
                 // 橫式錄影的成品是轉過的，預覽要轉回直立。
-                finished = Self.turned(CIImage(cvPixelBuffer: output), by: -ticket.turn)
+                finished = compareOnly ? nil : Self.turned(CameraGPU.image(output), by: -ticket.turn)
             } else {
                 recorder.noteRenderFailure()
             }
@@ -345,7 +396,8 @@ final class FramePipeline: NSObject {
         if let finished {
             image = finished
         } else {
-            image = previewImage(pixelBuffer, size: size, target: target, settings: now, filtering: filtering)
+            image = previewImage(pixelBuffer, size: size, target: target, settings: now,
+                                 filtering: filtering && !now.bypassed)
         }
         // 預覽一律是鏡像（和原生預覽一樣）。輸出已經鏡像就不用再翻。
         renderer.submit(image, mirrored: !now.mirrored)
@@ -354,7 +406,7 @@ final class FramePipeline: NSObject {
     /// 沒在錄影時的預覽：先縮到預覽框的大小再套濾鏡，4K 和小窗都不用算滿整張。
     private func previewImage(_ pixelBuffer: CVPixelBuffer, size: CGSize, target: CGSize,
                               settings: Settings, filtering: Bool) -> CIImage {
-        let source = CIImage(cvPixelBuffer: pixelBuffer)
+        let source = CameraGPU.image(pixelBuffer)
         guard filtering else { return source }
         let shortSide: CGFloat = min(size.width, size.height)
         let targetShort: CGFloat = min(target.width, target.height)
@@ -377,7 +429,7 @@ final class FramePipeline: NSObject {
         let extent: CGRect = image.extent
         let scale: CGFloat = min(extent.width, extent.height) / 1080
         return filter.apply(settings.look, to: image, face: face(in: extent.size), scale: scale,
-                            skipHeavy: settings.heavySkipped)
+                            skipHeavy: settings.skipsHeavy)
     }
 
     /// 錄影用：套處理、轉到成品方向、畫進寫檔器的緩衝區。
@@ -388,7 +440,7 @@ final class FramePipeline: NSObject {
         let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, ticket.pool, &made)
         guard status == kCVReturnSuccess, let output = made else { return nil }
 
-        let source = CIImage(cvPixelBuffer: pixelBuffer)
+        let source = CameraGPU.image(pixelBuffer)
         var image: CIImage = source
         if filtering {
             image = filtered(image, settings: settings)
@@ -400,7 +452,7 @@ final class FramePipeline: NSObject {
         // 色彩標籤跟原始影格完全一樣，同一支影片裡處理過和沒處理過的影格才會無縫。
         // 先標再畫：Core Image 靠標籤決定 RGB 轉 YCbCr 用哪個矩陣。
         Self.copyColorTags(from: pixelBuffer, to: output)
-        context.render(image, to: output, bounds: bounds, colorSpace: source.colorSpace ?? CameraGPU.colorSpace)
+        context.render(image, to: output, bounds: bounds, colorSpace: CameraGPU.colorSpace)
         Self.copyColorTags(from: pixelBuffer, to: output)
         return output
     }
@@ -506,5 +558,6 @@ extension FramePipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         lock.lock()
         counts.late += 1
         lock.unlock()
+        notePace(late: true)
     }
 }

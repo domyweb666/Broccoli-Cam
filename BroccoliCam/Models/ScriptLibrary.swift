@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// 一篇腳本。標題可以空著，列表就拿內文第一行當標題。
 struct ScriptItem: Identifiable, Codable, Equatable {
@@ -81,6 +82,8 @@ final class ScriptLibrary: ObservableObject {
     private var saveFailed = false
     /// 壞檔留不了底的時候不准寫，免得把原檔蓋掉。
     private var writingBlocked = false
+    /// 等著重讀檔案的通知。空的代表沒在等。
+    private var retryObservers: [NSObjectProtocol] = []
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -250,18 +253,57 @@ final class ScriptLibrary: ObservableObject {
             migrate()
             return
         }
+        let data: Data
         do {
-            let data = try Data(contentsOf: fileURL)
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            // 讀不到不代表檔案壞了（例如還沒解鎖），不能動它，也不能寫。
+            waitForFile()
+            return
+        }
+        do {
             let stored = try JSONDecoder().decode(StoredFile.self, from: data)
-            items = stored.items
+            // 讀不到的期間新增的留在最上面。
+            let added = items
+            items = added + stored.items
             activeID = stored.activeID
             repairActive()
             // 兩邊不一樣時以檔案為準。
             syncScript()
+            if !added.isEmpty { save() }
         } catch {
             quarantineBrokenFile()
-            migrate()
+            if items.isEmpty { migrate() } else { finishStructuralChange() }
         }
+    }
+
+    /// 檔案讀不到：擋住寫入，等手機解鎖或回前景再讀一次。
+    private func waitForFile() {
+        writingBlocked = true
+        errorMessage = "腳本檔現在讀不到，等一下會再讀一次。"
+        guard retryObservers.isEmpty else { return }
+        let names: [Notification.Name] = [
+            UIApplication.protectedDataDidBecomeAvailableNotification,
+            UIApplication.willEnterForegroundNotification
+        ]
+        for name in names {
+            let observer = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.retryLoad()
+            }
+            retryObservers.append(observer)
+        }
+    }
+
+    private func retryLoad() {
+        guard !retryObservers.isEmpty, (try? Data(contentsOf: fileURL)) != nil else { return }
+        for observer in retryObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        retryObservers = []
+        commitDrafts()
+        writingBlocked = false
+        errorMessage = nil
+        load()
     }
 
     /// 還沒有列表檔：舊版唯一那篇稿子變成第一篇。寫了檔之後就不會再走到這裡。

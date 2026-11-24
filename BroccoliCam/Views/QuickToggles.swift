@@ -63,13 +63,18 @@ struct QuickToggles: View {
     }
 
     private var stabilizationButton: some View {
-        QuickButton(systemImage: "figure.walk.motion", isOn: settings.stabilization != .off,
-                    label: "防抖", value: settings.stabilization.label,
+        QuickButton(systemImage: "figure.walk.motion", isOn: stabilization != .off,
+                    label: "防抖", value: stabilization.label,
                     angle: angle, side: side,
-                    badge: settings.stabilization == .strong ? "強" : nil,
+                    badge: stabilization == .strong ? "強" : nil,
                     action: nextStabilization)
             .disabled(isBusy)
             .opacity(isBusy ? 0.5 : 1)
+    }
+
+    /// 實際生效的強度，不是設定裡選的。
+    private var stabilization: StabilizationLevel {
+        camera.effectiveStabilization(settings.stabilization)
     }
 
     private var guideImage: String {
@@ -83,7 +88,7 @@ struct QuickToggles: View {
     private func nextStabilization() {
         let list: [StabilizationLevel] = camera.availableStabilizations
         guard !list.isEmpty else { return }
-        let index = list.firstIndex(of: settings.stabilization) ?? 0
+        let index = list.firstIndex(of: stabilization) ?? 0
         settings.stabilization = list[(index + 1) % list.count]
     }
 }

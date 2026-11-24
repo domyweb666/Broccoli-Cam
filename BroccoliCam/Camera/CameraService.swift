@@ -33,9 +33,10 @@ final class CameraService: NSObject, ObservableObject {
     private(set) var recordingLag: TimeInterval = 0
 
     /// 錄影檔完成（主執行緒回呼）。
-    var onRecordingFinished: ((URL) -> Void)?
-    /// 錄影失敗（主執行緒回呼）。
-    var onRecordingFailed: (() -> Void)?
+    /// 第二個值有東西代表中途出過狀況，檔案只救回一部分。
+    var onRecordingFinished: ((URL, String?) -> Void)?
+    /// 錄影失敗和原因（主執行緒回呼）。
+    var onRecordingFailed: ((String) -> Void)?
     /// 音量鍵或藍牙遙控器被按下（主執行緒回呼）。
     var onCaptureButton: (() -> Void)?
 
@@ -74,6 +75,8 @@ final class CameraService: NSObject, ObservableObject {
     private var mirrorOutput = false
     /// 目前格式實際的幀率，sessionQueue 讀寫。
     private var activeFPS = 30
+    /// 上次要求的曝光補償，sessionQueue 讀寫。裝置讀回來的值會慢慢變、也會四捨五入，拿來比會一直重設。
+    private var lastRequestedBias: Float?
 
     // 畫面優化。lookLock 保護這一組。
     private let lookLock = NSLock()
@@ -81,7 +84,9 @@ final class CameraService: NSObject, ObservableObject {
     private var lookEnabled = false
     /// 一鍵優化時把測光移到的位置（裝置座標）。nil 是中央。
     private var meteringPoint: CGPoint?
-    private var isOptimizing = false
+    /// 正在跑的一鍵優化是第幾次。nil 代表沒在跑，或已經被取消。
+    private var optimizeRun: Int?
+    private var optimizeCount = 0
     private var exposureApplyQueued = false
 
     // 主執行緒用
@@ -134,6 +139,9 @@ final class CameraService: NSObject, ObservableObject {
         updateThermalLimit()
         nc.addObserver(self, selector: #selector(thermalStateChanged(_:)),
                        name: ProcessInfo.thermalStateDidChangeNotification, object: nil)
+        pipeline.onTooSlow = { [weak self] in
+            self?.log("影格來不及處理，這段先略過降噪和柔膚")
+        }
         refreshAuthorization()
     }
 
@@ -171,8 +179,10 @@ final class CameraService: NSObject, ObservableObject {
     /// 啟動（或以新設定重新套用）相機。錄影中呼叫只會更新設定值，不會改格式。請在主執行緒呼叫。
     func start(resolution: VideoResolution, fps: Int, mirrorOutput: Bool,
                stabilization: StabilizationLevel = .off) {
-        let angle = currentCaptureAngle()
-        lastSentAngle = angle
+        let coordinatorReady = rotationCoordinator != nil
+        let heldSideways = UIDevice.current.orientation.isLandscape
+        let knownAngle = currentCaptureAngle()
+        lastSentAngle = knownAngle
         sessionQueue.async {
             self.desiredResolution = resolution
             self.desiredFPS = fps
@@ -182,6 +192,13 @@ final class CameraService: NSObject, ObservableObject {
                 self.configureSession()
             }
             guard self.isConfigured else { return }
+            var angle = knownAngle
+            if !coordinatorReady, !heldSideways, let probed = self.probePortraitAngle() {
+                angle = probed
+                DispatchQueue.main.async {
+                    if self.rotationCoordinator == nil { self.lastSentAngle = probed }
+                }
+            }
             if !self.pipeline.isRecording {
                 self.captureRotationAngle = angle
                 self.session.beginConfiguration()
@@ -280,6 +297,16 @@ final class CameraService: NSObject, ObservableObject {
         return coordinator.videoRotationAngleForHorizonLevelPreview
     }
 
+    /// 預覽層還沒好之前，先問這支手機直拿時影格要轉幾度。
+    /// iPhone 17 是 0 度，用預設的 90 度開錄會錄成側的。請在 sessionQueue 呼叫。
+    private func probePortraitAngle() -> CGFloat? {
+        guard let device = videoDevice else { return nil }
+        let probe = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+        let angle = probe.videoRotationAngleForHorizonLevelCapture
+        // 拿著的角度不明時可能回橫的值，直式只會是這兩個。
+        return angle == 0 || angle == 90 ? angle : nil
+    }
+
     /// 手機橫放時錄影應該轉幾度：跟著手機實際的擺法（重力方向）。
     private func currentLandscapeAngle() -> CGFloat {
         guard let coordinator = rotationCoordinator else { return 90 }
@@ -330,9 +357,16 @@ final class CameraService: NSObject, ObservableObject {
     private func syncCaptureAngle() {
         let angle = currentCaptureAngle()
         guard angle != lastSentAngle else { return }
+        let previous = lastSentAngle
         lastSentAngle = angle
         sessionQueue.async {
-            guard self.isConfigured, !self.pipeline.isRecording else { return }
+            guard self.isConfigured, !self.pipeline.isRecording else {
+                // 這次沒套到，記回原本的值，錄完會再補。
+                DispatchQueue.main.async {
+                    if self.lastSentAngle == angle { self.lastSentAngle = previous }
+                }
+                return
+            }
             self.captureRotationAngle = angle
             self.updateConnections()
         }
@@ -523,6 +557,8 @@ final class CameraService: NSObject, ObservableObject {
         if session.sessionPreset != preset, session.canSetSessionPreset(preset) {
             session.sessionPreset = preset
         }
+        // 換格式會把曝光補償洗掉。
+        lastRequestedBias = nil
         do {
             try device.lockForConfiguration()
             if let (format, fps) = chosen {
@@ -629,6 +665,13 @@ final class CameraService: NSObject, ObservableObject {
         return "代碼 \(mode.rawValue)"
     }
 
+    /// 設定裡選的強度在目前的格式上實際是哪一種。不支援就往下退，設定本身不動。
+    func effectiveStabilization(_ wanted: StabilizationLevel) -> StabilizationLevel {
+        if availableStabilizations.contains(wanted) { return wanted }
+        if wanted == .strong, availableStabilizations.contains(.standard) { return .standard }
+        return .off
+    }
+
     // MARK: - 錄影
 
     /// 影格時間用的時鐘。
@@ -642,6 +685,8 @@ final class CameraService: NSObject, ObservableObject {
 
     /// landscape：手機橫放，要錄成橫式 16:9。角度交給 RotationCoordinator 依手機實際的擺法決定。請在主執行緒呼叫。
     func startRecording(landscape: Bool = false) {
+        // 一鍵優化跑到一半就開錄：不要讓它在錄影中動曝光。
+        cancelOptimize()
         let turn = landscape ? currentLandscapeTurn() : 0
         if landscape {
             log("橫式錄影 再轉 \(turn) 度")
@@ -649,10 +694,12 @@ final class CameraService: NSObject, ObservableObject {
         sessionQueue.async {
             guard self.isConfigured, self.session.isRunning, !self.session.isInterrupted else {
                 self.log("相機尚未就緒，無法錄影")
-                DispatchQueue.main.async { self.onRecordingFailed?() }
+                DispatchQueue.main.async { self.onRecordingFailed?("相機還沒準備好，請再試一次") }
                 return
             }
             guard !self.pipeline.isRecording else { return }
+            // 分析中動過的曝光和測光先還原。
+            self.applyLookToDevice()
             do {
                 let recorder = try self.makeRecorder(turn: turn)
                 self.pipeline.setRecorder(recorder)
@@ -660,7 +707,7 @@ final class CameraService: NSObject, ObservableObject {
             } catch {
                 let text = "無法開始錄影：\(error.localizedDescription)"
                 self.fail(text)
-                DispatchQueue.main.async { self.onRecordingFailed?() }
+                DispatchQueue.main.async { self.onRecordingFailed?(text) }
             }
         }
     }
@@ -793,7 +840,8 @@ final class CameraService: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 self.isRecording = false
                 if let note { self.lastError = note }
-                self.onRecordingFinished?(url)
+                self.onRecordingFinished?(url, note)
+                self.applyPreviewRotation()
                 self.endRecordingTask()
             }
         case .failed(let message):
@@ -801,19 +849,19 @@ final class CameraService: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 self.isRecording = false
                 self.lastError = message
-                self.onRecordingFailed?()
+                self.onRecordingFailed?(message)
+                self.applyPreviewRotation()
                 self.endRecordingTask()
             }
         }
     }
 
     /// 在前景不計時，進了背景才會用到。
+    /// 主執行緒呼叫。
     private func beginRecordingTask() {
-        DispatchQueue.main.async { [self] in
-            guard self.recordingTask == .invalid else { return }
-            self.recordingTask = UIApplication.shared.beginBackgroundTask(withName: "broccoli-recording") { [weak self] in
-                self?.endRecordingTask()
-            }
+        guard recordingTask == .invalid else { return }
+        recordingTask = UIApplication.shared.beginBackgroundTask(withName: "broccoli-recording") { [weak self] in
+            self?.endRecordingTask()
         }
     }
 
@@ -834,7 +882,7 @@ final class CameraService: NSObject, ObservableObject {
         lookLock.lock()
         look = params
         lookEnabled = enabled
-        if neutral && !isOptimizing { meteringPoint = nil }
+        if neutral && optimizeRun == nil { meteringPoint = nil }
         lookLock.unlock()
         pipeline.setLook(params, enabled: enabled)
         refreshMetalPreview()
@@ -865,7 +913,7 @@ final class CameraService: NSObject, ObservableObject {
     /// 一鍵優化進行中由優化流程控制曝光，這裡先不動，結束後會再套一次。
     private func applyLookToDevice() {
         lookLock.lock()
-        let optimizing = isOptimizing
+        let optimizing = optimizeRun != nil
         let active = lookEnabled && look != LookParams.neutral
         let bias = active ? look.exposure : 0
         let point: CGPoint? = active ? meteringPoint : nil
@@ -880,7 +928,7 @@ final class CameraService: NSObject, ObservableObject {
         let target: Float = min(max(Float(bias), device.minExposureTargetBias), device.maxExposureTargetBias)
         let center = CGPoint(x: 0.5, y: 0.5)
         let spot: CGPoint = point ?? center
-        let biasChanged = abs(device.exposureTargetBias - target) > 0.01
+        let biasChanged = abs((lastRequestedBias ?? device.exposureTargetBias) - target) > 0.01
         let exposureMoves = device.isExposurePointOfInterestSupported
             && device.isExposureModeSupported(.continuousAutoExposure)
             && Self.isFar(device.exposurePointOfInterest, spot)
@@ -901,6 +949,7 @@ final class CameraService: NSObject, ObservableObject {
             }
             if biasChanged {
                 device.setExposureTargetBias(target, completionHandler: nil)
+                lastRequestedBias = target
             }
             device.unlockForConfiguration()
         } catch {
@@ -915,16 +964,19 @@ final class CameraService: NSObject, ObservableObject {
     /// 一鍵優化：對臉測光、等曝光穩定、分析，回傳參數。主執行緒呼叫、主執行緒回呼。
     /// 不套用，由呼叫端 setLook；smooth 由呼叫端補回。nil 代表沒有畫面可分析。
     func optimizeLook(completion: @escaping (LookResult?) -> Void) {
-        lookLock.lock()
-        let busy = isOptimizing
-        if !busy { isOptimizing = true }
-        lookLock.unlock()
-        guard !busy else {
+        guard isSessionRunning, pipeline.hasRecentFrame, !pipeline.isRecording else {
             DispatchQueue.main.async { completion(nil) }
             return
         }
-        guard isSessionRunning, pipeline.hasRecentFrame else {
-            finishOptimizing()
+        lookLock.lock()
+        let busy = optimizeRun != nil
+        if !busy {
+            optimizeCount += 1
+            optimizeRun = optimizeCount
+        }
+        let run = optimizeCount
+        lookLock.unlock()
+        guard !busy else {
             DispatchQueue.main.async { completion(nil) }
             return
         }
@@ -937,18 +989,20 @@ final class CameraService: NSObject, ObservableObject {
             }
         }
         analysisQueue.async {
-            let result = self.runOptimization(point: point)
+            let found = self.runOptimization(point: point, run: run)
             DispatchQueue.main.async {
+                // 中途被取消（開錄、按了還原）就當作沒有結果。
+                let result: LookResult? = self.isOptimizing(run) ? found : nil
                 if let result {
                     self.log(String(format: "一鍵優化 臉=%@ 曝光=%.2f 色溫=%.0f 色調=%.0f 太暗=%@",
                                     result.hasFace ? "有" : "無", result.params.exposure,
                                     result.params.temperature, result.params.tint,
                                     result.stillTooDark ? "是" : "否"))
                 } else {
-                    self.log("一鍵優化沒有畫面可分析")
+                    self.log("一鍵優化沒有結果")
                 }
                 self.lookLock.lock()
-                self.isOptimizing = false
+                if self.optimizeRun == run { self.optimizeRun = nil }
                 self.lookLock.unlock()
                 // 呼叫端通常會在這裡面 setLook，那就直接接上剛剛的曝光，不會跳一下。
                 completion(result)
@@ -960,24 +1014,36 @@ final class CameraService: NSObject, ObservableObject {
         }
     }
 
-    private func finishOptimizing() {
+    /// 取消進行中的一鍵優化，曝光和測光回到分析前。沒在跑就沒事。
+    func cancelOptimize() {
         lookLock.lock()
-        isOptimizing = false
+        let running = optimizeRun != nil
+        optimizeRun = nil
         lookLock.unlock()
+        guard running else { return }
+        queueExposureUpdate()
+    }
+
+    /// 第 run 次分析還要不要繼續：沒被取消、也沒在錄影。
+    private func isOptimizing(_ run: Int) -> Bool {
+        lookLock.lock()
+        let current = optimizeRun == run
+        lookLock.unlock()
+        return current && !pipeline.isRecording
     }
 
     /// 在 analysisQueue 跑，中間會等影格、等曝光穩定。只讀原始影格，逐格處理不影響分析。
-    private func runOptimization(point: CGPoint?) -> LookResult? {
+    private func runOptimization(point: CGPoint?, run: Int) -> LookResult? {
         guard let device = sessionQueue.sync(execute: { self.videoDevice }),
               let first = pipeline.grabSample(after: nil, timeout: 1.5),
               let start = LookAnalyzer.measure(first) else { return nil }
 
         // 第一次：測光移到臉上，順便把曝光推過去。
         var exposure = LookAnalyzer.exposureBias(current: Double(device.exposureTargetBias), reading: start)
-        guard var reading = settle(device, exposure: exposure, point: point) else { return nil }
+        guard var reading = settle(device, exposure: exposure, point: point, run: run) else { return nil }
         // 測光點換了，亮度會跟著變，差得多就再修一次。
         let refined = LookAnalyzer.exposureBias(current: exposure, reading: reading)
-        if abs(refined - exposure) >= 0.2, let again = settle(device, exposure: refined, point: point) {
+        if abs(refined - exposure) >= 0.2, let again = settle(device, exposure: refined, point: point, run: run) {
             exposure = refined
             reading = again
         }
@@ -990,6 +1056,7 @@ final class CameraService: NSObject, ObservableObject {
             exposureOffset: Double(device.exposureTargetOffset),
             shortSide: Int(min(size.width, size.height))
         )
+        guard isOptimizing(run) else { return nil }
         lookLock.lock()
         meteringPoint = point
         lookLock.unlock()
@@ -999,17 +1066,21 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     /// 套曝光，等穩定（最多 1.2 秒），再量一次。
-    private func settle(_ device: AVCaptureDevice, exposure: Double, point: CGPoint?) -> LookReading? {
-        sessionQueue.sync {
+    private func settle(_ device: AVCaptureDevice, exposure: Double, point: CGPoint?, run: Int) -> LookReading? {
+        // 在 sessionQueue 裡再確認一次，和開錄排在同一條佇列，不會交錯。
+        let applied: Bool = sessionQueue.sync {
+            guard self.isOptimizing(run) else { return false }
             self.applyExposure(bias: exposure, point: point)
+            return true
         }
+        guard applied else { return nil }
         Thread.sleep(forTimeInterval: 0.3)
         var waited: TimeInterval = 0.3
-        while waited < 1.2, device.isAdjustingExposure {
+        while waited < 1.2, device.isAdjustingExposure, isOptimizing(run) {
             Thread.sleep(forTimeInterval: 0.05)
             waited += 0.05
         }
-        guard let sample = pipeline.grabSample(after: captureTime(), timeout: 1.5) else { return nil }
+        guard isOptimizing(run), let sample = pipeline.grabSample(after: captureTime(), timeout: 1.5) else { return nil }
         return LookAnalyzer.measure(sample)
     }
 
@@ -1091,6 +1162,8 @@ final class CameraService: NSObject, ObservableObject {
     @objc private func appEnteredBackground(_ note: Notification) {
         // 背景不能用 GPU，也不會再有影格。
         pipeline.setGPUAllowed(false)
+        // 剛開錄就被切走時，第一格的通知可能還沒跑，這裡先要到背景時間再收尾。
+        if pipeline.isRecording { beginRecordingTask() }
         finishRecordingNow()
     }
 

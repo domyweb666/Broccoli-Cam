@@ -81,6 +81,10 @@ final class FrameRecorder {
     private var firstVideoTime: CMTime = .invalid
     private var lastVideoTime: CMTime = .invalid
     private var counts = Counts()
+    /// 停止之後，畫面已經收到 stopTime 了，在等聲音。
+    private var videoDone = false
+    /// 最後一包聲音到什麼時候（不管寫了沒）。
+    private var audioSeenUntil: CMTime = .invalid
 
     /// 聲音比畫面早到（開防抖時畫面會晚幾百毫秒），先放著，等畫面跟上再寫。
     private var pendingAudio: [CMSampleBuffer] = []
@@ -101,7 +105,8 @@ final class FrameRecorder {
          frameDuration: CMTime, startTimeout: TimeInterval, tailTimeout: TimeInterval) throws {
         let assetWriter = try AVAssetWriter(outputURL: url, fileType: .mov)
         // App 被系統殺掉或寫檔出錯時，前面的片段還能救回來。
-        assetWriter.movieFragmentInterval = CMTime(value: 10, timescale: 1)
+        assetWriter.movieFragmentInterval = CMTime(value: 2, timescale: 1)
+        assetWriter.initialMovieFragmentInterval = CMTime(value: 1, timescale: 1)
 
         guard assetWriter.canApply(outputSettings: videoSettings, forMediaType: .video) else {
             throw FrameRecorderError.badVideoSettings
@@ -272,13 +277,30 @@ final class FrameRecorder {
     private func acceptsLocked(_ time: CMTime) -> Bool {
         guard armed, phase != .ended, time.isNumeric else { return false }
         if phase == .stopping, time > stopTime {
-            endLocked()
+            finishVideoLocked()
             return false
         }
         guard time >= startTime else { return false }
         // 時間一定要往前走，重複或倒退的影格不收。
         if lastVideoTime.isValid, time <= lastVideoTime { return false }
         return true
+    }
+
+    /// 畫面收到停止的那一刻了。聲音通常晚一點到，等它也到，最多 0.15 秒，尾音才不會被切。
+    private func finishVideoLocked() {
+        guard !videoDone else { return }
+        videoDone = true
+        guard audioInput != nil, !audioReachedStopLocked() else {
+            endLocked()
+            return
+        }
+        finishQueue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.endIfStopping()
+        }
+    }
+
+    private func audioReachedStopLocked() -> Bool {
+        audioSeenUntil.isValid && audioSeenUntil >= stopTime
     }
 
     private func videoReadyLocked() -> Bool {
@@ -302,13 +324,19 @@ final class FrameRecorder {
         guard time.isNumeric else { return }
         lock.lock()
         defer { lock.unlock() }
-        guard armed, phase != .ended, audioEnd(sampleBuffer, from: time) > startTime else { return }
-        if phase == .stopping, time > stopTime { return }
-        pendingAudio.append(sampleBuffer)
-        if lastVideoTime.isValid {
-            drainAudioLocked(limit: lastVideoTime + Self.audioLead)
+        let end: CMTime = audioEnd(sampleBuffer, from: time)
+        guard armed, phase != .ended, end > startTime else { return }
+        audioSeenUntil = end
+        if phase != .stopping || time <= stopTime {
+            pendingAudio.append(sampleBuffer)
+            if lastVideoTime.isValid {
+                drainAudioLocked(limit: lastVideoTime + Self.audioLead)
+            }
+            trimBacklogLocked()
         }
-        trimBacklogLocked()
+        if phase == .stopping, videoDone, audioReachedStopLocked() {
+            endLocked()
+        }
     }
 
     private func audioEnd(_ sampleBuffer: CMSampleBuffer, from time: CMTime) -> CMTime {

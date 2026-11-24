@@ -21,6 +21,7 @@ struct VideoReviewView: View {
     @State private var player: AVPlayer?
     @State private var saveState: SaveState = .idle
     @State private var confirmDiscard = false
+    @State private var showNotice = false
     @State private var subtitleState: SubtitleState = .idle
     @State private var sharedSubtitle: SharedFile?
 
@@ -112,7 +113,13 @@ struct VideoReviewView: View {
             }
             Button("取消", role: .cancel) {}
         }
+        .alert("錄影有狀況", isPresented: $showNotice) {
+            Button("好") {}
+        } message: {
+            Text(video.notice ?? "")
+        }
         .onAppear {
+            showNotice = video.notice != nil
             // 回放時先停相機，並把音訊切到播放，聲音才會從喇叭出來。
             camera.stop()
             let audioSession = AVAudioSession.sharedInstance()

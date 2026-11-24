@@ -38,6 +38,12 @@ struct LookPanel: View {
             // 按著比對的時候面板被關掉，也要還原。
             camera.setLookBypassed(false)
         }
+        .onChange(of: isBusy) { _, busy in
+            guard busy, analyzing else { return }
+            attempt += 1
+            analyzing = false
+            camera.cancelOptimize()
+        }
     }
 
     private var panelBackground: some View {
@@ -169,6 +175,10 @@ struct LookPanel: View {
     }
 
     private func reset() {
+        // 分析到一半按還原，那次的結果不要再套上來。
+        attempt += 1
+        analyzing = false
+        camera.cancelOptimize()
         settings.look = .neutral
         settings.lookEnabled = false
         note = nil

@@ -10,6 +10,15 @@ struct RecordedVideo: Identifiable {
     var script = ""
     /// 是不是橫式 16:9。
     var isLandscape = false
+    /// 這支影片有什麼要告訴使用者的（例如結尾沒存到）。
+    var notice: String?
+}
+
+/// 稿子切出來的段落和已錄的不一樣，等使用者決定。
+struct ScriptChange: Identifiable {
+    let id = UUID()
+    /// 已經錄了幾段。
+    let count: Int
 }
 
 /// 一段錄好的影片，以及錄影當下量到的「有聲音」範圍（秒）。
@@ -29,7 +38,15 @@ final class RecordingViewModel: ObservableObject {
         case finishing
     }
 
-    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var phase: Phase = .idle {
+        didSet {
+            guard phase == .idle, oldValue != .idle else { return }
+            // 錄完的那一段要先記下來，再看有沒有等著套用的新稿。
+            DispatchQueue.main.async { [weak self] in
+                self?.reconsiderScript()
+            }
+        }
+    }
     @Published private(set) var elapsed: TimeInterval = 0
     @Published var review: RecordedVideo?
 
@@ -43,6 +60,14 @@ final class RecordingViewModel: ObservableObject {
     @Published var mergeError: String?
     /// 這一段的手機擺法和前面幾段不一樣時的提示。
     @Published var orientationError: String?
+    /// 錄影失敗、或只存到一部分時的提示。
+    @Published var recordingError: String?
+    /// 換稿會刪掉已錄的段落，等使用者決定。
+    @Published var scriptChange: ScriptChange?
+    /// 還沒套用的新稿（錄影中、或使用者選了保留已錄的）。
+    private var waitingScript: String?
+    /// 使用者選了保留時，新稿切出來的段落。同一份不再問。
+    private var declinedSegments: [String]?
     /// 跳轉、切換之後在畫面上閃一下的字，約 1.2 秒自己消失。
     @Published private(set) var jumpNote: String?
     /// 按下錄影那一刻介面轉的角度，錄影中不跟著手機晃動改變。
@@ -112,11 +137,11 @@ final class RecordingViewModel: ObservableObject {
         guard self.camera == nil else { return }
         self.camera = camera
         self.settings = settings
-        camera.onRecordingFinished = { [weak self] url in
-            self?.recordingFinished(url)
+        camera.onRecordingFinished = { [weak self] url, note in
+            self?.recordingFinished(url, damaged: note != nil)
         }
-        camera.onRecordingFailed = { [weak self] in
-            self?.recordingFailed()
+        camera.onRecordingFailed = { [weak self] reason in
+            self?.recordingFailed(reason)
         }
         camera.onCaptureButton = { [weak self] in
             self?.hardwareButtonPressed()
@@ -149,12 +174,48 @@ final class RecordingViewModel: ObservableObject {
 
     // MARK: - 稿件
 
-    /// 稿件內容、分段開關變了就重新切段；切出來不同時，已錄的各段作廢。
-    func updateScript(_ script: String) {
-        let next = ScriptSegments.segments(of: script, segmented: settings?.segmentedRecording ?? true)
-        guard next != segments else { return }
+    /// 稿件內容、分段開關變了就重新切段。切出來不同、又已經錄了幾段時先問（force 是已經問過了）。
+    /// 錄影中先記著，回到待機再套。
+    func updateScript(_ script: String, force: Bool = false) {
+        guard split(script) != segments else {
+            waitingScript = nil
+            declinedSegments = nil
+            return
+        }
+        waitingScript = script
+        guard phase == .idle, !isMerging, review == nil else { return }
+        if force || recordedCount == 0 {
+            discardAllTakes()
+            return
+        }
+        guard split(script) != declinedSegments else { return }
+        scriptChange = ScriptChange(count: recordedCount)
+    }
+
+    /// 換稿：已錄的各段作廢。
+    func acceptScriptChange() {
+        scriptChange = nil
         discardAllTakes()
-        segments = next
+    }
+
+    /// 保留已錄的：沿用原本的段落繼續錄，全部清掉之後才套新稿。
+    func declineScriptChange() {
+        scriptChange = nil
+        declinedSegments = waitingScript.map { split($0) }
+    }
+
+    /// 有等著套用的新稿就再看一次能不能套。
+    func reconsiderScript() {
+        guard let waiting = waitingScript else { return }
+        updateScript(waiting)
+    }
+
+    private func split(_ script: String) -> [String] {
+        ScriptSegments.segments(of: script, segmented: settings?.segmentedRecording ?? true)
+    }
+
+    private var recordedCount: Int {
+        takes.count + (pending == nil ? 0 : 1)
     }
 
     // MARK: - 錄影鈕
@@ -319,6 +380,11 @@ final class RecordingViewModel: ObservableObject {
         takesLandscape = nil
         pending = nil
         currentIndex = 0
+        if let waiting = waitingScript {
+            waitingScript = nil
+            declinedSegments = nil
+            segments = split(waiting)
+        }
         prompter.reset()
     }
 
@@ -366,6 +432,7 @@ final class RecordingViewModel: ObservableObject {
             guard let self, self.phase == .starting else { return }
             self.camera?.log("錄影未在 3 秒內開始")
             self.phase = .idle
+            self.recordingError = "相機沒有開始錄，請再試一次"
         }
     }
 
@@ -445,12 +512,15 @@ final class RecordingViewModel: ObservableObject {
         wasSpeaking = speaking
     }
 
-    private func recordingFinished(_ url: URL) {
+    private func recordingFinished(_ url: URL, damaged: Bool) {
         phase = .idle
+        let notice: String? = damaged ? "結尾有一小段沒存到" : nil
         if isSegmented {
             pending = SegmentTake(url: url, firstSound: firstSound, lastSound: lastSound)
+            recordingError = notice
         } else {
-            review = RecordedVideo(url: url, script: segments.first ?? "", isLandscape: lockedAngle != 0)
+            review = RecordedVideo(url: url, script: segments.first ?? "", isLandscape: lockedAngle != 0,
+                                   notice: notice)
             // 跟隨會從目前讀到的位置開始，下一次重錄要從頭。
             prompter.reset()
         }
@@ -668,7 +738,8 @@ final class RecordingViewModel: ObservableObject {
         showNote("改回固定速度")
     }
 
-    private func recordingFailed() {
+    private func recordingFailed(_ reason: String) {
         phase = .idle
+        recordingError = reason
     }
 }

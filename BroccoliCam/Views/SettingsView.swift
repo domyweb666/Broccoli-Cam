@@ -134,7 +134,7 @@ struct SettingsView: View {
                     Text("\(fps) FPS").tag(fps)
                 }
             }
-            Picker("防抖", selection: $settings.stabilization) {
+            Picker("防抖", selection: stabilizationBinding) {
                 ForEach(camera.availableStabilizations) { level in
                     Text(level.label).tag(level)
                 }
@@ -144,6 +144,14 @@ struct SettingsView: View {
         } header: {
             Text("影片")
         }
+    }
+
+    /// 顯示實際生效的強度；存下來的選擇在不支援的格式上不會被改掉。
+    private var stabilizationBinding: Binding<StabilizationLevel> {
+        Binding<StabilizationLevel>(
+            get: { camera.effectiveStabilization(settings.stabilization) },
+            set: { settings.stabilization = $0 }
+        )
     }
 
     private var recordingSection: some View {
