@@ -41,10 +41,63 @@ enum CompanionLayout: String, CaseIterable, Identifiable {
     }
 }
 
+/// 構圖輔助線。只畫在預覽上，不會錄進影片。
+enum GuideStyle: String, CaseIterable, Identifiable {
+    case off
+    case head
+    case grid
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .off: return "關"
+        case .head: return "頭像框"
+        case .grid: return "九宮格"
+        }
+    }
+
+    /// 主畫面按一下換下一種。
+    var next: GuideStyle {
+        switch self {
+        case .off: return .head
+        case .head: return .grid
+        case .grid: return .off
+        }
+    }
+}
+
+/// 防抖強度。裝置不支援的不會列出來。
+enum StabilizationLevel: String, CaseIterable, Identifiable {
+    case off
+    case standard
+    case strong
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .off: return "關"
+        case .standard: return "標準"
+        case .strong: return "加強"
+        }
+    }
+}
+
+/// 跳轉一次跳多遠。
+enum JumpMode: String, CaseIterable, Identifiable {
+    case paragraph
+    case line
+
+    var id: String { rawValue }
+    var label: String { self == .paragraph ? "逐段" : "逐行" }
+}
+
 /// 使用者偏好。全部存在 UserDefaults，改了就寫入。
 final class SettingsStore: ObservableObject {
     private let defaults = UserDefaults.standard
 
+    /// 正在用的那篇稿子的內文。列表在 ScriptLibrary，這裡是它的鏡像，由 ScriptLibrary 寫入。
     @Published var script: String { didSet { defaults.set(script, forKey: "script") } }
 
     @Published var resolution: VideoResolution { didSet { defaults.set(resolution.rawValue, forKey: "resolution") } }
@@ -59,7 +112,9 @@ final class SettingsStore: ObservableObject {
     @Published var promptBackground: Double { didSet { defaults.set(promptBackground, forKey: "promptBackground") } }
     @Published var autoStartPrompter: Bool { didSet { defaults.set(autoStartPrompter, forKey: "autoStartPrompter") } }
 
-    @Published var showGuide: Bool { didSet { defaults.set(showGuide, forKey: "showGuide") } }
+    @Published var guideStyle: GuideStyle { didSet { defaults.set(guideStyle.rawValue, forKey: "guideStyle") } }
+    /// 構圖線的濃淡 0.2–1，頭像框和九宮格共用
+    @Published var guideOpacity: Double { didSet { defaults.set(guideOpacity, forKey: "guideOpacity") } }
     /// 頭像框大小倍率 0.7–1.4
     @Published var guideScale: Double { didSet { defaults.set(guideScale, forKey: "guideScale") } }
 
@@ -85,6 +140,27 @@ final class SettingsStore: ObservableObject {
     /// 手機橫放時錄橫式 16:9
     @Published var autoLandscape: Bool { didSet { defaults.set(autoLandscape, forKey: "autoLandscape") } }
 
+    /// 稿件編輯頁的字級倍率 0.8–1.8
+    @Published var scriptTextScale: Double { didSet { defaults.set(scriptTextScale, forKey: "scriptTextScale") } }
+    /// 用空行分段錄。關掉就整篇一鏡到底
+    @Published var segmentedRecording: Bool { didSet { defaults.set(segmentedRecording, forKey: "segmentedRecording") } }
+    /// 跳轉一次跳一段或一行
+    @Published var jumpMode: JumpMode { didSet { defaults.set(jumpMode.rawValue, forKey: "jumpMode") } }
+    @Published var stabilization: StabilizationLevel { didSet { defaults.set(stabilization.rawValue, forKey: "stabilization") } }
+    /// 畫面優化的參數。lookEnabled 關著就不套
+    @Published var look: LookParams {
+        didSet {
+            if let data = try? JSONEncoder().encode(look) { defaults.set(data, forKey: "look") }
+        }
+    }
+    @Published var lookEnabled: Bool { didSet { defaults.set(lookEnabled, forKey: "lookEnabled") } }
+    /// 藍牙踏板、翻頁器的按鍵對應
+    @Published var remoteBindings: RemoteBindings {
+        didSet {
+            if let data = try? JSONEncoder().encode(remoteBindings) { defaults.set(data, forKey: "remoteBindings") }
+        }
+    }
+
     @Published var showDebug: Bool { didSet { defaults.set(showDebug, forKey: "showDebug") } }
 
     init() {
@@ -97,7 +173,13 @@ final class SettingsStore: ObservableObject {
         speed = (d.object(forKey: "speed") as? Double) ?? 36
         promptBackground = (d.object(forKey: "promptBackground") as? Double) ?? 0.45
         autoStartPrompter = (d.object(forKey: "autoStartPrompter") as? Bool) ?? true
-        showGuide = (d.object(forKey: "showGuide") as? Bool) ?? true
+        if let raw = d.string(forKey: "guideStyle"), let style = GuideStyle(rawValue: raw) {
+            guideStyle = style
+        } else {
+            // 舊版只有「顯示頭像框」一個開關。
+            guideStyle = ((d.object(forKey: "showGuide") as? Bool) ?? true) ? .head : .off
+        }
+        guideOpacity = (d.object(forKey: "guideOpacity") as? Double) ?? 0.85
         guideScale = (d.object(forKey: "guideScale") as? Double) ?? 1.0
         countdown = (d.object(forKey: "countdown") as? Int) ?? 3
         speechRate = (d.object(forKey: "speechRate") as? Double) ?? 220
@@ -108,6 +190,14 @@ final class SettingsStore: ObservableObject {
         companionMode = (d.object(forKey: "companionMode") as? Bool) ?? false
         companionLayout = CompanionLayout(rawValue: d.string(forKey: "companionLayout") ?? "") ?? .fullCall
         autoLandscape = (d.object(forKey: "autoLandscape") as? Bool) ?? true
+        scriptTextScale = (d.object(forKey: "scriptTextScale") as? Double) ?? 1.0
+        segmentedRecording = (d.object(forKey: "segmentedRecording") as? Bool) ?? true
+        jumpMode = JumpMode(rawValue: d.string(forKey: "jumpMode") ?? "") ?? .paragraph
+        stabilization = StabilizationLevel(rawValue: d.string(forKey: "stabilization") ?? "") ?? .off
+        look = d.data(forKey: "look").flatMap { try? JSONDecoder().decode(LookParams.self, from: $0) } ?? .neutral
+        lookEnabled = (d.object(forKey: "lookEnabled") as? Bool) ?? false
+        remoteBindings = d.data(forKey: "remoteBindings")
+            .flatMap { try? JSONDecoder().decode(RemoteBindings.self, from: $0) } ?? .standard
         showDebug = (d.object(forKey: "showDebug") as? Bool) ?? false
     }
 
@@ -125,8 +215,8 @@ final class SettingsStore: ObservableObject {
         companionMode ? "" : script
     }
 
-    /// 稿件依空行切出的各段。
+    /// 稿件依空行切出的各段。關掉分段錄影就是一整段。
     var segments: [String] {
-        ScriptSegments.split(script)
+        ScriptSegments.segments(of: script, segmented: segmentedRecording)
     }
 }

@@ -2,6 +2,16 @@ import Foundation
 
 /// 稿件分段與時長估算。空行就是分段點；沒有空行就是一整段。
 enum ScriptSegments {
+    /// 錄影要用的各段。segmented 關著就是一整段（保留空行），空稿回傳空陣列。
+    static func segments(of script: String, segmented: Bool) -> [String] {
+        if segmented { return split(script) }
+        let whole = script
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return whole.isEmpty ? [] : [whole]
+    }
+
     /// 用空行（可含空白字元）切段，去掉每段前後空白與空段。
     static func split(_ script: String) -> [String] {
         let normalized = script
