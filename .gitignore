@@ -12,3 +12,7 @@ __pycache__/
 docs/聆聽者短片/原始/
 # 轉好的短片和 App 資源重複，以 BroccoliCam/Resources/Companion 為準；串接預覽只留本機
 docs/聆聽者短片/*.mp4
+
+# 第三批起的抽格圖和總覽也只留本機（第二批 a 的抽格圖已經在版控裡，照舊追蹤）
+docs/聆聽者短片/*_frames.png
+docs/聆聽者短片/總覽.jpg
