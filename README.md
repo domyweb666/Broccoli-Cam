@@ -79,6 +79,16 @@
 
 規劃見 [`docs/第七輪計畫.md`](docs/第七輪計畫.md)。
 
+## 第八輪（尚未真機驗證）
+
+- 錄影檔改放 Application Support 的 `takes`，每次狀態改變就記到清單（`TakeStore`）。app 被滑掉，重開會問要接著錄還是刪掉；錄到一半被滑掉的那段也救得回來（至少半秒）。還沒儲存的完成影片一樣會問
+- 清單寫成功才刪檔；讀不到清單就什麼都不刪；清單壞掉會改名留底，能播的逐支救成影片
+- 提詞的畫面和點擊換算共用同一份 TextKit 排版（`PromptLayout`），有空行的長稿點哪行就跳哪行
+- iOS 17 開優化時改用 CoreMedia 的 709 色彩空間，暗部不再偏亮
+- 聆聽者三位可選：選單和設定頁都有頭像
+- 聆聽者即時反應（設定可關，預設開）：講完一句停頓時點頭、突然大聲時抬眉、停很久時歪頭等、重新開口時往前靠。只看音量，在手機上算。判斷在 `ListenerReactor`
+- 字幕燒進影片只有方案，還沒做：[`docs/字幕燒入方案.md`](docs/字幕燒入方案.md)
+
 ## 專案結構
 
 ```
@@ -89,13 +99,13 @@ BroccoliCam/
               LookFilter（濾鏡）、LookAnalyzer（一鍵優化的判斷）、
               MetalPreviewRenderer（處理過的預覽）
   Services/   RecordingViewModel、TeleprompterModel、FaceDetectionService、
-              SpeechActivityMonitor、PhotoSaver、VideoStitcher、
+              SpeechActivityMonitor、PhotoSaver、VideoStitcher、TakeStore（錄影檔與清單）、
               SpeechFollower（語音跟隨）、SubtitleMaker（字幕）、
               CompanionModel（聆聽者點頭的時機）、CompanionClipPlayer（播聆聽者短片）、
               OrientationMonitor（直放／橫放）
   Models/     SettingsStore、ScriptSegments、ScriptLibrary（腳本列表）、
               SpokenKeys、SpeechAligner、SubtitleLines、LookParams、
-              RemoteBindings（藍牙按鍵）
+              RemoteBindings（藍牙按鍵）、ListenerReactor（即時反應）
   Views/      拍攝主畫面、快速開關、提詞、頭像框、九宮格、優化面板、
               稿件列表與編輯、設定、藍牙控制、完成頁、除錯層
 project.yml   XcodeGen 專案定義（.xcodeproj 不進版控，由 CI 產生）
@@ -153,7 +163,7 @@ Build 編號用 Actions 的 run number，版本號在 `project.yml` 的 `MARKETI
 - 直式影片是不是 1080×1920 而且是正的；直式、橫式乘上鏡像開關，四種都要試。開優化和關優化各試一次。
 - iPhone 17 打開 app 立刻按錄影，畫面有沒有側過去。
 - 頭尾有沒有切到字，防抖「加強」時特別看結尾。
-- 優化打開、關掉那一瞬間預覽會不會閃或顛倒；顏色和關掉時比有沒有偏。iOS 17 的暗部會比較亮（固定色彩空間要 iOS 18）。
+- 優化打開、關掉那一瞬間預覽會不會閃或顛倒；顏色和關掉時比有沒有偏。iOS 17 的手機要看暗部有沒有偏亮。
 - 一鍵優化在暗房、逆光、黃燈、白天窗邊各按一次，臉有沒有比較好。門檻是估的，在 `LookAnalyzer`。
 - 防抖：清單列出哪幾種，標準和加強看不看得出差別，頭對在框裡錄出來有沒有跑位。
 - 錄影中來電、切到背景、鎖螢幕、插拔耳機，檔案有沒有留下來。
@@ -161,5 +171,13 @@ Build 編號用 Actions 的 run number，版本號在 `project.yml` 的 `MARKETI
 - 語音跟隨退回去重唸，跟不跟得上；跳完馬上開口，頭一兩個字可能漏。
 - 列表長按選單和拖曳排序會不會打架；注音組字時停頓，字會不會被打斷。
 - iPhone SE 的分段錄影，左側那條開關會不會擠到提詞和分段列。
+
+第八輪新增：
+
+- 分段錄兩段後把 app 滑掉，重開接著錄、接片、存照片；錄到一半滑掉，救回的那段能不能存進照片、能不能接片，HEVC 和 4K 都要試。
+- 講到一半點頭、抬眉、歪頭、靠前的時機自不自然，會不會太頻繁；一開口就一直講、音量又很平時，可能判不到在講話。
+- 4K 錄影加上聆聽者（四台播放器）會不會燙、會不會掉格。
+- 提詞的陰影在亮背景下好不好讀。
+- 手機講電話或插拔耳機後，聆聽者有沒有繼續動。
 
 模擬器測橫式介面：`defaults write org.domyweb.broccolicam debugForceAngle -float 90`（或 -90）後重開 App，介面會當成橫放。真機上不要設這個值。
