@@ -399,7 +399,8 @@ struct CaptionEditorView: View {
                 }
             }
             HStack(spacing: 10) {
-                CaptionWideButton(title: "樣式", icon: "textformat", prominent: false) {
+                // 不用 textformat：中文系統會把它畫成「格式」兩個字，變成「格式 樣式」。
+                CaptionWideButton(title: "樣式", icon: "paintpalette", prominent: false) {
                     hideKeyboard()
                     panel = .style
                 }

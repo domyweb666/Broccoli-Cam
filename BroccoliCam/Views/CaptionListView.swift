@@ -28,10 +28,10 @@ struct CaptionListView: View {
             .navigationTitle("字幕專案")
             .navigationBarTitleDisplayMode(.inline)
             .onAppear(perform: reload)
-            .confirmationDialog(
+            // 不用 confirmationDialog：新系統會變成頂端的小泡泡，而且不畫「取消」。刪了不能還原，取消要看得到。
+            .alert(
                 "刪掉這個字幕專案？",
                 isPresented: deleteShown,
-                titleVisibility: .visible,
                 presenting: pendingDelete
             ) { entry in
                 Button("刪掉", role: .destructive) { delete(entry) }

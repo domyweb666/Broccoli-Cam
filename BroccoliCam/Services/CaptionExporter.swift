@@ -339,7 +339,13 @@ final class CaptionExporter: ObservableObject {
 
     private func describe(_ error: Error) -> String {
         if let known = error as? CaptionBurnError { return known.localizedDescription }
-        if let known = error as? CaptionVideoError { return known.localizedDescription }
+        if let known = error as? CaptionVideoError {
+            // 背景不給用顯示晶片，轉過方向的影片就畫不出來。這是切出去造成的，不是影片有問題。
+            if case .cannotDraw = known, wentToBackground {
+                return CaptionBurnError.stoppedBySystem.localizedDescription
+            }
+            return known.localizedDescription
+        }
         if Self.isOutOfSpace(error as NSError) { return CaptionBurnError.noSpace.localizedDescription }
         let code: AVError.Code? = (error as? AVError)?.code
         if code == .operationInterrupted || code == .mediaServicesWereReset || wentToBackground {

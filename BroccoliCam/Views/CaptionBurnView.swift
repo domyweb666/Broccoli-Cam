@@ -46,9 +46,11 @@ struct CaptionBurnView: View {
 
     private func hot(_ canLower: Bool) -> some View {
         VStack(spacing: 18) {
+            // 旁邊就有字，沒藏起來旁白會唸出英文的圖示名稱。
             Image(systemName: "thermometer.high")
                 .font(.largeTitle)
                 .foregroundStyle(.yellow)
+                .accessibilityHidden(true)
             Text("手機太燙，先停下來了")
                 .font(.headline)
                 .foregroundStyle(.white)
@@ -66,6 +68,7 @@ struct CaptionBurnView: View {
                 .font(.largeTitle)
                 .imageScale(.large)
                 .foregroundStyle(Theme.good)
+                .accessibilityHidden(true)
             Text("燒好了")
                 .font(.title2.weight(.bold))
                 .foregroundStyle(.white)
@@ -137,6 +140,7 @@ struct CaptionBurnView: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.largeTitle)
                 .foregroundStyle(.yellow)
+                .accessibilityHidden(true)
             Text("沒有燒成功")
                 .font(.headline)
                 .foregroundStyle(.white)
