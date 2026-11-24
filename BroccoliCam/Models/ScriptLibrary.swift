@@ -265,10 +265,11 @@ final class ScriptLibrary: ObservableObject {
     }
 
     /// 還沒有列表檔：舊版唯一那篇稿子變成第一篇。寫了檔之後就不會再走到這裡。
+    /// 沒有稿子就先不寫檔：系統可能在設定還讀不到的時候就先把 App 叫起來，
+    /// 那時寫了空列表，下次就不會再搬，舊稿子會被空列表蓋掉。
     private func migrate() {
-        if settings.hasScript {
-            items = [ScriptItem(body: settings.script)]
-        }
+        guard settings.hasScript else { return }
+        items = [ScriptItem(body: settings.script)]
         finishStructuralChange()
     }
 

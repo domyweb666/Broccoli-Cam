@@ -63,6 +63,7 @@ final class FramePipeline: NSObject {
     private var counts = Counts()
     private var lastFrameSize: CGSize = .zero
     private var lastFrameAt: CFTimeInterval = 0
+    private var lastFrameTime: CMTime = .invalid
 
     // 以下只在 videoQueue 用
     /// 第一次用到才建（要算幾張色表），不拖慢開 App。
@@ -144,6 +145,24 @@ final class FramePipeline: NSObject {
         lastFrameSize = .zero
         lock.unlock()
     }
+
+    /// 最後一張影格的時間，除錯層用。還沒收到是 nil。
+    var lastTime: CMTime? {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastFrameTime.isNumeric ? lastFrameTime : nil
+    }
+
+    #if targetEnvironment(simulator)
+    /// 現在大概是影格時間的什麼時候。
+    var estimatedTime: CMTime? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard lastFrameTime.isNumeric else { return nil }
+        let passed: Double = CACurrentMediaTime() - lastFrameAt
+        return lastFrameTime + CMTime(seconds: passed, preferredTimescale: 90000)
+    }
+    #endif
 
     var currentCounts: Counts {
         lock.lock()
@@ -292,6 +311,7 @@ final class FramePipeline: NSObject {
         counts.frames += 1
         lastFrameSize = size
         lastFrameAt = CACurrentMediaTime()
+        lastFrameTime = time
         let now: Settings = settings
         let recorder: FrameRecorder? = currentRecorder
         lock.unlock()

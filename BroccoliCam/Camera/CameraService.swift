@@ -633,7 +633,11 @@ final class CameraService: NSObject, ObservableObject {
 
     /// 影格時間用的時鐘。
     private func captureTime() -> CMTime {
-        CMClockGetTime(session.synchronizationClock ?? CMClockGetHostTimeClock())
+        #if targetEnvironment(simulator)
+        // 模擬器的假相機自己編時間，和系統時鐘差很多，用最後一張影格往後推。
+        if let now = pipeline.estimatedTime { return now }
+        #endif
+        return CMClockGetTime(session.synchronizationClock ?? CMClockGetHostTimeClock())
     }
 
     /// landscape：手機橫放，要錄成橫式 16:9。角度交給 RotationCoordinator 依手機實際的擺法決定。請在主執行緒呼叫。
@@ -724,6 +728,14 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     private func videoSettings(width: Int, height: Int) -> [String: Any] {
+        #if targetEnvironment(simulator)
+        // 模擬器的相機是假的，問建議設定會直接閃退。
+        return [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height
+        ]
+        #else
         let codecs = videoDataOutput.availableVideoCodecTypesForAssetWriter(writingTo: .mov)
         let codec: AVVideoCodecType = codecs.contains(.hevc) ? .hevc : .h264
         var settings: [String: Any] = [:]
@@ -735,14 +747,17 @@ final class CameraService: NSObject, ObservableObject {
         settings[AVVideoWidthKey] = width
         settings[AVVideoHeightKey] = height
         return settings
+        #endif
     }
 
     /// 沒有麥克風就回 nil，只錄畫面。
     private func audioSettings() -> [String: Any]? {
         guard audioDataOutput.connection(with: .audio) != nil else { return nil }
+        #if !targetEnvironment(simulator)
         if let recommended = audioDataOutput.recommendedAudioSettingsForAssetWriter(writingTo: .mov) {
             return recommended
         }
+        #endif
         return [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 44100,
@@ -794,7 +809,7 @@ final class CameraService: NSObject, ObservableObject {
 
     /// 在前景不計時，進了背景才會用到。
     private func beginRecordingTask() {
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [self] in
             guard self.recordingTask == .invalid else { return }
             self.recordingTask = UIApplication.shared.beginBackgroundTask(withName: "broccoli-recording") { [weak self] in
                 self?.endRecordingTask()
@@ -1134,6 +1149,9 @@ final class CameraService: NSObject, ObservableObject {
         let frames = pipeline.currentCounts
         let preview = pipeline.renderer.counts
         lines.append("影格 收到 \(frames.frames) 丟 \(frames.late) · 預覽 \(metalPreviewOn ? "處理過" : "原生") 畫 \(preview.drawn) 略過 \(preview.skipped)")
+        if let last = pipeline.lastTime {
+            lines.append(String(format: "影格時間 比時鐘晚 %.0f 毫秒", (captureTime() - last).seconds * 1000))
+        }
         if let recorder = pipeline.recorder {
             let written = recorder.currentCounts
             lines.append("寫檔 \(written.frames) 格 來不及 \(written.notReady) 算圖失敗 \(written.renderFailed) 聲音丟 \(written.audioDropped) · 音軌\(recorder.hasAudio ? "有" : "無")")
