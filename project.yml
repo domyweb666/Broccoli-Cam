@@ -34,7 +34,7 @@ targets:
           - "org.domyweb.broccolicam.burn.*"
         NSCameraUsageDescription: 需要使用相機來錄製你的口播影片。
         NSMicrophoneUsageDescription: 需要使用麥克風來錄製你的聲音。
-        NSSpeechRecognitionUsageDescription: 需要語音辨識，提詞才能跟著你唸到的地方走，也才能用你的稿子幫影片對出字幕。
+        NSSpeechRecognitionUsageDescription: 需要語音辨識，提詞才能跟著你唸到的地方走、錄完幫你檢查有沒有漏講或講錯，也才能用你的稿子幫影片對出字幕。
         NSPhotoLibraryAddUsageDescription: 需要權限才能把錄好的影片存到照片圖庫。
     settings:
       base:

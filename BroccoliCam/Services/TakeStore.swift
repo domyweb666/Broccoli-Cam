@@ -232,15 +232,15 @@ final class TakeStore: @unchecked Sendable {
         do {
             try writeOnce(manifest)
         } catch {
-            // 多半是硬碟滿了。放掉預留的空間再試一次，這樣才寫得下「這個檔可以刪了」。
+            // 多半是硬碟滿了。聽到的字先不存，不要吃掉預留的空間，清單寫得進去才要緊。
+            let light = manifest.withoutHearings
+            if light != manifest, (try? writeOnce(light)) != nil { return light }
+            // 放掉預留的空間再試一次，這樣才寫得下「這個檔可以刪了」。
             try? FileManager.default.removeItem(at: url(Self.reserveName))
             do {
-                try writeOnce(manifest)
-                return manifest
+                try writeOnce(light)
+                return light
             } catch {
-                // 聽到的字可能比預留的空間還大，先不存它，清單要寫得進去才要緊。
-                let light = manifest.withoutHearings
-                if light != manifest, (try? writeOnce(light)) != nil { return light }
                 onLog?("錄影清單沒存成功：\(error.localizedDescription)")
                 return nil
             }

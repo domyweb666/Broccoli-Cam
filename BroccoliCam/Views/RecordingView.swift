@@ -184,8 +184,7 @@ struct RecordingView: View {
     private func sideStrip(previewHeight: CGFloat) -> some View {
         let topInset: CGFloat = previewHeight * 0.40 + 20
         let length: CGFloat = max(200, min(previewHeight - topInset - 110, 440))
-        let checkHeight: CGFloat = viewModel.pendingCheck.map { TakeCheckCard.height([$0]) + 8 } ?? flagHeight
-        let thickness: CGFloat = viewModel.isSegmented ? 150 + checkHeight : 44
+        let thickness: CGFloat = viewModel.isSegmented ? 150 + cardHeight + extraHeight : 44
         let edge: Alignment = uiAngle > 0 ? .leading : .trailing
         return statusAndSegments
             .frame(width: length)
@@ -387,7 +386,11 @@ struct RecordingView: View {
         }) {
             ScriptListView()
         }
-        .sheet(isPresented: $showSettings, onDismiss: { viewModel.reconsiderScript() }) {
+        .sheet(isPresented: $showSettings, onDismiss: {
+            viewModel.reconsiderScript()
+            // 字幕一行的字數、語音辨識的權限都可能在裡面變了。
+            viewModel.syncChecks()
+        }) {
             SettingsView(hasTakes: hasTakes, onCaptionEditing: { open in captionEditing(open) })
         }
         .sheet(isPresented: $showModes, onDismiss: { viewModel.reconsiderScript() }) {
@@ -493,13 +496,23 @@ struct RecordingView: View {
 
     /// 底下的狀態列、分段列、控制列蓋進預覽區多少。視訊通話的自己小窗要放在這之上。
     private func controlsOverlap(screenHeight: CGFloat, previewHeight: CGFloat) -> CGFloat {
-        let controls: CGFloat = 130 + (viewModel.isSegmented ? 110 + flagHeight : 0)
+        let controls: CGFloat = 130 + (viewModel.isSegmented ? 110 + extraHeight : 0)
         return max(0, controls - (screenHeight - previewHeight))
     }
 
-    /// 「第 2 段有 1 處」那一列多佔的高度。沒有「接成一支」的按鈕時，原本就留了一列的位置。
-    private var flagHeight: CGFloat {
-        viewModel.allRecorded && !viewModel.checkFlags.isEmpty ? 52 : 0
+    /// 剛錄完那一段的小卡多高。
+    private var cardHeight: CGFloat {
+        guard let entry = viewModel.pendingCheck else { return 0 }
+        return TakeCheckCard.height([entry], maxRows: TakeCheckCard.compactRows) + 8
+    }
+
+    /// 「第 2 段有 1 處」和「聲音會送到 Apple 辨識」多佔的高度。分段列原本就留了一列按鈕的位置。
+    private var extraHeight: CGFloat {
+        let hasButtons: Bool = viewModel.allRecorded || viewModel.pending != nil
+        var rows: CGFloat = hasButtons ? 54 : 0
+        if !viewModel.checkFlags.isEmpty { rows += 52 }
+        if viewModel.showsCheckSending { rows += 26 }
+        return max(0, rows - 54)
     }
 
     /// 目前這段（或整篇）稿件預估要講多久；沒有稿件時不顯示。
@@ -535,7 +548,10 @@ struct RecordingView: View {
     /// 有稿子要唸、又開著語音跟隨，先把辨識權限問完，不要等按了錄影才跳出來。
     private func askSpeechIfNeeded() {
         guard settings.voiceFollow, settings.usesPrompter, SpeechFollower.isUndetermined else { return }
-        SpeechFollower.requestAuthorization { _ in }
+        SpeechFollower.requestAuthorization { granted in
+            // 之前錄的沒有權限檢查，現在可以了。
+            if granted { viewModel.syncChecks() }
+        }
     }
 
     /// 從設定打開或關掉字幕校對頁。校對頁自己會停相機，關掉再叫起來。
@@ -1190,9 +1206,9 @@ private struct SegmentBar: View {
                             .font(.subheadline)
                             .foregroundStyle(Theme.good)
                     }
-                    if viewModel.currentIsUnchecked {
+                    if let note = viewModel.currentCheckNote {
                         // 錄好了的勾不可以讓人以為檢查過。
-                        Text("沒檢查到")
+                        Text(note)
                             .font(.footnote)
                             .foregroundStyle(.yellow)
                     }
@@ -1214,8 +1230,18 @@ private struct SegmentBar: View {
             .foregroundStyle(.white)
 
             if let entry = viewModel.pendingCheck {
-                TakeCheckCard(entries: [entry], sendsAudioOut: viewModel.checker.sendsAudioOut) { _, issue in
+                TakeCheckCard(entries: [entry], sendsAudioOut: viewModel.checker.sendsAudioOut,
+                              maxRows: TakeCheckCard.compactRows) { _, issue in
                     viewModel.openPendingCheck(issue)
+                }
+            }
+
+            if viewModel.showsCheckSending {
+                HStack(spacing: 8) {
+                    Text("檢查中")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                    CaptionNetworkLine()
                 }
             }
 

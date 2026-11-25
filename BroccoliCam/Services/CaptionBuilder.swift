@@ -29,7 +29,8 @@ enum CaptionBuilder {
         }
         var engine = Engine.off
         // 全部聽過就不碰辨識，沒有網路也做得出來。
-        if remembered.count < clips.count {
+        let mustListen: Bool = remembered.count < clips.count
+        if mustListen {
             engine = try await Engine.prepare()
             if engine.isOff {
                 // 有稿子就照字數平均排時間，還是給得出字幕；沒稿子就真的做不了。
@@ -40,8 +41,8 @@ enum CaptionBuilder {
             }
         }
         if !remembered.isEmpty { log("字幕：\(remembered.count) 段沿用錄完檢查聽到的字") }
-        // 整支都沒有辨識。
-        let isOff = engine.isOff && remembered.isEmpty
+        // 有段落要聽卻不能辨識。有的段沿用聽過的，其他段沒辨識的原因一樣要講。
+        let isOff: Bool = mustListen && engine.isOff
 
         let total = max(0.1, clips.reduce(0) { $0 + $1.duration })
         var done = 0.0
@@ -83,6 +84,8 @@ enum CaptionBuilder {
             let outcome = CaptionAligner.lines(script: item.clip.script, words: hearing.words.map { $0.word },
                                                failed: hearing.failed, duration: item.duration, maxChars: maxChars,
                                                boundaries: CaptionBreaker.wordBoundaries)
+            // 幾乎沒聽到的不交出去，下次才會再聽。
+            if outcome.heardLittle(words: hearing.words.count, duration: item.duration) { hearings[index] = nil }
             keyCount += outcome.keyCount
             hitCount += outcome.hitCount
             for line in outcome.lines {
@@ -167,6 +170,8 @@ enum CaptionBuilder {
                                     end: min(item.duration, word.end - start))
             return HeardWord(word: moved, confidence: nil)
         }
+        // 留下來的範圍裡一個字都沒有，等於沒聽到。
+        guard !hearing.words.isEmpty || !hasWords(item.clip.script) else { return nil }
         return hearing
     }
 

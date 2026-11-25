@@ -17,6 +17,8 @@ final class TakeChecker: ObservableObject {
     struct Job: Equatable {
         let url: URL
         let script: String
+        /// 字幕一行幾個字。
+        let maxChars: Int
         /// 之前聽過的。
         let hearing: TakeHearing?
 
@@ -30,7 +32,7 @@ final class TakeChecker: ObservableObject {
 
     /// 照檔名記。
     @Published private(set) var checks: [String: TakeCheck] = [:]
-    /// 正在聽的這支要把聲音送出去。
+    /// 正在聽，而且要把聲音送出去。沒有在聽就是 false。
     @Published private(set) var sendsAudioOut = false
     /// 聽完一支。
     var onHeard: ((String, TakeHearing) -> Void)?
@@ -42,6 +44,8 @@ final class TakeChecker: ObservableObject {
     private var task: Task<Void, Never>?
     /// 取消過的那一次晚回來不算。
     private var ticket = 0
+    /// 沒檢查到的最多再試幾次，不要每次回到前景都重聽。
+    private static let mostRetries = 3
 
     /// 稿子裡有會唸出來的字才有東西可以比。
     static func canCheck(_ script: String) -> Bool {
@@ -55,13 +59,18 @@ final class TakeChecker: ObservableObject {
         var next: [String: TakeCheck] = [:]
         for job in wanted {
             guard var known = checks[job.file], known.script == job.script else {
-                next[job.file] = TakeCheck(script: job.script)
+                next[job.file] = TakeCheck(script: job.script, maxChars: job.maxChars)
                 continue
             }
             // 上次沒聽全，後來對字幕時聽全了，拿那份再比一次。
             let hadAll: Bool = known.hearing?.isComplete ?? false
             let hasAll: Bool = job.hearing?.isComplete ?? false
             if known.isFinished, hasAll, !hadAll { known.state = TakeCheck.State.waiting }
+            if known.maxChars != job.maxChars {
+                known.maxChars = job.maxChars
+                // 聽過的拿來重比就好。沒聽全的不為了這個再聽一次。
+                if hasAll || !known.isFinished { known.state = TakeCheck.State.waiting }
+            }
             next[job.file] = known
         }
         if next != checks { checks = next }
@@ -76,7 +85,20 @@ final class TakeChecker: ObservableObject {
             stopRunning()
         } else {
             guard holds.remove(reason) != nil else { return }
+            if reason == Hold.background { retryFailed() }
             pump()
+        }
+    }
+
+    /// 沒檢查到的回到前景再試，多半是當時沒有網路。
+    private func retryFailed() {
+        for job in jobs {
+            guard var check = checks[job.file], check.isFinished, check.retries < Self.mostRetries,
+                  !(check.hearing?.isComplete ?? false) else { continue }
+            check.retries += 1
+            check.earlier = check.report
+            check.state = TakeCheck.State.waiting
+            checks[job.file] = check
         }
     }
 
@@ -89,11 +111,16 @@ final class TakeChecker: ObservableObject {
         if checks[file]?.state == TakeCheck.State.checking {
             checks[file]?.state = TakeCheck.State.waiting
         }
+        if sendsAudioOut { sendsAudioOut = false }
     }
 
     private func pump() {
-        guard runningFile == nil, holds.isEmpty,
-              let job = jobs.first(where: { checks[$0.file]?.state == TakeCheck.State.waiting }) else { return }
+        guard runningFile == nil else { return }
+        guard holds.isEmpty,
+              let job = jobs.first(where: { checks[$0.file]?.state == TakeCheck.State.waiting }) else {
+            if sendsAudioOut { sendsAudioOut = false }
+            return
+        }
         ticket += 1
         let mine = ticket
         runningFile = job.file
@@ -119,7 +146,7 @@ final class TakeChecker: ObservableObject {
                 hearing = try await CaptionBuilder.hear(job.url, script: job.script)
             }
             try Task.checkCancellation()
-            return .heard(hearing, TakeReport(script: job.script, hearing: hearing))
+            return .heard(hearing, TakeReport(script: job.script, hearing: hearing, maxChars: job.maxChars))
         } catch {
             return .failed(error.localizedDescription)
         }
@@ -132,11 +159,19 @@ final class TakeChecker: ObservableObject {
         let seconds: Double = Date().timeIntervalSince(began)
         switch answer {
         case .heard(let hearing, let report):
-            checks[job.file]?.state = TakeCheck.State.done(report)
-            checks[job.file]?.hearing = hearing
             onLog?(Self.summary(hearing, report, seconds: seconds))
-            // 外面會存起來，接著再叫 sync。
-            if hearing != job.hearing { onHeard?(job.file, hearing) }
+            let earlier: TakeReport? = checks[job.file]?.earlier
+            checks[job.file]?.earlier = nil
+            if let earlier, report.isIncomplete, report.issues.count < earlier.issues.count {
+                // 再聽還是沒聽全，找到的又比較少，留著上次的。
+                checks[job.file]?.state = TakeCheck.State.done(earlier)
+            } else {
+                checks[job.file]?.state = TakeCheck.State.done(report)
+                // 幾乎沒聽到的不留也不存，加字幕、下次打開都重新聽。
+                checks[job.file]?.hearing = report.heardLittle ? nil : hearing
+                // 外面會存起來，接著再叫 sync。
+                if hearing != job.hearing, !report.heardLittle { onHeard?(job.file, hearing) }
+            }
         case .failed(let reason):
             checks[job.file]?.state = TakeCheck.State.failed
             onLog?(String(format: "這段檢查沒成功，花 %.1f 秒：", seconds) + reason)

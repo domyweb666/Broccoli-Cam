@@ -51,6 +51,8 @@ struct VideoReviewView: View {
     @State private var playback: TakePlayback?
     /// 在播放視窗按了重錄，等視窗關掉。
     @State private var retakeFile: String?
+    /// 字幕檔做好的時候播放視窗還開著，等它關掉再分享。
+    @State private var waitingSubtitle: SharedFile?
 
     private enum SubtitleState: Equatable {
         case idle
@@ -146,7 +148,7 @@ struct VideoReviewView: View {
 
     // MARK: - 這段檢查
 
-    /// 接好的看各段，單支就看自己。沒有檢查的（沒有稿子、沒開）不列。
+    /// 接好的看各段，單支就看自己。沒有檢查的不列：全部都沒有是沒開，只有幾段沒有是那幾段沒有稿子。
     private var checkEntries: [TakeCheckEntry] {
         guard video.isStitched else {
             guard let check = checker.checks[video.url.lastPathComponent] else { return [] }
@@ -160,9 +162,11 @@ struct VideoReviewView: View {
 
     @ViewBuilder
     private var checkRow: some View {
-        let entries = checkEntries
+        let entries: [TakeCheckEntry] = checkEntries
+        let unscripted: Int = video.isStitched ? max(0, video.takes.count - entries.count) : 0
         if !entries.isEmpty {
-            TakeCheckCard(entries: entries, sendsAudioOut: checker.sendsAudioOut) { entry, issue in
+            TakeCheckCard(entries: entries, sendsAudioOut: checker.sendsAudioOut,
+                          unscripted: unscripted) { entry, issue in
                 guard playback == nil, captionTicket == nil, !isMakingProject else { return }
                 player?.pause()
                 playback = TakePlayback(url: entry.url, title: entry.title, issues: entry.issues, time: issue.time)
@@ -177,13 +181,20 @@ struct VideoReviewView: View {
         case .saving, .saved: return nil
         case .idle, .failed: break
         }
-        guard !isMakingProject else { return nil }
+        guard !isMakingProject, subtitleState != .working else { return nil }
         return video.isStitched ? "重錄這段" : "重新錄影"
     }
 
     private func playbackClosed() {
-        guard let file = retakeFile else { return }
+        guard let file = retakeFile else {
+            if let waiting = waitingSubtitle {
+                waitingSubtitle = nil
+                sharedSubtitle = waiting
+            }
+            return
+        }
         retakeFile = nil
+        waitingSubtitle = nil
         guard video.isStitched else {
             // 單支丟了就沒了，照樣先問。
             confirmDiscard = true
@@ -364,7 +375,8 @@ struct VideoReviewView: View {
             for clip in project?.clips ?? [] {
                 if let hearing = clip.hearing { onHeard(hearing, clip.file) }
             }
-            checker.hold(.captions, false)
+            // 這中間又按了加字幕的話，等那一次關掉再放行。
+            if captionTicket == nil, !isMakingProject { checker.hold(.captions, false) }
         }
     }
 
@@ -429,7 +441,13 @@ struct VideoReviewView: View {
                 await MainActor.run {
                     checker.hold(.subtitles, false)
                     subtitleState = .done(Self.subtitleNote(result, script: script))
-                    sharedSubtitle = SharedFile(url: result.url)
+                    let file = SharedFile(url: result.url)
+                    // 播放視窗開著，分享選單跳不出來。
+                    if playback == nil {
+                        sharedSubtitle = file
+                    } else {
+                        waitingSubtitle = file
+                    }
                 }
             } catch {
                 await MainActor.run {

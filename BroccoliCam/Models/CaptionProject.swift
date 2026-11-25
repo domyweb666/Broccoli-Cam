@@ -161,9 +161,9 @@ struct TakeHearing: Codable, Equatable {
     var from: Double
     var to: Double
 
-    /// 從頭到尾都聽成了，才可以拿來用。
+    /// 從頭到尾都聽成了，才可以拿來用。一個字都沒有的不算聽成。
     var isComplete: Bool {
-        failed.isEmpty && fileLength > 0 && to > from
+        failed.isEmpty && !words.isEmpty && fileLength > 0 && to > from
     }
 
     init(words: [CaptionWord], failed: [ClosedRange<Double>], engine: String, onDevice: Bool,
@@ -205,6 +205,14 @@ struct TakeHearing: Codable, Equatable {
     }
 }
 
+extension CaptionAligner.Outcome {
+    /// 幾乎沒聽到。這種聽寫不留，下次要重新聽。
+    /// 稿子太長比不動也算 isSparse，但那是聽到了沒比，字數不會這麼少，不用再聽。
+    func heardLittle(words: Int, duration: Double) -> Bool {
+        isSparse && Double(words) < max(60, duration)
+    }
+}
+
 /// 組成影片的一段。單支影片就只有一段。
 struct CaptionClip: Codable, Equatable {
     /// 專案資料夾裡的檔名。
@@ -227,7 +235,8 @@ struct CaptionRecognition: Codable, Equatable {
     var failedRanges: [ClosedRange<Double>] = []
     /// 稿子有多少比例的字找到了時間。沒有稿子是 nil。
     var coverage: Double?
-    /// 整支都沒辨識到的原因（CaptionProblem）。部分失敗不寫。存成字串，之後加新的原因舊版也讀得進來。
+    /// 整支都沒辨識到、或有的段落沿用聽過的而其他段不能辨識，原因是什麼（CaptionProblem）。
+    /// 辨識到一半失敗的不寫。存成字串，之後加新的原因舊版也讀得進來。
     var problem: String?
 }
 

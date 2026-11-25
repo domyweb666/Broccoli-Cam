@@ -884,20 +884,26 @@ final class RecordingViewModel: ObservableObject {
     }
 
     private func checkJobs() -> [TakeChecker.Job] {
-        guard loaded, settings?.takeCheck ?? false, CaptionBuilder.canListenQuietly else { return [] }
+        guard loaded, let settings, settings.takeCheck, CaptionBuilder.canListenQuietly else { return [] }
         var jobs: [TakeChecker.Job] = []
-        func add(_ url: URL, _ script: String) {
+        // 和校對頁用同一個斷行長度，兩邊抓到的才會一樣。
+        let portrait = Int(settings.captionCharsPortrait)
+        let landscape = Int(settings.captionCharsLandscape)
+        func add(_ url: URL, _ script: String, isLandscape: Bool) {
             // 提綱的重點沒有稿子，不檢查。
             guard TakeChecker.canCheck(script) else { return }
-            jobs.append(TakeChecker.Job(url: url, script: script, hearing: hearings[url.lastPathComponent]))
+            jobs.append(TakeChecker.Job(url: url, script: script, maxChars: isLandscape ? landscape : portrait,
+                                        hearing: hearings[url.lastPathComponent]))
         }
         if let pending, pieces.indices.contains(currentIndex) {
-            add(pending.url, pieces[currentIndex].captionScript)
+            add(pending.url, pieces[currentIndex].captionScript, isLandscape: lockedAngle != 0)
         }
         // 接好的那種看各段就好，不用整支再聽一次。
-        if let review, !review.isStitched { add(review.url, review.script) }
+        if let review, !review.isStitched { add(review.url, review.script, isLandscape: review.isLandscape) }
         for index in takes.keys.sorted() where pieces.indices.contains(index) {
-            if let take = takes[index] { add(take.url, pieces[index].captionScript) }
+            if let take = takes[index] {
+                add(take.url, pieces[index].captionScript, isLandscape: takesLandscape ?? false)
+            }
         }
         return jobs
     }
@@ -936,10 +942,19 @@ final class RecordingViewModel: ObservableObject {
         }
     }
 
-    /// 目前這段已經留用、但沒檢查到。
-    var currentIsUnchecked: Bool {
-        guard pending == nil, let take = takes[currentIndex] else { return false }
-        return checker.checks[take.url.lastPathComponent]?.isUnchecked ?? false
+    /// 目前這段已經留用、但沒檢查到或沒聽清楚。
+    var currentCheckNote: String? {
+        guard pending == nil, let take = takes[currentIndex],
+              let check = checker.checks[take.url.lastPathComponent] else { return nil }
+        if check.isUnchecked { return "沒檢查到" }
+        let unclear: Int = check.report?.unclear ?? 0
+        return unclear > 0 ? "沒聽清楚" : nil
+    }
+
+    /// 正在把聲音送出去檢查，而小卡沒有寫（已經留用、或接著錄的段落）。
+    var showsCheckSending: Bool {
+        guard checker.sendsAudioOut else { return false }
+        return pendingCheck?.check.isFinished ?? true
     }
 
     func openPendingCheck(_ issue: TakeIssue) {
@@ -1304,6 +1319,8 @@ final class RecordingViewModel: ObservableObject {
             self.speechAskedAt = nil
             if granted {
                 self.setVoiceFollow(true)
+                // 剛錄完那段之前沒有權限，現在可以檢查了。
+                self.syncChecks()
             } else {
                 if self.settings?.voiceFollow == true { self.settings?.voiceFollow = false }
                 self.showNote("沒有語音辨識權限")

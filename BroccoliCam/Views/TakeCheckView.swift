@@ -8,29 +8,42 @@ struct TakeCheckCard: View {
     let entries: [TakeCheckEntry]
     /// 正在聽的要把聲音送出去。
     let sendsAudioOut: Bool
+    /// entries 以外、沒有稿子的段數。
+    var unscripted: Int = 0
+    /// 連「還有 N 處」最多幾列。
+    var maxRows: Int = 4
     let onOpen: (TakeCheckEntry, TakeIssue) -> Void
 
+    /// 主畫面上少一列，才不會往上蓋到提詞。
+    static let compactRows = 3
     private static let most = 3
     private static let rowHeight: CGFloat = 44
     private static let statusHeight: CGFloat = 36
 
+    /// 列幾條，其餘收成一列「還有 N 處」。
+    private static func listed(_ count: Int, maxRows: Int) -> Int {
+        count <= min(most, maxRows) ? count : min(most, maxRows - 1)
+    }
+
     /// 大概多高，橫放時要先留位置。
-    static func height(_ entries: [TakeCheckEntry]) -> CGFloat {
+    static func height(_ entries: [TakeCheckEntry], maxRows: Int) -> CGFloat {
         let summary = TakeCheckSummary(entries)
-        var result: CGFloat = CGFloat(min(most, summary.rows.count)) * rowHeight
-        if summary.rows.count > most { result += rowHeight }
+        let shown: Int = listed(summary.rows.count, maxRows: maxRows)
+        var result: CGFloat = CGFloat(shown) * rowHeight
+        if summary.rows.count > shown { result += rowHeight }
         if summary.rows.isEmpty || summary.isChecking || summary.note != nil { result += statusHeight }
         return result
     }
 
     var body: some View {
-        let summary = TakeCheckSummary(entries)
+        let summary = TakeCheckSummary(entries, unscripted: unscripted)
+        let shown: Int = Self.listed(summary.rows.count, maxRows: maxRows)
         return VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(summary.rows.prefix(Self.most))) { row in
+            ForEach(Array(summary.rows.prefix(shown))) { row in
                 issueRow(row)
             }
-            if summary.rows.count > Self.most {
-                moreRow(summary.rows[Self.most], count: summary.rows.count - Self.most)
+            if summary.rows.count > shown {
+                moreRow(summary.rows[shown], count: summary.rows.count - shown)
             }
             status(summary)
         }
@@ -75,16 +88,25 @@ struct TakeCheckCard: View {
                 }
             }
             .frame(minHeight: Self.statusHeight)
-        } else if let note = summary.note {
-            Label(note, systemImage: "exclamationmark.triangle")
-                .font(.footnote.weight(.medium))
-                .foregroundStyle(.yellow)
-                .frame(minHeight: Self.statusHeight)
-        } else if summary.isClean {
-            Label("沒問題", systemImage: "checkmark.circle.fill")
-                .font(.footnote.weight(.medium))
-                .foregroundStyle(Theme.good)
-                .frame(minHeight: Self.statusHeight)
+        } else {
+            if let note = summary.note {
+                Label(note, systemImage: "exclamationmark.triangle")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.yellow)
+                    .frame(minHeight: Self.statusHeight)
+            }
+            if let skipped = summary.skipped {
+                // 只檢查了幾段，不打綠勾，免得看成整支都沒問題。
+                Label(skipped, systemImage: "minus.circle")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .frame(minHeight: Self.statusHeight)
+            } else if summary.isClean {
+                Label("沒問題", systemImage: "checkmark.circle.fill")
+                    .font(.footnote.weight(.medium))
+                    .foregroundStyle(Theme.good)
+                    .frame(minHeight: Self.statusHeight)
+            }
         }
     }
 }
