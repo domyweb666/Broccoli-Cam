@@ -61,8 +61,8 @@ struct VideoReviewView: View {
 
     private var prompts: some View {
         screen
-            .confirmationDialog(video.isStitched ? "這支影片還沒儲存" : "這支影片還沒儲存，確定要丟掉重錄？",
-                                isPresented: $confirmDiscard, titleVisibility: .visible) {
+            .alert(video.isStitched ? "這支影片還沒儲存" : "這支影片還沒儲存，確定要丟掉重錄？",
+                   isPresented: $confirmDiscard) {
                 discardButtons
             }
             .alert("錄影有狀況", isPresented: $showNotice) {

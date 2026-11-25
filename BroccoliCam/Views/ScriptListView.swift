@@ -51,12 +51,8 @@ struct ScriptListView: View {
             } message: {
                 Text(importError ?? "")
             }
-            .confirmationDialog(
-                deleteTitle,
-                isPresented: deleteShown,
-                titleVisibility: .visible,
-                presenting: pendingDelete
-            ) { item in
+            // 不用 confirmationDialog：新系統不畫「取消」，刪了不能還原，取消要看得到。
+            .alert(deleteTitle, isPresented: deleteShown, presenting: pendingDelete) { item in
                 Button("刪除", role: .destructive) {
                     withAnimation { library.delete(item.id) }
                 }
@@ -161,7 +157,8 @@ struct ScriptListView: View {
     private func row(_ item: ScriptItem) -> some View {
         let active: Bool = library.isActive(item.id)
         return NavigationLink(value: ScriptRoute(id: item.id)) {
-            ScriptRow(item: item, isActive: active, speechRate: settings.speechRate)
+            ScriptRow(item: item, isActive: active, speechRate: settings.speechRate,
+                      showsDuration: settings.promptAmount != PromptAmount.outline)
         }
         .listRowBackground(active ? Theme.accent.opacity(0.16) : Color.clear)
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
@@ -292,6 +289,8 @@ private struct ScriptRow: View {
     let item: ScriptItem
     let isActive: Bool
     let speechRate: Double
+    /// 提綱是用自己的話講，照字數估的時長不準。
+    let showsDuration: Bool
 
     @Environment(\.dynamicTypeSize) private var typeSize
 
@@ -337,6 +336,7 @@ private struct ScriptRow: View {
 
     private var meta: String {
         let count = ScriptSegments.spokenCount(item.body)
+        guard showsDuration else { return "\(count) 字 · \(ScriptRelativeTime.text(item.updatedAt))" }
         let seconds = ScriptSegments.estimatedSeconds(item.body, charsPerMinute: speechRate)
         let duration = ScriptSegments.formatDuration(seconds)
         return "\(count) 字 · 約 \(duration) · \(ScriptRelativeTime.text(item.updatedAt))"

@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-/// 陪伴模式的聆聽者：決定什麼時候做反應。
+/// 聆聽者：決定什麼時候做反應。
 /// 只看音量，不理解內容、不評分、不出聲。
 /// 「即時反應」開著時跟著停頓和音量走（ListenerReactor），關掉就是講話時隨機點頭。
 /// 這裡只管時機；眨眼、呼吸已經在待機短片裡，播哪支片由 CompanionClipPlayer 決定。

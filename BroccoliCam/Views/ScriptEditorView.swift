@@ -121,7 +121,7 @@ private struct ScriptEditorContent: View {
                     toolbarButtons
                 }
             }
-            .confirmationDialog("清空內文？", isPresented: $confirmClear, titleVisibility: .visible) {
+            .alert("清空內文？", isPresented: $confirmClear) {
                 Button("清空", role: .destructive) {
                     text = ""
                 }
@@ -145,6 +145,7 @@ private struct ScriptEditorContent: View {
                 text: text,
                 speechRate: settings.speechRate,
                 segmented: settings.segmentedRecording,
+                amount: settings.promptAmount,
                 inset: textInset
             )
             bodyEditor
@@ -253,7 +254,8 @@ private struct ScriptEditorContent: View {
             ScriptStatsText(
                 text: text,
                 speechRate: settings.speechRate,
-                segmented: settings.segmentedRecording
+                segmented: settings.segmentedRecording,
+                amount: settings.promptAmount
             )
             .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 4) {
@@ -351,6 +353,7 @@ private struct ScriptStatsText: View {
     let text: String
     let speechRate: Double
     let segmented: Bool
+    let amount: PromptAmount
 
     var body: some View {
         let count: Int = ScriptSegments.spokenCount(text)
@@ -377,6 +380,11 @@ private struct ScriptStatsText: View {
     private func detailText(count: Int) -> String {
         guard count > 0 else { return "" }
         let seconds = ScriptSegments.estimatedSeconds(text, charsPerMinute: speechRate)
+        // 提綱是用自己的話講，照字數估的時長不準。
+        if amount == .outline {
+            let points: Int = ScriptSegments.outline(of: text, segmented: segmented).count
+            return points > 1 ? "\(points) 段" : ""
+        }
         var detail = "約 \(ScriptSegments.formatDuration(seconds))"
         let segments = ScriptSegments.segments(of: text, segmented: segmented).count
         if segments > 1 {
@@ -391,9 +399,11 @@ private struct ScriptSegmentChips: View {
     let text: String
     let speechRate: Double
     let segmented: Bool
+    let amount: PromptAmount
     let inset: CGFloat
 
     private var durations: [String] {
+        guard amount != .outline else { return [] }
         let segments = ScriptSegments.segments(of: text, segmented: segmented)
         guard segments.count > 1 else { return [] }
         return segments.map { segment in

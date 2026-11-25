@@ -17,6 +17,37 @@ struct SavedSession: Codable, Equatable {
     /// 錄 pending 那一刻介面轉的角度。
     var pendingAngle: Double
     var declinedSegments: [String]?
+    /// 各段對字幕用的稿子，重點是空字串。舊檔沒有，等於全部照念。
+    var captionScripts: [String]?
+    /// 各段是不是提綱的重點。舊檔沒有，等於都不是。
+    var points: [Bool]?
+    /// declinedSegments 各段是不是重點。全稿和提綱切出來的字可能一樣，只比字分不出來。
+    var declinedPoints: [Bool]?
+
+    /// 各段。少記的、長度對不上的，都當成照念。
+    var pieces: [ScriptPiece] {
+        segments.indices.map { index in
+            let text: String = segments[index]
+            let isPoint: Bool = Self.value(points, index) ?? false
+            let script: String = Self.value(captionScripts, index) ?? text
+            // 重點一定沒有稿子，不管檔案裡寫什麼。
+            return ScriptPiece(text: text, captionScript: isPoint ? "" : script, isPoint: isPoint)
+        }
+    }
+
+    var declinedPieces: [ScriptPiece]? {
+        declinedSegments.map { texts in
+            texts.indices.map { index in
+                let isPoint: Bool = Self.value(declinedPoints, index) ?? false
+                return isPoint ? ScriptPiece.point(texts[index]) : ScriptPiece.spoken(texts[index])
+            }
+        }
+    }
+
+    private static func value<T>(_ list: [T]?, _ index: Int) -> T? {
+        guard let list, list.indices.contains(index) else { return nil }
+        return list[index]
+    }
 
     /// 已經錄了幾段。
     var count: Int {
@@ -71,7 +102,7 @@ struct SavedVideo: Codable, Equatable {
 
 struct TakeManifest: Codable, Equatable {
     var session: SavedSession?
-    /// 切到陪伴時收著的進度。
+    /// 切到「不看」時收著的進度。
     var shelf: SavedSession?
     var recordings: [SavedRecording] = []
     var videos: [SavedVideo] = []

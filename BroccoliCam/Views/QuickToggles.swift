@@ -7,6 +7,8 @@ struct QuickToggles: View {
     @EnvironmentObject private var settings: SettingsStore
     /// 倒數、錄影、接片中。只剩語音跟隨能按，整條變淡，錄影時才不會分心。
     let isBusy: Bool
+    /// 提綱的重點不跟聲音，這顆就不顯示。
+    let showsVoice: Bool
     let angle: Double
     /// 每一顆的邊長，至少 44。
     let side: CGFloat
@@ -24,7 +26,7 @@ struct QuickToggles: View {
 
     var body: some View {
         VStack(spacing: 4) {
-            if settings.usesPrompter {
+            if showsVoice {
                 voiceButton
             }
             lookButton
@@ -34,42 +36,39 @@ struct QuickToggles: View {
             }
         }
         .padding(3)
-        .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: side / 2 + 3, style: .continuous))
-        .opacity(isBusy ? 0.5 : 1)
+        .background(.black.opacity(isBusy ? 0.18 : 0.35),
+                    in: RoundedRectangle(cornerRadius: side / 2 + 3, style: .continuous))
     }
 
     private var voiceButton: some View {
         QuickButton(systemImage: "waveform", isOn: settings.voiceFollow,
                     label: "語音跟隨", value: settings.voiceFollow ? "開" : "關",
-                    angle: angle, side: side, action: onVoice)
+                    angle: angle, side: side, dim: isBusy ? 0.6 : 1, action: onVoice)
     }
 
     private var lookButton: some View {
         QuickButton(systemImage: "wand.and.stars", isOn: settings.lookEnabled,
                     label: "一鍵優化", value: settings.lookEnabled ? "開" : "關",
-                    angle: angle, side: side, action: onLook)
+                    angle: angle, side: side, dim: isBusy ? 0.25 : 1, action: onLook)
             .disabled(isBusy)
-            .opacity(isBusy ? 0.5 : 1)
     }
 
     private var guideButton: some View {
         QuickButton(systemImage: guideImage, isOn: settings.guideStyle != .off,
                     label: "構圖線", value: settings.guideStyle.label,
-                    angle: angle, side: side) {
+                    angle: angle, side: side, dim: isBusy ? 0.25 : 1) {
             settings.guideStyle = settings.guideStyle.next
         }
         .disabled(isBusy)
-        .opacity(isBusy ? 0.5 : 1)
     }
 
     private var stabilizationButton: some View {
         QuickButton(systemImage: "figure.walk.motion", isOn: stabilization != .off,
                     label: "防抖", value: stabilization.label,
                     angle: angle, side: side,
-                    badge: stabilization == .strong ? "強" : nil,
+                    badge: stabilization == .strong ? "強" : nil, dim: isBusy ? 0.25 : 1,
                     action: nextStabilization)
             .disabled(isBusy)
-            .opacity(isBusy ? 0.5 : 1)
     }
 
     /// 實際生效的強度，不是設定裡選的。
@@ -101,6 +100,8 @@ private struct QuickButton: View {
     let angle: Double
     let side: CGFloat
     var badge: String?
+    /// 變淡只淡圖示本身。整條一起淡的話，錄影中連還能按的那顆都收不到點擊。
+    var dim: Double = 1
     let action: () -> Void
 
     var body: some View {
@@ -110,6 +111,7 @@ private struct QuickButton: View {
                 .animation(.easeInOut(duration: 0.25), value: angle)
                 .frame(width: side, height: side)
                 .background(isOn ? Theme.accent : Color.clear, in: Circle())
+                .opacity(dim)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

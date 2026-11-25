@@ -1,9 +1,15 @@
 import SwiftUI
 import UIKit
 
-/// 主畫面按「提詞／陪伴」跳出來的選單。選了就關掉，直接看效果。
+/// 主畫面按「看多少字」跳出來的選單。選聆聽者擺法才關掉，其他的可以一次調好幾樣。
 struct ModeSheet: View {
+    @EnvironmentObject private var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
+
+    private var height: CGFloat {
+        guard settings.hasListener else { return 330 }
+        return CompanionAssets.available.count > 1 ? 760 : 670
+    }
 
     var body: some View {
         ScrollView {
@@ -11,12 +17,12 @@ struct ModeSheet: View {
                 .padding(20)
                 .padding(.top, 8)
         }
-        .presentationDetents([.height(CompanionAssets.available.count > 1 ? 590 : 500), .large])
+        .presentationDetents([.height(height), .large])
         .presentationDragIndicator(.visible)
     }
 }
 
-/// 模式和聆聽者擺法一起選：上面一顆提詞，下面是陪伴的各種擺法。設定頁和選單共用。
+/// 看多少字、有沒有人聽、看不看自己，三件事分開選。設定頁和選單共用。
 struct ModePicker: View {
     @EnvironmentObject private var settings: SettingsStore
     var onPick: () -> Void = {}
@@ -25,42 +31,53 @@ struct ModePicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Button {
-                settings.companionMode = false
-                onPick()
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "text.alignleft")
-                    Text("提詞")
+            HStack(spacing: 12) {
+                ForEach(PromptAmount.allCases) { amount in
+                    amountButton(amount)
                 }
-                .font(.title3.weight(.semibold))
-                .modifier(ModeCard(selected: !settings.companionMode, height: 64))
             }
-            .buttonStyle(.plain)
-            .accessibilityAddTraits(settings.companionMode ? [] : .isSelected)
-
-            Text("陪伴")
-                .font(.headline)
-                .foregroundStyle(.secondary)
-                .padding(.top, 6)
-
-            if CompanionAssets.available.count > 1 {
-                PersonPicker()
-            }
-
-            LazyVGrid(columns: columns, spacing: 12) {
-                ForEach(CompanionLayout.allCases) { layout in
-                    layoutButton(layout)
-                }
+            SwitchCard(title: "有人聽", systemImage: "person.wave.2.fill", isOn: $settings.hasListener)
+            SwitchCard(title: "不看自己", systemImage: "eye.slash.fill", isOn: $settings.hideSelf)
+            if settings.hasListener {
+                listenerOptions
             }
         }
     }
 
+    @ViewBuilder
+    private var listenerOptions: some View {
+        if CompanionAssets.available.count > 1 {
+            PersonPicker()
+        }
+        LazyVGrid(columns: columns, spacing: 12) {
+            ForEach(CompanionLayout.allCases) { layout in
+                layoutButton(layout)
+            }
+        }
+    }
+
+    private func amountButton(_ amount: PromptAmount) -> some View {
+        let selected: Bool = settings.promptAmount == amount
+        return Button {
+            settings.promptAmount = amount
+        } label: {
+            VStack(spacing: 8) {
+                Image(systemName: amount.symbol)
+                Text(amount.label)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .font(.title3.weight(.semibold))
+            .modifier(ModeCard(selected: selected, height: 80))
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
     private func layoutButton(_ layout: CompanionLayout) -> some View {
-        let selected = settings.companionMode && settings.companionLayout == layout
+        let selected: Bool = settings.companionLayout == layout
         return Button {
             settings.companionLayout = layout
-            settings.companionMode = true
             onPick()
         } label: {
             VStack(spacing: 10) {
@@ -77,7 +94,36 @@ struct ModePicker: View {
     }
 }
 
-/// 聆聽者的頭像橫排。只換人，不會切到陪伴模式，也不關選單，可以一個一個比。
+/// 大顆的開關，一整條都能按。
+private struct SwitchCard: View {
+    let title: String
+    let systemImage: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Toggle(isOn: $isOn) {
+            Label(title, systemImage: systemImage)
+                .font(.title3.weight(.semibold))
+        }
+        .tint(Theme.accent)
+        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, minHeight: 60)
+        .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+extension PromptAmount {
+    /// 選單和主畫面用的圖示。
+    var symbol: String {
+        switch self {
+        case .full: return "text.alignleft"
+        case .outline: return "list.bullet"
+        case .none: return "text.badge.xmark"
+        }
+    }
+}
+
+/// 聆聽者的頭像橫排。只換人，不關選單，可以一個一個比。
 private struct PersonPicker: View {
     @EnvironmentObject private var settings: SettingsStore
 

@@ -28,7 +28,7 @@ struct RemoteSettingsView: View {
         .onDisappear {
             waiting = nil
         }
-        .confirmationDialog("還原成預設的按鍵？", isPresented: $confirmReset, titleVisibility: .visible) {
+        .alert("還原成預設的按鍵？", isPresented: $confirmReset) {
             Button("還原預設", role: .destructive) {
                 settings.remoteBindings = .standard
             }

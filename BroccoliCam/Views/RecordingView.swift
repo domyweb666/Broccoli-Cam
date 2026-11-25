@@ -69,6 +69,7 @@ struct RecordingView: View {
             clipPlayer: clipPlayer,
             phase: viewModel.phase,
             text: viewModel.currentText,
+            isPoint: viewModel.currentIsPoint,
             isMerging: viewModel.isMerging,
             angle: uiAngle,
             size: preview,
@@ -119,6 +120,7 @@ struct RecordingView: View {
             if !showLook {
                 QuickToggles(
                     isBusy: viewModel.isBusy,
+                    showsVoice: settings.usesPrompter && !viewModel.currentIsPoint,
                     angle: uiAngle,
                     side: side,
                     onVoice: { viewModel.toggleVoiceFollow() },
@@ -131,7 +133,8 @@ struct RecordingView: View {
                 .transition(.opacity)
             }
 
-            if settings.usesPrompter {
+            // 重點整張看得到，只有分段錄影要換段時才用得到跳轉鍵。
+            if settings.usesPrompter, !viewModel.currentIsPoint || viewModel.isSegmented {
                 JumpKeys(angle: uiAngle, side: side) { forward in
                     viewModel.jump(forward: forward)
                 }
@@ -214,10 +217,16 @@ struct RecordingView: View {
     /// 和稿子、提詞有關的監聽。
     private var scriptObserved: some View {
         formatObserved
-            .onChange(of: settings.companionMode) { _, _ in
-                viewModel.applyMode()
-                viewModel.prompter.reset()
+            .onChange(of: settings.promptAmount) { _, _ in
+                viewModel.promptAmountChanged()
+                askSpeechIfNeeded()
+            }
+            .onChange(of: settings.hasListener) { _, _ in
+                // 只多一個人或少一個人，段落和稿子都不動。
                 updateCompanion()
+            }
+            .onChange(of: settings.airPodsMic) { _, on in
+                camera.setBluetoothHQ(on)
             }
             .onChange(of: settings.script) { _, _ in
                 // 腳本頁開著時不跟著打字更新，不然改一個字已錄的各段就作廢，關掉那一頁再一次算。
@@ -276,6 +285,7 @@ struct RecordingView: View {
         viewModel.prompter.speed = CGFloat(settings.speed)
         viewModel.deviceAngle = deviceAngle
         UIApplication.shared.isIdleTimerDisabled = true
+        camera.setBluetoothHQ(settings.airPodsMic)
         startCamera()
         updateCompanion()
         askSpeechIfNeeded()
@@ -426,7 +436,7 @@ struct RecordingView: View {
     }
 
     private func updateCompanion() {
-        if settings.companionMode {
+        if settings.hasListener {
             companion.start(meter: camera.meter)
             clipPlayer.start(model: companion)
         } else {
@@ -443,7 +453,8 @@ struct RecordingView: View {
 
     /// 目前這段（或整篇）稿件預估要講多久；沒有稿件時不顯示。
     private var estimate: TimeInterval? {
-        guard settings.usesPrompter else { return nil }
+        // 提綱是用自己的話講，照字數估不準。
+        guard settings.usesPrompter, settings.promptAmount != .outline, !viewModel.currentIsPoint else { return nil }
         return ScriptSegments.estimatedSeconds(viewModel.currentText, charsPerMinute: settings.speechRate)
     }
 
@@ -516,6 +527,8 @@ private struct PreviewStack: View {
     let clipPlayer: CompanionClipPlayer
     let phase: RecordingViewModel.Phase
     let text: String
+    /// 目前這段是提綱的重點。
+    let isPoint: Bool
     let isMerging: Bool
     /// 橫放時字和圖示要轉的角度（±90）；直放是 0。
     let angle: Double
@@ -527,11 +540,18 @@ private struct PreviewStack: View {
     /// 點提詞的某一行。
     let onTapOffset: (Int) -> Void
 
-    /// 陪伴模式下聆聽者的擺法；提詞模式是 nil。
-    /// 橫放時只有圓形頭像和頂部小窗對得上視線（鏡頭在側邊），其他擺法改用頂部小窗。
+    @StateObject private var selfView = SelfViewModel()
+
+    /// 聆聽者的擺法；沒有聆聽者是 nil。
+    /// 有字的時候字要貼著鏡頭，聆聽者只能墊在字的底下，所以只用滿版的兩種；橫放沒有滿版，就不顯示。
+    /// 沒有字、橫放時只有圓形頭像和頂部小窗對得上視線（鏡頭在側邊），其他擺法改用頂部小窗。
     private var layout: CompanionLayout? {
-        guard settings.companionMode else { return nil }
+        guard settings.hasListener else { return nil }
         let chosen = settings.companionLayout
+        if settings.usesPrompter {
+            guard angle == 0 else { return nil }
+            return chosen == .alignFirst ? .alignFirst : .fullCall
+        }
         if angle != 0 && chosen != .circle {
             return .topCard
         }
@@ -544,6 +564,21 @@ private struct PreviewStack: View {
         case .starting, .recording, .finishing: return true
         case .idle, .countdown: return false
         }
+    }
+
+    /// 正在錄，而且選了不看自己。按了停止就看得到。
+    private var hidesSelf: Bool {
+        phase == .recording && settings.hideSelf
+    }
+
+    /// 現在看不到自己。
+    private var selfHidden: Bool {
+        hidesSelf && selfView.isHidden
+    }
+
+    /// 淡掉、淡回來都慢慢來；停止錄影立刻回來。
+    private var selfFade: Animation? {
+        hidesSelf ? .easeInOut(duration: 0.5) : nil
     }
 
     /// 自己的畫面在預覽區裡的位置。一律是完整的 9:16，頭在裡面的位置就是錄出來的位置。
@@ -617,7 +652,9 @@ private struct PreviewStack: View {
 
     /// 提詞已經開始了。
     private var prompting: Bool {
-        settings.usesPrompter && (prompter.isPlaying || prompter.offset > 0)
+        // 重點不會捲，開錄就算開始了。
+        if settings.usesPrompter && isPoint { return isRolling }
+        return settings.usesPrompter && (prompter.isPlaying || prompter.offset > 0)
     }
 
     /// 有稿件時，頭像框只在開始提詞前顯示供對位；提詞開始後淡出。
@@ -653,6 +690,26 @@ private struct PreviewStack: View {
     }
 
     var body: some View {
+        layers
+            .onChange(of: hidesSelf) { _, on in
+                if on {
+                    selfView.start(faces: camera.faces)
+                } else {
+                    selfView.stop()
+                }
+            }
+            .onChange(of: cameraRect.size, initial: true) { _, value in
+                selfView.frame = value
+            }
+            .onChange(of: angle, initial: true) { _, value in
+                selfView.upright = value == 0
+            }
+            .onDisappear {
+                selfView.stop()
+            }
+    }
+
+    private var layers: some View {
         ZStack(alignment: .top) {
             cameraLayer
 
@@ -663,7 +720,7 @@ private struct PreviewStack: View {
             guideLayers
 
             if settings.usesPrompter {
-                prompterLayer
+                promptLayers
             }
 
             jumpNoteLayer
@@ -684,6 +741,8 @@ private struct PreviewStack: View {
                              topReserve: guideTopReserve, strength: settings.guideOpacity)
                 .turned(angle, width: cam.width, height: cam.height)
                 .position(x: cam.midX, y: cam.midY)
+                .opacity(selfHidden ? 0 : 1)
+                .animation(selfFade, value: selfHidden)
                 .transition(.opacity)
                 .zIndex(2)
         }
@@ -691,9 +750,30 @@ private struct PreviewStack: View {
             GridGuideView(strength: gridStrength)
                 .frame(width: cam.width, height: cam.height)
                 .position(x: cam.midX, y: cam.midY)
+                .opacity(selfHidden ? 0 : 1)
+                .animation(selfFade, value: selfHidden)
                 .transition(.opacity)
                 .zIndex(2)
         }
+    }
+
+    @ViewBuilder
+    private var promptLayers: some View {
+        if isPoint {
+            pointLayer
+        } else {
+            prompterLayer
+        }
+    }
+
+    private var pointLayer: some View {
+        PromptPointView(text: text, fontSize: CGFloat(settings.fontSize),
+                        backgroundOpacity: settings.promptBackground)
+            .turned(angle, width: size.width * 0.84,
+                    height: PromptBand.height(previewHeight: size.height, angle: angle))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .padding(.top, PromptBand.top)
+            .zIndex(3)
     }
 
     private var prompterLayer: some View {
@@ -784,6 +864,10 @@ private struct PreviewStack: View {
             .frame(width: cam.width, height: cam.height)
             .clipShape(shape)
             .overlay(shape.stroke(Color.white.opacity(isFull ? 0 : 0.3), lineWidth: 1))
+            // 預覽層不拆也不藏，臉的位置要繼續算。完全透明的 view 系統會當成看不到，
+            // 音量鍵和遙控器的快門就收不到，所以留一點點。
+            .opacity(selfHidden ? 0.012 : 1)
+            .animation(selfFade, value: selfHidden)
             .position(x: cam.midX, y: cam.midY)
             .zIndex(1)
     }
@@ -809,7 +893,7 @@ private struct StatusRow: View {
     let phase: RecordingViewModel.Phase
     let elapsed: TimeInterval
     let estimate: TimeInterval?
-    /// 待機時才能切換提詞／陪伴。
+    /// 待機時才能切換看多少字、有沒有人聽。
     let canSwitchMode: Bool
     @Binding var showModes: Bool
 
@@ -844,23 +928,36 @@ private struct StatusRow: View {
                 Button {
                     showModes = true
                 } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: settings.companionMode ? "person.wave.2.fill" : "text.alignleft")
-                            .font(.caption)
-                        Text(settings.companionMode ? "陪伴" : "提詞")
-                            .font(.caption.weight(.medium))
-                    }
-                    .foregroundStyle(settings.companionMode ? Color.black : Color.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(settings.companionMode ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Color.black.opacity(0.55)),
-                                in: Capsule())
-                    .contentShape(Capsule())
+                    modeLabel
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(settings.companionMode ? "選擇模式，目前是陪伴" : "選擇模式，目前是提詞")
+                .accessibilityLabel(modeName)
             }
         }
+    }
+
+    /// 看多少字；有聆聽者就亮起來。
+    private var modeLabel: some View {
+        let listening: Bool = settings.hasListener
+        let fill: Color = listening ? Theme.accent : Color.black.opacity(0.55)
+        return HStack(spacing: 5) {
+            Image(systemName: settings.promptAmount.symbol)
+            if listening {
+                Image(systemName: "person.wave.2.fill")
+            }
+            Text(settings.promptAmount.label)
+                .fontWeight(.medium)
+        }
+        .font(.caption)
+        .foregroundStyle(listening ? Color.black : Color.white)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(fill, in: Capsule())
+        .contentShape(Rectangle().inset(by: -10))
+    }
+
+    private var modeName: String {
+        "選擇模式，目前是\(settings.promptAmount.label)，\(settings.hasListener ? "有人聽" : "沒有人聽")"
     }
 
     static func format(_ time: TimeInterval) -> String {
@@ -915,20 +1012,29 @@ private struct ControlBar: View {
     @Binding var showScript: Bool
     @Binding var showSettings: Bool
 
+    private var isOff: Bool {
+        settings.promptAmount == PromptAmount.none
+    }
+
+    /// 有字而且會捲。重點是靜止的，播放和回開頭用不到。
+    private var scrolls: Bool {
+        settings.usesPrompter && !viewModel.currentIsPoint
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             BarButton(title: "腳本", systemImage: "doc.text", angle: angle) {
                 showScript = true
             }
-            .disabled(viewModel.isBusy || settings.companionMode)
-            .opacity(settings.companionMode ? 0 : (viewModel.isBusy ? 0.35 : 1))
+            .disabled(viewModel.isBusy || isOff)
+            .opacity(isOff ? 0 : (viewModel.isBusy ? 0.35 : 1))
 
             BarButton(title: prompter.isPlaying ? "暫停" : "提詞",
                       systemImage: prompter.isPlaying ? "pause.fill" : "play.fill", angle: angle) {
                 viewModel.togglePrompter()
             }
-            .opacity(settings.usesPrompter ? 1 : 0)
-            .disabled(!settings.usesPrompter)
+            .opacity(scrolls ? 1 : 0)
+            .disabled(!scrolls)
 
             RecordButton(phase: viewModel.phase) {
                 viewModel.primaryTapped(
@@ -943,8 +1049,8 @@ private struct ControlBar: View {
             BarButton(title: "回開頭", systemImage: "arrow.counterclockwise", angle: angle) {
                 prompter.reset()
             }
-            .opacity(settings.usesPrompter ? 1 : 0)
-            .disabled(!settings.usesPrompter)
+            .opacity(scrolls ? 1 : 0)
+            .disabled(!scrolls)
 
             BarButton(title: "設定", systemImage: "slider.horizontal.3", angle: angle) {
                 showSettings = true
@@ -972,6 +1078,11 @@ private struct SegmentBar: View {
         return "約 " + ScriptSegments.formatDuration(seconds)
     }
 
+    /// 提綱是用自己的話講，照字數估不準。
+    private var showsEstimate: Bool {
+        settings.promptAmount != .outline && !viewModel.currentIsPoint
+    }
+
     private var canStep: Bool {
         !viewModel.isBusy && viewModel.pending == nil
     }
@@ -979,7 +1090,7 @@ private struct SegmentBar: View {
     /// 留用這段之後是不是就全部錄完了。
     private var isLastMissing: Bool {
         let recorded = Set(viewModel.takes.keys).union([viewModel.currentIndex])
-        return recorded.count == viewModel.segments.count
+        return recorded.count == viewModel.pieces.count
     }
 
     private var canGoBack: Bool {
@@ -987,7 +1098,7 @@ private struct SegmentBar: View {
     }
 
     private var canGoForward: Bool {
-        canStep && viewModel.currentIndex < viewModel.segments.count - 1
+        canStep && viewModel.currentIndex < viewModel.pieces.count - 1
     }
 
     var body: some View {
@@ -1005,12 +1116,14 @@ private struct SegmentBar: View {
                 .opacity(canGoBack ? 1 : 0.3)
 
                 HStack(spacing: 6) {
-                    Text("第 \(viewModel.currentIndex + 1)／\(viewModel.segments.count) 段")
+                    Text("第 \(viewModel.currentIndex + 1)／\(viewModel.pieces.count) 段")
                         .font(.subheadline.weight(.semibold))
-                    Text(estimateText)
-                        .font(.footnote)
-                        .foregroundStyle(.white.opacity(0.7))
-                        .monospacedDigit()
+                    if showsEstimate {
+                        Text(estimateText)
+                            .font(.footnote)
+                            .foregroundStyle(.white.opacity(0.7))
+                            .monospacedDigit()
+                    }
                     if viewModel.currentHasTake && viewModel.pending == nil {
                         Image(systemName: "checkmark.circle.fill")
                             .font(.subheadline)

@@ -2,7 +2,7 @@ import SwiftUI
 import AVFoundation
 import UIKit
 
-/// 陪伴模式的聆聽者：播 CompanionClipPlayer 的 9:16 預錄短片。
+/// 聆聽者：播 CompanionClipPlayer 的 9:16 預錄短片。
 /// 只是預覽上的畫面，不會錄進影片，也不會發出聲音。
 /// 所有擺法都用這個 view，差在外框大小和裁法。
 struct CompanionView: View {

@@ -77,6 +77,8 @@ final class CameraService: NSObject, ObservableObject {
     private var desiredFPS = 30
     private var desiredStabilization: StabilizationLevel = .off
     private var mirrorOutput = false
+    /// 要不要用 AirPods 高品質收音。
+    private var desiredBluetoothHQ = false
     /// 目前格式實際的幀率，sessionQueue 讀寫。
     private var activeFPS = 30
     /// 上次要求的曝光補償，sessionQueue 讀寫。裝置讀回來的值會慢慢變、也會四捨五入，拿來比會一直重設。
@@ -213,6 +215,7 @@ final class CameraService: NSObject, ObservableObject {
                 self.session.beginConfiguration()
                 self.applyFormat()
                 self.updateConnections()
+                self.applyBluetoothHQ()
                 self.session.commitConfiguration()
                 // 換格式會把曝光補償和測光點洗掉，補回來。
                 self.applyLookToDevice()
@@ -246,6 +249,49 @@ final class CameraService: NSObject, ObservableObject {
                 self.faces.update(nil)
             }
         }
+    }
+
+    // MARK: - AirPods 收音
+
+    /// 這支手機的系統有沒有 AirPods 高品質收音。
+    static var supportsBluetoothHQ: Bool {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) { return true }
+        #endif
+        return false
+    }
+
+    /// 開關 AirPods 高品質收音。錄影中不動，停下來才套用。
+    func setBluetoothHQ(_ on: Bool) {
+        sessionQueue.async {
+            self.desiredBluetoothHQ = on
+            self.applyBluetoothHQ()
+        }
+    }
+
+    /// 請在 sessionQueue 呼叫。錄影中換收音會斷掉聲音，寫檔器收完再套。
+    private func applyBluetoothHQ() {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            guard isConfigured, !pipeline.isRecording else { return }
+            let wanted: Bool = desiredBluetoothHQ
+            guard session.configuresApplicationAudioSessionForBluetoothHighQualityRecording != wanted else { return }
+            session.beginConfiguration()
+            session.configuresApplicationAudioSessionForBluetoothHighQualityRecording = wanted
+            session.commitConfiguration()
+            log("AirPods 收音 \(wanted ? "開" : "關")")
+        }
+        #endif
+    }
+
+    /// 除錯層用的一行。
+    private func bluetoothHQText() -> String {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            return session.configuresApplicationAudioSessionForBluetoothHighQualityRecording ? "開" : "關"
+        }
+        #endif
+        return "系統不支援"
     }
 
     // MARK: - 預覽
@@ -802,6 +848,8 @@ final class CameraService: NSObject, ObservableObject {
                 self.pipeline.clearRecorder(recorder)
             }
             self.recordingEnded(outcome, url: url)
+            // 錄影中改過的收音設定，現在才套。
+            self.sessionQueue.async { self.applyBluetoothHQ() }
         }
         log("準備錄影 \(width)x\(height) 音軌\(recorder.hasAudio ? "有" : "無")")
         return recorder
@@ -1287,6 +1335,7 @@ final class CameraService: NSObject, ObservableObject {
         audioTapLock.unlock()
         lines.append("音訊 收到 \(packets) 包")
         lines.append("音訊路由 \(meter.route)")
+        lines.append("AirPods 收音 \(bluetoothHQText())")
         let mic: String
         switch meter.micStatus {
         case .ok: mic = "正常"

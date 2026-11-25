@@ -94,7 +94,8 @@ final class RecordingViewModel: ObservableObject {
     @Published private(set) var recoveredCount = 0
 
     // 分段錄影
-    @Published private(set) var segments: [String] = []
+    /// 要錄的各段。
+    @Published private(set) var pieces: [ScriptPiece] = []
     @Published private(set) var currentIndex = 0
     @Published private(set) var takes: [Int: SegmentTake] = [:]
     /// 剛錄完、還沒決定留用或重錄的那一段。
@@ -110,11 +111,11 @@ final class RecordingViewModel: ObservableObject {
     /// 還沒套用的新稿（錄影中、或使用者選了保留已錄的）。
     private var waitingScript: String?
     /// 使用者選了保留時，新稿切出來的段落。同一份不再問。
-    private var declinedSegments: [String]?
-    /// 切到陪伴時收起來的段落。檔案不動，切回提詞原樣放回去。
+    private var declinedPieces: [ScriptPiece]?
+    /// 切到「不看」時收起來的段落。檔案不動，切回有字的原樣放回去。
     private var shelf: SavedSession?
-    /// 現在的段落是照哪個模式切的。
-    private var isCompanion = false
+    /// 現在是不是照「不看」在錄（段落已經收好）。
+    private var isOff = false
     /// 跳轉、切換之後在畫面上閃一下的字，約 1.2 秒自己消失。
     @Published private(set) var jumpNote: String?
     /// 按下錄影那一刻介面轉的角度，錄影中不跟著手機晃動改變。
@@ -192,19 +193,32 @@ final class RecordingViewModel: ObservableObject {
 
     /// 稿件有兩段以上才進分段流程；否則行為和一鏡到底一樣。
     var isSegmented: Bool {
-        segments.count > 1
+        pieces.count > 1
+    }
+
+    /// 目前這一段。
+    private var currentPiece: ScriptPiece? {
+        guard isSegmented, pieces.indices.contains(currentIndex) else { return pieces.first }
+        return pieces[currentIndex]
     }
 
     /// 目前提詞要顯示的文字。
     var currentText: String {
-        guard isSegmented, segments.indices.contains(currentIndex) else {
-            return segments.first ?? ""
-        }
-        return segments[currentIndex]
+        currentPiece?.text ?? ""
+    }
+
+    /// 目前這段是提綱的重點：字不捲、不跟聲音、不等停頓。
+    var currentIsPoint: Bool {
+        currentPiece?.isPoint ?? false
+    }
+
+    /// 整支影片照著唸的稿子，重點不算在內。
+    private var joinedScript: String {
+        pieces.map(\.captionScript).filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
     var allRecorded: Bool {
-        isSegmented && takes.count == segments.count
+        isSegmented && takes.count == pieces.count
     }
 
     var currentHasTake: Bool {
@@ -215,7 +229,7 @@ final class RecordingViewModel: ObservableObject {
         guard self.camera == nil else { return }
         self.camera = camera
         self.settings = settings
-        isCompanion = settings.companionMode
+        isOff = settings.promptAmount == PromptAmount.none
         camera.onRecordingFinished = { [weak self] url, note in
             self?.recordingFinished(url, damaged: note != nil)
         }
@@ -288,21 +302,23 @@ final class RecordingViewModel: ObservableObject {
 
     private func liveSession() -> SavedSession {
         SavedSession(
-            segments: segments, currentIndex: currentIndex, takes: takes.mapValues { $0.saved },
+            segments: pieces.map(\.text), currentIndex: currentIndex, takes: takes.mapValues { $0.saved },
             takesLandscape: takesLandscape, pending: pending?.saved,
-            pendingAngle: lockedAngle, declinedSegments: declinedSegments
+            pendingAngle: lockedAngle, declinedSegments: declinedPieces?.map(\.text),
+            captionScripts: pieces.map(\.captionScript), points: pieces.map(\.isPoint),
+            declinedPoints: declinedPieces?.map(\.isPoint)
         )
     }
 
     /// 把存下來的進度放回畫面。
     private func apply(_ saved: SavedSession) {
-        segments = saved.segments
+        pieces = saved.pieces
         currentIndex = saved.currentIndex
         takes = saved.takes.mapValues { SegmentTake($0, in: store) }
         takesLandscape = saved.takesLandscape
         pending = saved.pending.map { SegmentTake($0, in: store) }
         if saved.pending != nil { lockedAngle = saved.pendingAngle }
-        declinedSegments = saved.declinedSegments
+        declinedPieces = saved.declinedPieces
         prompter.reset()
     }
 
@@ -322,7 +338,7 @@ final class RecordingViewModel: ObservableObject {
         let saved = result.manifest
         recordings = saved.recordings
         videos = saved.videos
-        // 兩個不會同時有東西：分段進度只在提詞模式，切到陪伴就整個收著。
+        // 兩個不會同時有東西：分段進度只在有字的時候，切到「不看」就整個收著。
         recoveredSession = saved.session ?? saved.shelf
         recoveredCount = recoveredSession?.count ?? 0
         loaded = true
@@ -385,10 +401,11 @@ final class RecordingViewModel: ObservableObject {
 
     func resumeRecoveredTakes() {
         recovery = nil
+        let outlined: Bool = recoveredSession?.pieces.contains { $0.isPoint } ?? false
         takeBackSession()
-        // 要接著錄就得看稿；停在陪伴模式的話，那些段落看起來會像不見了。
-        if settings?.companionMode == true {
-            settings?.companionMode = false
+        // 要接著錄就得看稿；停在「不看」的話，那些段落看起來會像不見了。當初用哪一種錄的就切回哪一種。
+        if let settings, settings.promptAmount == PromptAmount.none {
+            settings.promptAmount = outlined ? PromptAmount.outline : PromptAmount.full
             applyMode()
         }
         askRecovery(after: alertGap)
@@ -402,11 +419,11 @@ final class RecordingViewModel: ObservableObject {
         askRecovery(after: alertGap)
     }
 
-    /// 上次的分段進度放回來：提詞模式直接接上，陪伴模式先收著。
+    /// 上次的分段進度放回來：有字的直接接上，選不看的先收著。
     private func takeBackSession() {
         guard let saved = recoveredSession else { return }
         recoveredSession = nil
-        if isCompanion {
+        if isOff {
             shelf = saved
         } else {
             apply(saved)
@@ -459,9 +476,9 @@ final class RecordingViewModel: ObservableObject {
     func updateScript(_ script: String, force: Bool = false) {
         // 模式還沒換好就拿新模式的稿子來比，會誤刪已錄的。
         applyMode()
-        guard split(script) != segments else {
+        guard split(script) != pieces else {
             waitingScript = nil
-            declinedSegments = nil
+            declinedPieces = nil
             return
         }
         waitingScript = script
@@ -470,7 +487,7 @@ final class RecordingViewModel: ObservableObject {
             discardAllTakes()
             return
         }
-        guard split(script) != declinedSegments else { return }
+        guard split(script) != declinedPieces else { return }
         scriptChange = ScriptChange(count: recordedCount)
     }
 
@@ -479,24 +496,38 @@ final class RecordingViewModel: ObservableObject {
         scriptChange = nil
         // 視窗開著時用別的辦法開錄了：現在刪會刪到正在錄的。新稿還記著，回到待機會再問一次。
         guard phase == .idle, !isMerging else { return }
+        // 沒有等著的新稿就沒有換稿這回事，不能刪。
+        guard waitingScript != nil else { return }
         discardAllTakes()
     }
 
     /// 保留已錄的：沿用原本的段落繼續錄，全部清掉之後才套新稿。
     func declineScriptChange() {
         scriptChange = nil
-        declinedSegments = waitingScript.map { split($0) }
+        declinedPieces = waitingScript.map { split($0) }
         persist()
     }
 
-    /// 提詞和陪伴切換。陪伴不看稿，但稿子沒有變，已錄的各段先收著，切回提詞再放回來。
-    /// 這裡不問換稿：選單或設定頁還開著，視窗跳不出來，等那一頁關掉再由 reconsiderScript 看。
+    /// 換了「看多少字」。有字和不看之間收放段落；全稿和提綱切出來不一樣，已經錄了就走換稿那一套。
+    /// 這裡不問換稿：選單或設定頁還開著，視窗跳不出來，先記著，等那一頁關掉再由 reconsiderScript 看。
+    func promptAmountChanged() {
+        applyMode()
+        waitingScript = settings?.activeScript ?? ""
+        // 一段都還沒錄，沒有東西會不見，馬上換給使用者看。
+        if recordedCount == 0 { reconsiderScript() }
+        prompter.reset()
+    }
+
+    /// 有字和不看切換。不看的時候沒有稿，但稿子沒有變，已錄的各段先收著，切回有字再放回來。
+    /// 有沒有聆聽者和段落無關，不會走到這裡。
     func applyMode() {
-        guard let settings, settings.companionMode != isCompanion else { return }
+        guard let settings else { return }
+        let off: Bool = settings.promptAmount == PromptAmount.none
+        guard off != isOff else { return }
         guard phase == .idle, !isMerging, review == nil else { return }
-        isCompanion = settings.companionMode
+        isOff = off
         scriptChange = nil
-        if isCompanion {
+        if off {
             shelveTakes()
         } else {
             restoreTakes()
@@ -528,12 +559,14 @@ final class RecordingViewModel: ObservableObject {
     /// 有等著套用的模式或新稿就再看一次能不能套。
     func reconsiderScript() {
         applyMode()
-        guard let waiting = waitingScript else { return }
-        updateScript(waiting)
+        guard waitingScript != nil else { return }
+        // 等的期間可能又換過看多少字，當時記的稿子配現在的切法會比錯，一律拿現在的。
+        updateScript(settings?.activeScript ?? "")
     }
 
-    private func split(_ script: String) -> [String] {
-        ScriptSegments.segments(of: script, segmented: settings?.segmentedRecording ?? true)
+    private func split(_ script: String) -> [ScriptPiece] {
+        ScriptSegments.pieces(of: script, amount: settings?.promptAmount ?? PromptAmount.full,
+                              segmented: settings?.segmentedRecording ?? true)
     }
 
     private var recordedCount: Int {
@@ -562,9 +595,10 @@ final class RecordingViewModel: ObservableObject {
                     : "前面幾段是直著錄的，請把手機直放再錄這一段。"
                 return
             }
-            self.autoPrompt = autoPrompt
+            // 重點是靜止的，不用播。
+            self.autoPrompt = autoPrompt && !currentIsPoint
             // 唸過的字要變色的話，另一套排版先建好，不要錄到一半才卡一下。
-            if settings?.voiceFollow ?? false { prompter.prepareSpoken(in: currentText) }
+            if settings?.voiceFollow ?? false, !currentIsPoint { prompter.prepareSpoken(in: currentText) }
             if countdown > 0 {
                 startCountdown(countdown)
             } else {
@@ -593,6 +627,7 @@ final class RecordingViewModel: ObservableObject {
     }
 
     func togglePrompter() {
+        guard !currentIsPoint else { return }
         heldByPause = false
         guard phase == .recording else {
             prompter.toggle()
@@ -637,7 +672,7 @@ final class RecordingViewModel: ObservableObject {
         takesLandscape = lockedAngle != 0
         pending = nil
         prompter.reset()
-        let next = (0..<segments.count).first { takes[$0] == nil }
+        let next = (0..<pieces.count).first { takes[$0] == nil }
         if let next { currentIndex = next }
         persist(deleting: replaced.map { [$0.url] } ?? [])
         if next == nil { mergeAll() }
@@ -654,7 +689,7 @@ final class RecordingViewModel: ObservableObject {
     /// 切到前一段／後一段（要重錄某一段時用）。
     func step(_ delta: Int) {
         guard !isBusy, pending == nil, isSegmented else { return }
-        let target = min(segments.count - 1, max(0, currentIndex + delta))
+        let target = min(pieces.count - 1, max(0, currentIndex + delta))
         guard target != currentIndex else { return }
         currentIndex = target
         persist()
@@ -665,7 +700,7 @@ final class RecordingViewModel: ObservableObject {
     func mergeAll() {
         guard allRecorded, !isMerging, pending == nil, !restoring else { return }
         let trim = settings?.trimSilence ?? true
-        let parts: [RecordedPart] = (0..<segments.count).compactMap { index in
+        let parts: [RecordedPart] = (0..<pieces.count).compactMap { index in
             guard let take = takes[index] else { return nil }
             var start: Double?
             var end: Double?
@@ -673,7 +708,7 @@ final class RecordingViewModel: ObservableObject {
                 start = max(0, first - trimLead)
                 end = last + trimTail
             }
-            return RecordedPart(url: take.url, start: start, end: end, script: segments[index])
+            return RecordedPart(url: take.url, start: start, end: end, script: pieces[index].captionScript)
         }
         // 接片和字幕專案用同一組範圍，時間才對得上。
         let clips: [VideoStitcher.Clip] = parts.map { part in
@@ -684,7 +719,7 @@ final class RecordingViewModel: ObservableObject {
         let output = store.url(file)
         let sources = clips.map { $0.url.lastPathComponent }
         // 先記下由哪幾段接成。接完還沒進完成頁就被滑掉，下次才認得出是這一批。
-        recordings.append(SavedRecording(file: file, index: nil, script: segments.joined(separator: "\n"),
+        recordings.append(SavedRecording(file: file, index: nil, script: joinedScript,
                                          angle: lockedAngle, takes: sources))
         persist()
         camera?.log("開始接片：\(clips.count) 段，裁靜音 \(trim ? "開" : "關")")
@@ -697,7 +732,7 @@ final class RecordingViewModel: ObservableObject {
                     self.recordings.removeAll { $0.file == file }
                     self.camera?.log("接片完成")
                     self.show(RecordedVideo(url: output, isStitched: true,
-                                            script: self.segments.joined(separator: "\n"),
+                                            script: self.joinedScript,
                                             isLandscape: self.takesLandscape ?? false, takes: sources,
                                             parts: parts))
                 }
@@ -752,8 +787,8 @@ final class RecordingViewModel: ObservableObject {
         stitchedTakes = []
         if let waiting = waitingScript {
             waitingScript = nil
-            declinedSegments = nil
-            segments = split(waiting)
+            declinedPieces = nil
+            pieces = split(waiting)
         }
         persist(deleting: files)
         prompter.reset()
@@ -802,7 +837,7 @@ final class RecordingViewModel: ObservableObject {
         activeFile = file
         // 稿子存這一段的，救成單支時字幕才對得上。
         recordings.append(SavedRecording(file: file, index: isSegmented ? currentIndex : nil,
-                                         script: currentText, angle: lockedAngle))
+                                         script: currentPiece?.captionScript ?? "", angle: lockedAngle))
         persist()
         let store = self.store
         let url = store.url(file)
@@ -886,7 +921,7 @@ final class RecordingViewModel: ObservableObject {
                 camera?.log("語音跟隨沒有對上稿子，改回固定速度")
                 fallBackToFixedSpeed()
             }
-        } else if settings?.waitOnPause ?? false {
+        } else if settings?.waitOnPause ?? false, !currentIsPoint {
             if wasSpeaking && !speaking && prompter.isPlaying {
                 prompter.pause()
                 heldByPause = true
@@ -912,7 +947,7 @@ final class RecordingViewModel: ObservableObject {
             recordingError = notice
             persist()
         } else {
-            show(RecordedVideo(url: url, script: segments.first ?? "", isLandscape: lockedAngle != 0,
+            show(RecordedVideo(url: url, script: pieces.first?.captionScript ?? "", isLandscape: lockedAngle != 0,
                                notice: notice))
             // 跟隨會從目前讀到的位置開始，下一次重錄要從頭。
             prompter.reset()
@@ -929,7 +964,8 @@ final class RecordingViewModel: ObservableObject {
             return
         }
         let text = currentText
-        guard !text.isEmpty else { return }
+        // 重點整張看得到，沒有東西要跳。
+        guard !text.isEmpty, !currentIsPoint else { return }
         let starts = TeleprompterModel.paragraphStarts(of: text)
         // 只有一個段落，逐段等於不能跳，改成逐行。
         if settings?.jumpMode == .paragraph && starts.count > 1 {
@@ -941,13 +977,13 @@ final class RecordingViewModel: ObservableObject {
 
     /// 點了提詞裡的某一行。
     func jumpTo(utf16Offset: Int) {
-        guard settings?.usesPrompter ?? false, !isMerging, phase != .finishing else { return }
+        guard settings?.usesPrompter ?? false, !currentIsPoint, !isMerging, phase != .finishing else { return }
         moveReading(to: utf16Offset)
     }
 
     private func jumpSegment(forward: Bool) {
         let target = currentIndex + (forward ? 1 : -1)
-        guard segments.indices.contains(target) else {
+        guard pieces.indices.contains(target) else {
             showNote(forward ? "到結尾了" : "到開頭了")
             return
         }
@@ -1036,6 +1072,7 @@ final class RecordingViewModel: ObservableObject {
             guard settings.usesPrompter else { return }
             togglePrompter()
         case .toggleVoice:
+            guard !currentIsPoint else { return }
             toggleVoiceFollow()
         case .toggleJumpMode:
             let next: JumpMode = settings.jumpMode == .paragraph ? .line : .paragraph
@@ -1085,7 +1122,7 @@ final class RecordingViewModel: ObservableObject {
 
     /// 設定改了：錄影中立刻開始或停止跟隨。不在錄影就不用做什麼，開錄時會照設定。重複呼叫沒有關係。
     func applyVoiceFollowSetting() {
-        guard phase == .recording else { return }
+        guard phase == .recording, !currentIsPoint else { return }
         guard settings?.voiceFollow ?? false else {
             guard prompter.isFollowing else { return }
             // 改回固定速度，播放中的繼續播。
@@ -1106,7 +1143,7 @@ final class RecordingViewModel: ObservableObject {
     private func startFollowingIfWanted() {
         followSpeakingTicks = 0
         let text = currentText
-        guard settings?.voiceFollow ?? false, !text.isEmpty, let camera else { return }
+        guard settings?.voiceFollow ?? false, !currentIsPoint, !text.isEmpty, let camera else { return }
         let here = prompter.readingOffset(in: text)
         guard follower.start(text: text, from: here) else {
             camera.log("語音跟隨無法啟動，使用固定速度")

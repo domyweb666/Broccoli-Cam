@@ -89,6 +89,29 @@ struct TeleprompterView: View {
     }
 }
 
+/// 提綱的重點：一張大字，靜止不動，貼著鏡頭。
+/// 比提詞大一點，眼睛掃一下就知道要講什麼；放不下再縮。
+struct PromptPointView: View {
+    let text: String
+    let fontSize: CGFloat
+    let backgroundOpacity: Double
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: fontSize * 1.4, weight: .semibold))
+            .lineSpacing(fontSize * 0.2)
+            .minimumScaleFactor(0.25)
+            .multilineTextAlignment(.center)
+            .foregroundStyle(.white)
+            .shadow(color: .black.opacity(0.6), radius: 4, y: 1)
+            .padding(.horizontal, 14)
+            .padding(.vertical, TeleprompterModel.topPadding)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(Color.black.opacity(backgroundOpacity))
+            .allowsHitTesting(false)
+    }
+}
+
 /// 畫提詞的文字。用的就是換算用的那一份排版，點到哪行、捲到哪行才不會差。
 /// 整篇一鏡到底的稿子很長，只留看得到的那幾行，一行一個小圖層；捲動時只搬位置，不重畫。
 private struct PromptLines: UIViewRepresentable {

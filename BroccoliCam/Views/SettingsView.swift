@@ -73,7 +73,9 @@ struct SettingsView: View {
         Section {
             ModePicker()
                 .padding(.vertical, 8)
-            Toggle("即時反應", isOn: $settings.instantReaction)
+            if settings.hasListener {
+                Toggle("即時反應", isOn: $settings.instantReaction)
+            }
         } header: {
             Text("模式")
         }
@@ -167,6 +169,10 @@ struct SettingsView: View {
             }
             Toggle("接片時裁掉每段頭尾的空白", isOn: $settings.trimSilence)
             Toggle("手機橫放時錄橫式影片", isOn: $settings.autoLandscape)
+            if CameraService.supportsBluetoothHQ {
+                Toggle("AirPods 收音", isOn: $settings.airPodsMic)
+            }
+            Toggle("錄完檢查", isOn: $settings.takeCheck)
         } header: {
             Text("錄影")
         }
