@@ -11,7 +11,8 @@ enum FramingStatus {
 /// 「錄的時候不看自己」：什麼時候看得到自己。純邏輯，只看時間和臉。
 struct SelfViewGate {
     /// 臉不見、或頭出了畫面這麼久就淡回來。
-    static let outLimit: Double = 2
+    /// 臉不見要先等 FaceDetectionService 認定沒有臉（0.6 秒），加起來大約 2 秒。
+    static let outLimit: Double = 1.6
     /// 回到畫面裡這麼久再淡掉。
     static let inLimit: Double = 1
 
@@ -73,7 +74,7 @@ final class SelfViewModel: ObservableObject {
         guard timer == nil else { return }
         gate.reset()
         let next = Timer(timeInterval: 0.2, repeats: true) { [weak self, weak faces] _ in
-            self?.tick(face: faces?.faceRect)
+            self?.tick(face: faces?.recentFace)
         }
         RunLoop.main.add(next, forMode: .common)
         timer = next
@@ -111,12 +112,23 @@ final class FaceDetectionService: ObservableObject {
     @Published private(set) var faceRect: CGRect?
 
     private var clearWork: DispatchWorkItem?
+    /// 最後一次看到臉的時間（systemUptime）。
+    private var lastSeen: Double = 0
+    /// 有臉的回報每 0.33 秒一次，超過這麼久沒有就是真的沒了。
+    private static let recentLimit: Double = 0.6
+
+    /// 剛剛才回報過的臉。faceRect 要 1.5 秒沒有回報才清掉，構圖提示才不會閃；
+    /// 判斷人還在不在畫面裡等不了那麼久。
+    var recentFace: CGRect? {
+        ProcessInfo.processInfo.systemUptime - lastSeen < Self.recentLimit ? faceRect : nil
+    }
 
     /// 必須在主執行緒呼叫。
     func update(_ rect: CGRect?) {
         clearWork?.cancel()
         faceRect = rect
         guard rect != nil else { return }
+        lastSeen = ProcessInfo.processInfo.systemUptime
         // 一段時間沒有新回報就視為沒有臉。
         let work = DispatchWorkItem { [weak self] in
             self?.faceRect = nil

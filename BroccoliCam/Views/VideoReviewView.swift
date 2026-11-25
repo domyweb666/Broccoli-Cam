@@ -417,10 +417,13 @@ struct VideoReviewView: View {
         checker.hold(.subtitles, true)
         let url = video.url
         let script = video.script
+        let whole: [CaptionSource] = heard(video.wholeSource)
+        let parts: [CaptionSource] = video.parts.isEmpty ? [] : heard(video.captionSources)
         let maxChars = Int(settings.subtitleMaxChars)
         Task {
             do {
-                let result = try await SubtitleMaker.make(videoURL: url, script: script, maxChars: maxChars) { message in
+                let result = try await SubtitleMaker.make(videoURL: url, whole: whole, parts: parts,
+                                                          maxChars: maxChars) { message in
                     camera.log(message)
                 }
                 await MainActor.run {
@@ -440,6 +443,8 @@ struct VideoReviewView: View {
 
     private static func subtitleNote(_ result: SubtitleMaker.Result, script: String) -> String {
         let count = "共 \(result.cueCount) 句"
+        // 字幕檔沒有校對頁，這裡不說就沒有人會知道。
+        let doubts = result.doubtCount > 0 ? "有 \(result.doubtCount) 句的數字或字可能和講的不一樣。" : ""
         if script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let failed = result.hasFailures ? "有一段沒辨識到。" : ""
             return "沒有稿子，字幕是直接聽出來的，可能有錯字。\(failed)\(count)。"
@@ -450,12 +455,15 @@ struct VideoReviewView: View {
         if result.hasFailures {
             // 對不太上可能只是因為沒辨識到，這時候列的也不全是聽到的話。
             let unlike = result.coverage < 0.3 ? "聲音和稿子對不太上，" : ""
-            return "\(unlike)有一段沒辨識到，時間是猜的，匯入後請自己調。\(count)。"
+            return "\(unlike)有一段沒辨識到，時間是猜的，匯入後請自己調。\(doubts)\(count)。"
         }
         if result.coverage < 0.3 {
             return "聲音和稿子對不太上，列的是聽到的話。\(count)。"
         }
-        return "\(count)，字用的是你的稿子。"
+        if result.heardCount * 2 > result.cueCount {
+            return "大部分是直接聽出來的，可能有錯字。\(doubts)\(count)。"
+        }
+        return "\(count)，字用的是你的稿子。\(doubts)"
     }
 
     private func save() {

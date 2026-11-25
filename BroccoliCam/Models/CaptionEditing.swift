@@ -60,6 +60,8 @@ enum CaptionEditing {
         second.words = line.words.filter { ($0.start + $0.end) / 2 >= cut }
         second.scriptText = nil
         second.heardText = nil
+        // 併過的有好幾個原因，分不出各在哪半句，兩邊都留著。
+        if line.doubtScripts.count > 1 { return (first, second) }
         // 哪裡不一樣只跟著那個字所在的那半句。
         if let time = line.doubtTime, time < cut {
             second.clearDoubt()
@@ -116,7 +118,9 @@ enum CaptionEditing {
         result.isConfirmed = !(first.blocksBurning || second.blocksBurning)
         result.isHidden = false
         // 還沒看過的原因留著，看過的不用。
-        if !(first.blocksBurning && first.doubt != nil) {
+        if first.blocksBurning, first.doubt != nil {
+            if second.blocksBurning, second.doubt != nil { result.addDoubt(of: second) }
+        } else {
             result.clearDoubt()
             if second.blocksBurning {
                 result.doubt = second.doubt
@@ -317,7 +321,8 @@ enum CaptionEditing {
             count += hits
             var changed = line
             changed.text = line.text.replacingOccurrences(of: find, with: replacement)
-            changed.clearDoubt()
+            // 換掉的是那個數字或字，原因才作廢；只是句子裡別的字換了，還是要看過。
+            if !line.doubtScripts.contains(where: { changed.text.contains($0) }) { changed.clearDoubt() }
             return changed
         }
         return (result, count)

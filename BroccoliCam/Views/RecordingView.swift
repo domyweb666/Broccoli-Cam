@@ -42,17 +42,18 @@ struct RecordingView: View {
 
             previewStack(preview, screenHeight: screen.height)
 
+            // 要在開關和控制列底下，不然會蓋住、吃掉點擊。往下放一點，跳出來的提示才看得到。
+            if settings.showDebug {
+                DebugOverlayView()
+                    .padding(.top, previewHeight * 0.44)
+            }
+
             sideControls(preview, screenHeight: screen.height)
 
             bottomControls
 
             if uiAngle != 0 {
                 sideStrip(previewHeight: previewHeight)
-            }
-
-            if settings.showDebug {
-                DebugOverlayView()
-                    .padding(.top, previewHeight * 0.34)
             }
 
             if showLook {
@@ -77,6 +78,9 @@ struct RecordingView: View {
             jumpNote: viewModel.jumpNote,
             onTapOffset: { offset in
                 viewModel.jumpTo(utf16Offset: offset)
+            },
+            onPointScrolls: { value in
+                viewModel.pointScrollsChanged(value)
             }
         )
         .frame(width: preview.width, height: preview.height)
@@ -134,8 +138,8 @@ struct RecordingView: View {
                 .transition(.opacity)
             }
 
-            // 重點整張看得到，只有分段錄影要換段時才用得到跳轉鍵。
-            if settings.usesPrompter, !viewModel.currentIsPoint || viewModel.isSegmented {
+            // 重點整張看得到的話，只有分段錄影要換段時才用得到跳轉鍵。
+            if settings.usesPrompter, viewModel.currentScrolls || viewModel.isSegmented {
                 JumpKeys(angle: uiAngle, side: side) { forward in
                     viewModel.jump(forward: forward)
                 }
@@ -223,7 +227,7 @@ struct RecordingView: View {
                 viewModel.promptAmountChanged()
                 askSpeechIfNeeded()
             }
-            .onChange(of: settings.hasListener) { _, _ in
+            .onChange(of: showsListener) { _, _ in
                 // 只多一個人或少一個人，段落和稿子都不動。
                 updateCompanion()
             }
@@ -370,8 +374,8 @@ struct RecordingView: View {
         } message: {
             Text(viewModel.recordingError ?? "")
         }
-        .alert("換稿會刪掉已錄的 \(viewModel.scriptChange?.count ?? 0) 段", isPresented: scriptChangeShown) {
-            Button("換稿", role: .destructive) { viewModel.acceptScriptChange() }
+        .alert(scriptChangeTitle, isPresented: scriptChangeShown) {
+            Button(scriptChangeAction, role: .destructive) { viewModel.acceptScriptChange() }
             Button("保留已錄的", role: .cancel) { viewModel.declineScriptChange() }
         }
         .sheet(isPresented: $showScript, onDismiss: {
@@ -464,8 +468,21 @@ struct RecordingView: View {
         )
     }
 
+    private var scriptChangeAction: String {
+        viewModel.scriptChange?.action ?? "換稿"
+    }
+
+    private var scriptChangeTitle: String {
+        "\(scriptChangeAction)會刪掉已錄的 \(viewModel.scriptChange?.count ?? 0) 段"
+    }
+
+    /// 聆聽者現在會不會畫出來。橫放又有字的時候沒有放的位置，不用一直解碼。
+    private var showsListener: Bool {
+        settings.hasListener && !(settings.usesPrompter && uiAngle != 0)
+    }
+
     private func updateCompanion() {
-        if settings.hasListener {
+        if showsListener {
             companion.start(meter: camera.meter)
             clipPlayer.start(model: companion)
         } else {
@@ -575,6 +592,8 @@ private struct PreviewStack: View {
     let jumpNote: String?
     /// 點提詞的某一行。
     let onTapOffset: (Int) -> Void
+    /// 重點是不是放不下、要捲。
+    let onPointScrolls: (Bool) -> Void
 
     @StateObject private var selfView = SelfViewModel()
 
@@ -803,8 +822,9 @@ private struct PreviewStack: View {
     }
 
     private var pointLayer: some View {
-        PromptPointView(text: text, fontSize: CGFloat(settings.fontSize),
-                        backgroundOpacity: settings.promptBackground)
+        PromptPointView(model: prompter, text: text, fontSize: CGFloat(settings.fontSize),
+                        backgroundOpacity: settings.promptBackground,
+                        onTapOffset: onTapOffset, onScrolls: onPointScrolls)
             .turned(angle, width: size.width * 0.84,
                     height: PromptBand.height(previewHeight: size.height, angle: angle))
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -1057,6 +1077,11 @@ private struct ControlBar: View {
         settings.usesPrompter && !viewModel.currentIsPoint
     }
 
+    /// 放不下的重點是用手捲的，也要能一下回到開頭。
+    private var rewinds: Bool {
+        settings.usesPrompter && viewModel.currentScrolls
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             BarButton(title: "腳本", systemImage: "doc.text", angle: angle) {
@@ -1085,8 +1110,8 @@ private struct ControlBar: View {
             BarButton(title: "回開頭", systemImage: "arrow.counterclockwise", angle: angle) {
                 prompter.reset()
             }
-            .opacity(scrolls ? 1 : 0)
-            .disabled(!scrolls)
+            .opacity(rewinds ? 1 : 0)
+            .disabled(!rewinds)
 
             BarButton(title: "設定", systemImage: "slider.horizontal.3", angle: angle) {
                 showSettings = true

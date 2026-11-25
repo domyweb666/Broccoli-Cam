@@ -42,6 +42,8 @@ struct ScriptChange: Identifiable {
     let id = UUID()
     /// 已經錄了幾段。
     let count: Int
+    /// 「換稿」；只是換了看多少字就寫「換成提綱」。
+    let action: String
 }
 
 /// 一段錄好的影片，以及錄影當下量到的「有聲音」範圍（秒）。
@@ -192,8 +194,10 @@ final class RecordingViewModel: ObservableObject {
     private var heldByPause = false
     /// 語音跟隨開著的時候，累計「有在講話」的次數（每次 0.1 秒）。
     private var followSpeakingTicks = 0
-    /// 正在問語音辨識的權限，問完之前不重複問。
-    private var askingSpeech = false
+    /// 什麼時候開始問語音辨識的權限。沒在問是 nil。
+    private var speechAskedAt: Date?
+    /// 問了這麼久沒有回音，再按就重新問，不要卡住。
+    private let speechAskLimit: TimeInterval = 10
 
     /// 判定「有聲音」的門檻（dBFS），比說話偵測寬鬆，寧可少裁。
     private let soundFloor: Float = -45
@@ -223,6 +227,18 @@ final class RecordingViewModel: ObservableObject {
     /// 目前這段是提綱的重點：字不捲、不跟聲音、不等停頓。
     var currentIsPoint: Bool {
         currentPiece?.isPoint ?? false
+    }
+
+    /// 重點太多、一張放不下，要捲著看。由畫面回報。
+    @Published private(set) var pointScrolls = false
+
+    func pointScrollsChanged(_ value: Bool) {
+        if pointScrolls != value { pointScrolls = value }
+    }
+
+    /// 目前的字要不要捲：照念的，或放不下的重點。
+    var currentScrolls: Bool {
+        !currentIsPoint || pointScrolls
     }
 
     /// 整支影片照著唸的稿子，重點不算在內。
@@ -525,7 +541,25 @@ final class RecordingViewModel: ObservableObject {
             return
         }
         guard split(script) != declinedPieces else { return }
-        scriptChange = ScriptChange(count: recordedCount)
+        let amount: PromptAmount = settings?.promptAmount ?? PromptAmount.full
+        let action: String = isAmountChange(split(script)) ? "換成\(amount.label)" : "換稿"
+        scriptChange = ScriptChange(count: recordedCount, action: action)
+    }
+
+    /// 已錄的段落是哪一種切出來的：有重點就是提綱。
+    private var recordedAmount: PromptAmount {
+        let hasPoint: Bool = pieces.contains { $0.isPoint }
+        return hasPoint ? PromptAmount.outline : PromptAmount.full
+    }
+
+    /// 和已錄的不一樣，是因為換了看多少字，不是稿子改了。
+    private func isAmountChange(_ next: [ScriptPiece]) -> Bool {
+        guard let amount = settings?.promptAmount, amount != PromptAmount.none, amount != recordedAmount else {
+            return false
+        }
+        let nextHasPoint: Bool = next.contains { $0.isPoint }
+        let hasPoint: Bool = pieces.contains { $0.isPoint }
+        return nextHasPoint != hasPoint
     }
 
     /// 換稿：已錄的各段作廢。
@@ -539,9 +573,20 @@ final class RecordingViewModel: ObservableObject {
     }
 
     /// 保留已錄的：沿用原本的段落繼續錄，全部清掉之後才套新稿。
+    /// 是換了看多少字才問的，就換回去，不然按鈕寫提綱、畫面上還是全稿。
     func declineScriptChange() {
         scriptChange = nil
-        declinedPieces = waitingScript.map { split($0) }
+        if phase == .idle, let waiting = waitingScript, isAmountChange(split(waiting)) {
+            settings?.promptAmount = recordedAmount
+        }
+        let next: [ScriptPiece]? = waitingScript.map { split($0) }
+        if next == pieces {
+            // 換回去就和已錄的一樣，沒有等著的新稿了。
+            waitingScript = nil
+            declinedPieces = nil
+        } else {
+            declinedPieces = next
+        }
         persist()
     }
 
@@ -1110,8 +1155,8 @@ final class RecordingViewModel: ObservableObject {
             return
         }
         let text = currentText
-        // 重點整張看得到，沒有東西要跳。
-        guard !text.isEmpty, !currentIsPoint else { return }
+        // 整張看得到的重點沒有東西要跳。
+        guard !text.isEmpty, currentScrolls else { return }
         let starts = TeleprompterModel.paragraphStarts(of: text)
         // 只有一個段落，逐段等於不能跳，改成逐行。
         if settings?.jumpMode == .paragraph && starts.count > 1 {
@@ -1123,7 +1168,7 @@ final class RecordingViewModel: ObservableObject {
 
     /// 點了提詞裡的某一行。
     func jumpTo(utf16Offset: Int) {
-        guard settings?.usesPrompter ?? false, !currentIsPoint, !isMerging, phase != .finishing else { return }
+        guard settings?.usesPrompter ?? false, currentScrolls, !isMerging, phase != .finishing else { return }
         moveReading(to: utf16Offset)
     }
 
@@ -1156,6 +1201,10 @@ final class RecordingViewModel: ObservableObject {
             target = spokenCount(from: starts[current], to: here, in: text) > 3 ? current : current - 1
         }
         moveReading(to: starts[target])
+        if currentIsPoint {
+            showNote("第 \(target + 1) 點")
+            return
+        }
         // 分段錄影裡的是「這一段裡的小段」，不要和分段列的第幾段混在一起。
         showNote(isSegmented ? "第 \(target + 1) 小段" : "第 \(target + 1) 段")
     }
@@ -1233,6 +1282,8 @@ final class RecordingViewModel: ObservableObject {
 
     /// 開關語音跟隨。還沒有權限就先問，沒給就維持關著。
     func toggleVoiceFollow() {
+        // 看起來沒反應的時候，要分得出是沒按到、還是按到了沒效果。
+        logVoicePress()
         guard let settings else { return }
         if settings.voiceFollow {
             setVoiceFollow(false)
@@ -1242,11 +1293,15 @@ final class RecordingViewModel: ObservableObject {
             setVoiceFollow(true)
             return
         }
-        guard !askingSpeech else { return }
-        askingSpeech = true
+        if isAskingSpeech {
+            showNote("正在等語音辨識權限")
+            return
+        }
+        speechAskedAt = Date()
         SpeechFollower.requestAuthorization { [weak self] granted in
-            guard let self else { return }
-            self.askingSpeech = false
+            // 等太久又問了一次的話，兩次會一起回來，只算一次。
+            guard let self, self.speechAskedAt != nil else { return }
+            self.speechAskedAt = nil
             if granted {
                 self.setVoiceFollow(true)
             } else {
@@ -1254,6 +1309,21 @@ final class RecordingViewModel: ObservableObject {
                 self.showNote("沒有語音辨識權限")
             }
         }
+    }
+
+    private func logVoicePress() {
+        let isOn: Bool = settings?.voiceFollow ?? false
+        let asking: Bool = speechAskedAt != nil
+        var text = "按了語音跟隨：\(phase)，設定 \(isOn ? "開" : "關")"
+        text += "，跟隨中 \(prompter.isFollowing ? "是" : "否")，提詞 \(prompter.isPlaying ? "播" : "停")"
+        text += "，權限 \(SpeechFollower.authorizationText)，正在問 \(asking ? "是" : "否")"
+        camera?.log(text)
+    }
+
+    /// 權限視窗還沒答。已經有答案、或等太久了都不算在問。
+    private var isAskingSpeech: Bool {
+        guard let speechAskedAt, SpeechFollower.isUndetermined else { return false }
+        return Date().timeIntervalSince(speechAskedAt) < speechAskLimit
     }
 
     private func setVoiceFollow(_ on: Bool) {

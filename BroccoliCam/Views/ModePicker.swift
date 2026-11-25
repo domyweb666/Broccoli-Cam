@@ -94,21 +94,39 @@ struct ModePicker: View {
     }
 }
 
-/// 大顆的開關，一整條都能按。
+/// 大顆的開關，一整條都能按。Toggle 只有右邊那一小塊會切，所以外面包一顆按鈕。
 private struct SwitchCard: View {
     let title: String
     let systemImage: String
     @Binding var isOn: Bool
 
     var body: some View {
-        Toggle(isOn: $isOn) {
+        Button {
+            isOn.toggle()
+        } label: {
+            card
+        }
+        .buttonStyle(.plain)
+        .accessibilityRepresentation {
+            Toggle(title, isOn: $isOn)
+        }
+    }
+
+    private var card: some View {
+        HStack(spacing: 12) {
             Label(title, systemImage: systemImage)
                 .font(.title3.weight(.semibold))
+                .foregroundStyle(Color.white)
+            Spacer(minLength: 0)
+            Toggle(title, isOn: $isOn)
+                .labelsHidden()
+                .tint(Theme.accent)
+                .allowsHitTesting(false)
         }
-        .tint(Theme.accent)
         .padding(.horizontal, 16)
         .frame(maxWidth: .infinity, minHeight: 60)
         .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .contentShape(Rectangle())
     }
 }
 

@@ -90,25 +90,52 @@ struct TeleprompterView: View {
 }
 
 /// 提綱的重點：一張大字，靜止不動，貼著鏡頭。
-/// 比提詞大一點，眼睛掃一下就知道要講什麼；放不下再縮。
+/// 比提詞大一點，眼睛掃一下就知道要講什麼；放不下再縮，縮到最小還放不下就改成可以用手或跳轉鍵捲的。
 struct PromptPointView: View {
+    let model: TeleprompterModel
     let text: String
     let fontSize: CGFloat
     let backgroundOpacity: Double
+    /// 可以捲的時候，點了某一行。
+    var onTapOffset: ((Int) -> Void)? = nil
+    /// 是不是放不下、要捲。
+    var onScrolls: (Bool) -> Void = { _ in }
 
     var body: some View {
-        Text(text)
-            .font(.system(size: fontSize * 1.4, weight: .semibold))
-            .lineSpacing(fontSize * 0.2)
-            .minimumScaleFactor(0.25)
-            .multilineTextAlignment(.center)
-            .foregroundStyle(.white)
-            .shadow(color: .black.opacity(0.6), radius: 4, y: 1)
-            .padding(.horizontal, 14)
-            .padding(.vertical, TeleprompterModel.topPadding)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        GeometryReader { geo in
+            card(in: geo.size)
+        }
+    }
+
+    private func card(in size: CGSize) -> some View {
+        let box = CGSize(width: max(0, size.width - 28),
+                         height: max(0, size.height - TeleprompterModel.topPadding * 2))
+        let isReady: Bool = box.width > 1 && box.height > 1
+        let fitted: PromptLayout? = isReady ? model.pointLayout(for: text, in: box, fontSize: fontSize) : nil
+        let scrolls: Bool = isReady && fitted == nil
+        return ZStack {
+            if scrolls {
+                TeleprompterView(model: model, text: text, fontSize: fontSize,
+                                 backgroundOpacity: backgroundOpacity, onTapOffset: onTapOffset)
+            } else {
+                still(fitted, width: box.width, size: size)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .onChange(of: scrolls, initial: true) { _, value in
+            onScrolls(value)
+        }
+    }
+
+    private func still(_ layout: PromptLayout?, width: CGFloat, size: CGSize) -> some View {
+        PromptLines(layout: layout, offset: 0, spoken: 0)
+            .frame(width: width, height: size.height)
+            .frame(width: size.width, height: size.height)
             .background(Color.black.opacity(backgroundOpacity))
             .allowsHitTesting(false)
+            .accessibilityElement()
+            .accessibilityLabel(text)
+            .accessibilityAddTraits(.isStaticText)
     }
 }
 

@@ -100,7 +100,7 @@ private struct QuickButton: View {
     let angle: Double
     let side: CGFloat
     var badge: String?
-    /// 變淡只淡圖示本身。整條一起淡的話，錄影中連還能按的那顆都收不到點擊。
+    /// 錄影時各顆自己淡，還能按的那顆淡得少一點。
     var dim: Double = 1
     let action: () -> Void
 

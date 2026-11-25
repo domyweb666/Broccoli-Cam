@@ -35,16 +35,23 @@ enum SubtitleMaker {
         let recognized: Bool
         /// 有沒有一段沒辨識到。那一段的句子時間是猜的。
         let hasFailures: Bool
+        /// 有幾句是直接聽出來的，不是稿子的字。
+        let heardCount: Int
+        /// 有幾句的數字或字可能和講的不一樣。
+        let doubtCount: Int
     }
 
-    static func make(videoURL: URL, script: String, maxChars: Int,
+    /// parts 是接成這支的各段。有的話一段一段對，每段只拿自己的稿子：提綱的重點沒有稿子，
+    /// 整支拿一份稿子去對，會配到別段重講的地方。單支、拿不到各段的用 whole。
+    static func make(videoURL: URL, whole: [CaptionSource], parts: [CaptionSource], maxChars: Int,
                      log: @escaping (String) -> Void) async throws -> Result {
         let duration = try await AVURLAsset(url: videoURL).load(.duration).seconds
         guard duration > 0 else { throw SubtitleError.noAudio }
-        let clip = CaptionClip(file: videoURL.lastPathComponent, start: nil, end: nil, script: script)
+        let separate: [CaptionBuilder.Clip] = await placed(parts, log: log)
+        let clips: [CaptionBuilder.Clip] = separate.isEmpty
+            ? whole.map { clip($0, offset: 0, duration: duration) } : separate
         let built = try await CaptionBuilder.build(
-            clips: [(url: videoURL, clip: clip, offset: 0, duration: duration)],
-            maxChars: maxChars, log: log, progress: { _ in }
+            clips: clips, maxChars: maxChars, log: log, progress: { _ in }
         )
         let lines = writable(built.lines, duration: duration)
         guard !lines.isEmpty else { throw SubtitleError.nothingToWrite }
@@ -62,7 +69,32 @@ enum SubtitleMaker {
         try SubtitleLines.srt(lines).write(to: url, atomically: true, encoding: .utf8)
         return Result(url: url, cueCount: lines.count, coverage: coverage,
                       recognized: built.recognition.engine != CaptionBuilder.noEngine,
-                      hasFailures: hasFailures)
+                      hasFailures: hasFailures,
+                      heardCount: lines.filter { $0.status == .extra || $0.status == .heard }.count,
+                      doubtCount: lines.filter { $0.doubt != nil }.count)
+    }
+
+    /// 各段在整支影片裡的位置，和接片用同一套算法。沒有各段、或有一段讀不到就回空的。
+    private static func placed(_ parts: [CaptionSource], log: (String) -> Void) async -> [CaptionBuilder.Clip] {
+        guard !parts.isEmpty else { return [] }
+        let clips: [VideoStitcher.Clip] = parts.map { part in
+            VideoStitcher.Clip(url: part.url, start: part.start, end: part.end)
+        }
+        do {
+            let timeline = try await VideoStitcher.composition(clips)
+            return parts.indices.map { index -> CaptionBuilder.Clip in
+                clip(parts[index], offset: timeline.offsets[index], duration: timeline.durations[index])
+            }
+        } catch {
+            log("字幕檔：有一段讀不到，改用接好的整支（\(error.localizedDescription)）")
+            return []
+        }
+    }
+
+    private static func clip(_ source: CaptionSource, offset: Double, duration: Double) -> CaptionBuilder.Clip {
+        let item = CaptionClip(file: source.url.lastPathComponent, start: source.start, end: source.end,
+                               script: source.script, hearing: source.hearing)
+        return (url: source.url, clip: item, offset: offset, duration: duration)
     }
 
     /// 漏講的不進字幕檔；多講的、要確認的都進，剪輯時看得到。

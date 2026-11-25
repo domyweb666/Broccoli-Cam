@@ -67,6 +67,22 @@ struct CaptionLine: Codable, Equatable, Identifiable {
         return "稿子 \(doubtScript)，聽到 \(doubtHeard)"
     }
 
+    /// 稿子寫的那幾個。併過的句子會有好幾個。
+    var doubtScripts: [String] {
+        doubtScript?.components(separatedBy: "、") ?? []
+    }
+
+    /// 併進另一句的原因，兩個都寫出來。
+    mutating func addDoubt(of other: CaptionLine) {
+        guard let mine = doubtScript, let theirs = other.doubtScript else { return }
+        if doubtHeard != nil || other.doubtHeard != nil {
+            doubtHeard = (doubtHeard ?? "沒聽到") + "、" + (other.doubtHeard ?? "沒聽到")
+        }
+        doubtScript = mine + "、" + theirs
+        if other.doubt == .number { doubt = .number }
+        doubtTime = [doubtTime, other.doubtTime].compactMap { $0 }.min()
+    }
+
     /// 字改過了，原因就不一定對。
     mutating func clearDoubt() {
         doubt = nil

@@ -42,6 +42,17 @@ final class SpeechFollower {
         SFSpeechRecognizer.authorizationStatus() == .notDetermined
     }
 
+    /// 除錯紀錄用。
+    static var authorizationText: String {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized: return "已授權"
+        case .denied: return "拒絕"
+        case .restricted: return "受限"
+        case .notDetermined: return "沒問過"
+        @unknown default: return "不明"
+        }
+    }
+
     static func requestAuthorization(_ done: @escaping (Bool) -> Void) {
         SFSpeechRecognizer.requestAuthorization { status in
             DispatchQueue.main.async {

@@ -4,6 +4,9 @@ import UIKit
 /// App 內除錯資訊層：把真機上的格式、FPS、音訊路由與錯誤帶回來。
 /// 開發環境沒有 Mac，這是回報問題的主要依據。
 struct DebugOverlayView: View {
+    /// 左右各讓這麼寬，不蓋到兩側的快速開關和跳轉鍵。
+    private static let sideRoom: CGFloat = 60
+
     @EnvironmentObject private var camera: CameraService
     @EnvironmentObject private var settings: SettingsStore
     @StateObject private var probe = CaptionProbeLog()
@@ -54,9 +57,9 @@ struct DebugOverlayView: View {
             .foregroundStyle(.white)
             .padding(10)
             .frame(maxWidth: .infinity)
-            .frame(height: 250)
+            .frame(height: 210)
             .background(.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .padding(.horizontal, 10)
+            .padding(.horizontal, Self.sideRoom)
         }
     }
 }

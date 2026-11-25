@@ -170,6 +170,7 @@ final class TeleprompterModel: ObservableObject {
     private var fontSize: CGFloat = 26
     private var contentHeight: CGFloat = 0
     private var cachedLayout: PromptLayout?
+    private var cachedPoint: PointFit?
     /// 上一次整篇排版的時間，拉字級時用來節流。
     private var lastBuild: CFTimeInterval = 0
     private var rebuildQueued = false
@@ -395,6 +396,43 @@ final class TeleprompterModel: ObservableObject {
         }
         self.fontSize = fontSize
         return layout(for: text)
+    }
+
+    /// 重點的字級，從大到小試。是提詞字級的幾倍。
+    private static let pointScales: [CGFloat] = [1.4, 1.25, 1.1, 1, 0.9, 0.8]
+    private static let smallestPointScale: CGFloat = 0.7
+    /// 再小就看不清楚了。
+    private static let smallestPoint: CGFloat = 16
+
+    private struct PointFit {
+        let text: String
+        let box: CGSize
+        let fontSize: CGFloat
+        /// 縮到最小還放不下是 nil。
+        let layout: PromptLayout?
+    }
+
+    /// 重點整張放得進 box 的最大字級，行距跟著字級縮。縮到最小還放不下是 nil，畫面改成可以捲的。
+    func pointLayout(for text: String, in box: CGSize, fontSize: CGFloat) -> PromptLayout? {
+        if let known = cachedPoint, known.text == text, known.box == box, known.fontSize == fontSize {
+            return known.layout
+        }
+        func fitted(_ scale: CGFloat) -> PromptLayout? {
+            let built = PromptLayout(text: text, width: box.width, fontSize: max(Self.smallestPoint, fontSize * scale),
+                                     spokenColor: UIColor(Theme.good))
+            return built.height <= box.height ? built : nil
+        }
+        // 先試最小的。長稿放不下的話，排這一次就知道了。
+        var found: PromptLayout? = fitted(Self.smallestPointScale)
+        if found != nil {
+            for scale in Self.pointScales {
+                guard let larger = fitted(scale) else { continue }
+                found = larger
+                break
+            }
+        }
+        cachedPoint = PointFit(text: text, box: box, fontSize: fontSize, layout: found)
+        return found
     }
 
     private func queueRebuild() {
