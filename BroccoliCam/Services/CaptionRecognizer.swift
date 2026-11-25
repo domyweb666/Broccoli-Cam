@@ -240,7 +240,8 @@ final class SystemCaptionRecognizer: CaptionRecognizing {
 /// 測試用：模擬器沒有中文辨識，照稿子編出聽到的字和時間。
 /// UserDefaults 的 debugFakeCaptions 寫情境，用逗號隔開：normal、missing（漏第二句）、extra（第一句後面多講）、
 /// repeat（第一句講兩次）、misheard（最後一句一半聽錯）、fail（後半辨識失敗）、silent（什麼都沒聽到）、
-/// offline（沒有網路）、unavailable（不能辨識）、timeout（整支等不到回應）、mixed（漏、多、重講、聽錯一次來）。
+/// offline（沒有網路）、unavailable（不能辨識）、timeout（整支等不到回應）、mixed（漏、多、重講、聽錯一次來）、
+/// number（第一個數字講成別的）、negate（拿掉或加上一個「不」）。
 struct FakeCaptionRecognizer: CaptionRecognizing {
     static var scenario: Set<String>? {
         guard let text = UserDefaults.standard.string(forKey: "debugFakeCaptions"), !text.isEmpty else { return nil }
@@ -283,6 +284,8 @@ struct FakeCaptionRecognizer: CaptionRecognizing {
         let source = SpokenKeys.keys(of: script).isEmpty ? "這支影片沒有稿子。我是直接想到什麼就講什麼。" : script
         var sentences = CaptionBreaker.sentences(CaptionBreaker.glyphs(of: source))
             .map { String($0.map { $0.character }) }
+        if scenario.contains("number") { sentences = changingNumber(sentences) }
+        if scenario.contains("negate") { sentences = negating(sentences) }
         if scenario.contains("misheard"), let last = sentences.last {
             var wrong = ""
             for (index, character) in last.enumerated() {
@@ -304,11 +307,98 @@ struct FakeCaptionRecognizer: CaptionRecognizing {
         var result: [CaptionWord] = []
         var time = 0.2
         for sentence in sentences {
-            for character in sentence where SpokenKeys.key(for: character) != nil {
-                result.append(CaptionWord(text: String(character), start: time, end: time + pace))
-                time += pace
+            for piece in pieces(sentence) {
+                let length = pace * Double(SpokenKeys.keys(of: piece).count)
+                result.append(CaptionWord(text: piece, start: time, end: time + length))
+                time += length
             }
             time += min(0.4, duration * 0.05)
+        }
+        return result
+    }
+
+    /// 中文一個字一個詞，連著的英數算一個詞（30%、1,000），和真的辨識一樣。
+    private static func pieces(_ sentence: String) -> [String] {
+        let characters = Array(sentence)
+        var result: [String] = []
+        var canJoin = false
+        for (index, character) in characters.enumerated() {
+            if SpokenKeys.key(for: character) != nil {
+                if canJoin, character.isASCII, !result.isEmpty {
+                    result[result.count - 1].append(character)
+                } else {
+                    result.append(String(character))
+                }
+                canJoin = character.isASCII
+                continue
+            }
+            let isNextDigit = index + 1 < characters.count && characters[index + 1].isASCII
+                && characters[index + 1].isNumber
+            if canJoin, !result.isEmpty, character == "%" {
+                result[result.count - 1].append(character)
+                canJoin = false
+            } else if canJoin, !result.isEmpty, isNextDigit, [".", ",", ":"].contains(character) {
+                result[result.count - 1].append(character)
+            } else {
+                canJoin = false
+            }
+        }
+        return result
+    }
+
+    /// 第一個數字換成別的值，寫法不變。
+    private static func changingNumber(_ sentences: [String]) -> [String] {
+        let chinese: [Character] = ["一", "二", "三", "四", "五", "六", "七", "八", "九"]
+        var result = sentences
+        for (index, sentence) in sentences.enumerated() {
+            guard let number = SpokenNumbers.values(in: sentence).first(where: { !$0.isWeak }) else { continue }
+            var changed = ""
+            var isDone = false
+            for character in number.text {
+                if isDone {
+                    changed.append(character)
+                } else if character.isASCII, let digit = character.wholeNumberValue {
+                    changed.append(String(digit % 9 + 1))
+                    isDone = true
+                } else if character == "兩" {
+                    changed.append("三")
+                    isDone = true
+                } else if let place = chinese.firstIndex(of: character) {
+                    changed.append(chinese[(place + 1) % chinese.count])
+                    isDone = true
+                } else {
+                    changed.append(character)
+                }
+            }
+            // 只有一個「十」。
+            if !isDone { changed = "二" + number.text }
+            let range = NSRange(location: number.range.lowerBound, length: number.range.count)
+            result[index] = (sentence as NSString).replacingCharacters(in: range, with: changed)
+            return result
+        }
+        return result
+    }
+
+    /// 有「不」就拿掉第一個，沒有就在第一句的第二個字後面加一個。
+    private static func negating(_ sentences: [String]) -> [String] {
+        var result = sentences
+        for (index, sentence) in sentences.enumerated() {
+            var characters = Array(sentence)
+            for place in characters.indices where place > 0 && characters[place] == "不" {
+                guard place + 1 < characters.count, SpokenKeys.key(for: characters[place - 1]) != nil,
+                      SpokenKeys.key(for: characters[place + 1]) != nil,
+                      CaptionDoubtFinder.isNegation(characters, place) else { continue }
+                characters.remove(at: place)
+                result[index] = String(characters)
+                return result
+            }
+        }
+        for (index, sentence) in sentences.enumerated() {
+            var characters = Array(sentence)
+            guard characters.count >= 4, characters[..<4].allSatisfy({ SpokenKeys.key(for: $0) != nil }) else { continue }
+            characters.insert("不", at: 2)
+            result[index] = String(characters)
+            return result
         }
         return result
     }

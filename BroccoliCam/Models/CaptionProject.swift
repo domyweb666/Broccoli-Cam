@@ -19,6 +19,14 @@ enum CaptionStatus: String, Codable {
     var needsReview: Bool { self != .matched }
 }
 
+/// 對上了、但講的可能和稿子不一樣。只標出來給人聽。
+enum CaptionDoubt: String, Codable {
+    /// 數字不一樣，或數字沒講到。
+    case number
+    /// 一字之差：相反字，或多一個、少一個「不」。
+    case word
+}
+
 /// 一個詞和它在整支影片裡的時間（秒）。拆句時用來算切點。
 struct CaptionWord: Codable, Equatable {
     var text: String
@@ -43,6 +51,29 @@ struct CaptionLine: Codable, Equatable, Identifiable {
     /// 使用者看過了。
     var isConfirmed = false
     var words: [CaptionWord] = []
+    /// 為什麼標出來。沒有就是 nil。
+    var doubt: CaptionDoubt?
+    /// 稿子寫的那個字或數字，例如「30%」。
+    var doubtScript: String?
+    /// 聽到的，例如「13%」。沒聽到是 nil。
+    var doubtHeard: String?
+    /// 那個字在第幾秒，和 start 同一個時間基準。
+    var doubtTime: Double?
+
+    /// 給人看的原因。
+    var doubtNote: String? {
+        guard doubt != nil, let doubtScript else { return nil }
+        guard let doubtHeard else { return "稿子 \(doubtScript)，沒聽到" }
+        return "稿子 \(doubtScript)，聽到 \(doubtHeard)"
+    }
+
+    /// 字改過了，原因就不一定對。
+    mutating func clearDoubt() {
+        doubt = nil
+        doubtScript = nil
+        doubtHeard = nil
+        doubtTime = nil
+    }
 
     /// 還擋著燒錄：要看過的句子，沒確認也沒隱藏。漏講的預設隱藏，但仍要看過一次。
     var blocksBurning: Bool { status.needsReview && !isConfirmed }

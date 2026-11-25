@@ -26,6 +26,7 @@ enum CaptionEditing {
             result.start = min(max(0, line.start.isFinite ? line.start : 0), limit)
             result.end = min(max(result.start, line.end.isFinite ? line.end : result.start), limit)
             result.words = line.words.filter { $0.start.isFinite && $0.end.isFinite }
+            if let time = line.doubtTime, !time.isFinite { result.doubtTime = nil }
             return result
         }
         return sorted(fixed)
@@ -59,6 +60,12 @@ enum CaptionEditing {
         second.words = line.words.filter { ($0.start + $0.end) / 2 >= cut }
         second.scriptText = nil
         second.heardText = nil
+        // 哪裡不一樣只跟著那個字所在的那半句。
+        if let time = line.doubtTime, time < cut {
+            second.clearDoubt()
+        } else {
+            first.clearDoubt()
+        }
         return (first, second)
     }
 
@@ -108,6 +115,16 @@ enum CaptionEditing {
         }
         result.isConfirmed = !(first.blocksBurning || second.blocksBurning)
         result.isHidden = false
+        // 還沒看過的原因留著，看過的不用。
+        if !(first.blocksBurning && first.doubt != nil) {
+            result.clearDoubt()
+            if second.blocksBurning {
+                result.doubt = second.doubt
+                result.doubtScript = second.doubtScript
+                result.doubtHeard = second.doubtHeard
+                result.doubtTime = second.doubtTime
+            }
+        }
         return result
     }
 
@@ -150,6 +167,7 @@ enum CaptionEditing {
         let moved = start - result[index].start
         result[index].start = start
         result[index].end = start + length
+        result[index].doubtTime = result[index].doubtTime.map { $0 + moved }
         result[index].words = result[index].words.map { word in
             CaptionWord(text: word.text, start: word.start + moved, end: word.end + moved)
         }
@@ -163,6 +181,7 @@ enum CaptionEditing {
             var result = line
             result.start = min(max(0, line.start + offset), limit)
             result.end = min(max(0, line.end + offset), limit)
+            result.doubtTime = line.doubtTime.map { $0 + offset }
             result.words = line.words.map { word in
                 CaptionWord(text: word.text, start: word.start + offset, end: word.end + offset)
             }
@@ -279,6 +298,7 @@ enum CaptionEditing {
             guard moved != 0 else { continue }
             lines[index].start += moved
             lines[index].end += moved
+            lines[index].doubtTime = lines[index].doubtTime.map { $0 + moved }
             for word in lines[index].words.indices {
                 lines[index].words[word].start += moved
                 lines[index].words[word].end += moved
@@ -297,6 +317,7 @@ enum CaptionEditing {
             count += hits
             var changed = line
             changed.text = line.text.replacingOccurrences(of: find, with: replacement)
+            changed.clearDoubt()
             return changed
         }
         return (result, count)

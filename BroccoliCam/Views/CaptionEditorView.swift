@@ -713,6 +713,7 @@ private struct CaptionLineRow: View {
                 .frame(width: 4)
             VStack(alignment: .leading, spacing: 8) {
                 meta
+                doubtNote
                 if isSelected && !isLocked {
                     expanded
                 } else {
@@ -751,6 +752,19 @@ private struct CaptionLineRow: View {
         .foregroundStyle(.white.opacity(0.6))
         .contentShape(Rectangle())
         .onTapGesture { model.select(line.id) }
+    }
+
+    /// 數字或關鍵的字不一樣，寫出兩邊各是什麼。
+    @ViewBuilder
+    private var doubtNote: some View {
+        if line.blocksBurning, let note = line.doubtNote {
+            Text(note)
+                .font(.caption)
+                .foregroundStyle(.yellow)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture { model.select(line.id) }
+        }
     }
 
     private var statusText: String {
