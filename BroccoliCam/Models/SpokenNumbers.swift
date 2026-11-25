@@ -12,6 +12,26 @@ struct SpokenNumber: Equatable {
         case discount
     }
 
+    /// 同一類的單位換成同一個基準才能比：公分、公尺都是長度。
+    struct Unit: Equatable {
+        let dimension: String
+        let factor: Decimal
+    }
+
+    /// 這個數字的一種讀法，已經含「%、成」。「五公里半」除了 5 還可以是 5.5 公里，「一米七五」的 75 還可以是 1.75 公尺。
+    struct Reading: Equatable {
+        let top: Decimal
+        let bottom: Decimal
+        let unit: Unit?
+
+        func matches(_ other: Reading) -> Bool {
+            // 一邊看不出單位就只比數字：單位常常被聽成別的字。
+            guard let mine = unit, let theirs = other.unit else { return top * other.bottom == other.top * bottom }
+            return mine.dimension == theirs.dimension
+                && top * mine.factor * other.bottom == other.top * theirs.factor * bottom
+        }
+    }
+
     let kind: Kind
     let numerator: Decimal
     let denominator: Decimal
@@ -25,14 +45,26 @@ struct SpokenNumber: Equatable {
     let spelling: String
     /// 單獨一個「一」或「零」。多半只是詞的一部分，要位置剛好對上才拿來比，也不算漏講。
     let isWeak: Bool
+    /// 第一個是照字面的，後面是別的讀法。有一種相同就算同一個數字，只會多放過，不會多抓。
+    let readings: [Reading]
 
     func matches(_ other: SpokenNumber) -> Bool {
         if (kind == .discount) == (other.kind == .discount),
            numerator * other.denominator == other.numerator * denominator { return true }
         // 一邊沒有「%、成、折」，數字一樣就不算不同：「10 到 15%」和「百分之十到十五」的百分號記在不同的數字上，
         // 「前三，成為」聽寫沒有標點會讀成三成，辨識也可能漏掉 %。
-        guard (kind == .plain) != (other.kind == .plain) else { return false }
-        return numerator * scale * other.denominator == other.numerator * other.scale * denominator
+        if (kind == .plain) != (other.kind == .plain),
+           numerator * scale * other.denominator == other.numerator * other.scale * denominator { return true }
+        return Self.agree(readings, other.readings)
+    }
+
+    /// 換一種讀法才相同：1.73 公尺和「一公尺七三」的 73。
+    func isReread(as other: SpokenNumber) -> Bool {
+        Self.agree(Array(readings.dropFirst()), other.readings)
+    }
+
+    private static func agree(_ mine: [Reading], _ theirs: [Reading]) -> Bool {
+        mine.contains { one in theirs.contains { one.matches($0) } }
     }
 }
 
@@ -110,6 +142,82 @@ enum SpokenNumbers {
         return result
     }()
 
+    fileprivate struct Measure {
+        let name: [Character]
+        let unit: SpokenNumber.Unit
+    }
+
+    /// 換算用的單位，加上常接「半」的量詞（兩杯半）。英制和公制換起來不是整數，各算各的。
+    private static let unitTable: [(dimension: String, factor: Int, names: [String])] = [
+        ("長度", 1, ["公釐", "毫米", "mm"]),
+        ("長度", 10, ["公分", "厘米", "cm"]),
+        ("長度", 1000, ["公尺", "米"]),
+        ("長度", 1000000, ["公里", "km"]),
+        ("重量", 1, ["公克", "克"]),
+        ("重量", 600, ["台斤", "臺斤", "斤"]),
+        ("重量", 1000, ["公斤", "kg"]),
+        ("重量", 1000000, ["公噸", "噸"]),
+        ("容量", 1, ["毫升", "ml", "cc"]),
+        ("容量", 1000, ["公升", "升"]),
+        ("時間", 1, ["秒", "秒鐘"]),
+        ("時間", 60, ["分鐘"]),
+        ("時間", 3600, ["小時", "鐘頭"]),
+        ("時間", 86400, ["天"]),
+        ("時間", 604800, ["週", "周", "星期", "禮拜"]),
+        ("月數", 1, ["月"]),
+        ("月數", 12, ["年"]),
+        ("錢", 1, ["元", "圓", "塊"]),
+        ("英里", 1, ["英里", "英哩", "哩"]),
+        ("呎", 1, ["英尺", "英呎", "呎", "尺"]),
+        ("吋", 1, ["英寸", "英吋", "吋", "寸"]),
+        ("磅", 1, ["磅"]),
+        ("坪", 1, ["坪"]),
+        ("公頃", 1, ["公頃"]),
+        ("甲", 1, ["甲"]),
+        ("度", 1, ["度"]),
+        ("倍", 1, ["倍"]),
+        ("歲", 1, ["歲"]),
+        ("圈", 1, ["圈"]),
+        ("頁", 1, ["頁"]),
+        ("層", 1, ["層"]),
+        ("樓", 1, ["樓"]),
+        ("格", 1, ["格"]),
+        ("節", 1, ["節"]),
+        ("集", 1, ["集"]),
+        ("杯", 1, ["杯"]),
+        ("碗", 1, ["碗"]),
+        ("瓶", 1, ["瓶"]),
+        ("匙", 1, ["大匙", "茶匙", "湯匙", "匙"]),
+        ("包", 1, ["包"]),
+        ("盒", 1, ["盒"]),
+        ("箱", 1, ["箱"]),
+        ("罐", 1, ["罐"]),
+        ("條", 1, ["條"]),
+        ("顆", 1, ["顆"]),
+        ("片", 1, ["片"]),
+        ("份", 1, ["份"])
+    ]
+    fileprivate static let unitsByHead: [Character: [Measure]] = {
+        var result: [Character: [Measure]] = [:]
+        for row in SpokenNumbers.unitTable {
+            let unit = SpokenNumber.Unit(dimension: row.dimension, factor: Decimal(row.factor))
+            for name in row.names {
+                guard let head = name.first else { continue }
+                result[head, default: []].append(Measure(name: Array(name), unit: unit))
+            }
+        }
+        return result
+    }()
+    /// 前面可以加「個」的：兩個半小時、三個半月。「三個半天」是三次半天，不在裡面。
+    fileprivate static let counted: Set<String> = ["小時", "鐘頭", "月", "星期", "禮拜"]
+    /// 後面的數字是小數的：一米七五、一公尺七、三塊五。
+    fileprivate static let trailed: Set<String> = ["公尺", "米", "塊"]
+    /// 「半」後面接這些字是另一個詞：半價、半糖、半夜、半成品。
+    fileprivate static let halfWords: Set<Character> = [
+        "價", "票", "糖", "冰", "奶", "夜", "天", "年", "載", "成", "熟", "場", "馬", "途", "路", "島", "球", "圓", "徑",
+        "身", "自", "數", "段", "截", "邊", "信", "官"
+    ]
+
     fileprivate static func power(_ exponent: Int) -> Decimal {
         var result = Decimal(1)
         for _ in 0..<max(0, exponent) { result *= 10 }
@@ -169,6 +277,14 @@ private struct Reader {
         /// 在字元裡的位置。
         var from: Int
         var to: Int
+    }
+
+    /// 「一米」「三塊」：後面緊接的數字可能是它的小數。
+    private struct Lead {
+        let amount: Amount
+        let unit: SpokenNumber.Unit
+        /// 後面的數字要從這裡開始。
+        let end: Int
     }
 
     private let source: [Character]
@@ -236,6 +352,7 @@ private struct Reader {
 
     func read() -> [SpokenNumber] {
         var result: [SpokenNumber] = []
+        var previous: Lead?
         var index = 0
         while index < plain.count {
             guard isNumeric(index) else {
@@ -248,7 +365,8 @@ private struct Reader {
                 continue
             }
             let run = readRun(from: index)
-            let step = numbers(run, start: index)
+            let step = numbers(run, start: index, previous: previous)
+            previous = lead(run)
             result.append(contentsOf: step.numbers)
             index = max(index + 1, step.end)
         }
@@ -535,7 +653,7 @@ private struct Reader {
         return (number, max(top.to, run.end))
     }
 
-    private func numbers(_ run: Run, start: Int) -> (numbers: [SpokenNumber], end: Int) {
+    private func numbers(_ run: Run, start: Int, previous: Lead?) -> (numbers: [SpokenNumber], end: Int) {
         guard !run.isUnclear else { return ([], run.end) }
         let list = amounts(run.pieces)
         guard let last = list.last, !isVague(run, start: start) else { return ([], run.end) }
@@ -566,9 +684,102 @@ private struct Reader {
         let lone = loneKind(run, start: start)
         if lone != .word {
             result.append(make(.plain, top: last.top, bottom: last.bottom, scale: 1, from: last.from, to: last.to,
-                               spelling: spell(last), isWeak: lone == .weak))
+                               spelling: spell(last), isWeak: lone == .weak, unit: measure(at: run.end)?.unit,
+                               others: others(last, run, start: start, previous: previous)))
         }
         return (result, run.end)
+    }
+
+    // MARK: 單位
+
+    /// 這裡開始的單位，取最長的。
+    private func unit(at start: Int) -> SpokenNumbers.Measure? {
+        guard let first = character(start) else { return nil }
+        let list: [SpokenNumbers.Measure] = SpokenNumbers.unitsByHead[lowered(first)] ?? []
+        var best: SpokenNumbers.Measure?
+        for candidate in list where candidate.name.count > (best?.name.count ?? 0) {
+            guard start + candidate.name.count <= plain.count else { continue }
+            let isHere: Bool = candidate.name.indices.allSatisfy { lowered(plain[start + $0]) == candidate.name[$0] }
+            if isHere { best = candidate }
+        }
+        return best
+    }
+
+    private func lowered(_ letter: Character) -> Character {
+        guard letter.isASCII, letter.isUppercase, let lower = letter.lowercased().first else { return letter }
+        return lower
+    }
+
+    /// 數字後面的單位。「三月」是月份，「三個月」才是長度。
+    private func measure(at index: Int) -> (name: String, unit: SpokenNumber.Unit, end: Int)? {
+        var start = skippingSpaces(index)
+        let isCounted = character(start) == "個"
+        if isCounted { start += 1 }
+        guard let found = unit(at: start) else { return nil }
+        let name = String(found.name)
+        if isCounted {
+            guard SpokenNumbers.counted.contains(name) else { return nil }
+        } else if name == "月" {
+            return nil
+        }
+        return (name, found.unit, start + found.name.count)
+    }
+
+    /// 五公里半、兩個半小時：有「半」就回它的單位。
+    private func half(after index: Int) -> SpokenNumber.Unit? {
+        if let found = measure(at: index), isHalf(found.end) { return found.unit }
+        let start = skippingSpaces(index)
+        guard character(start) == "個", character(start + 1) == "半", let found = unit(at: start + 2),
+              SpokenNumbers.counted.contains(String(found.name)) else { return nil }
+        return found.unit
+    }
+
+    private func isHalf(_ index: Int) -> Bool {
+        guard character(index) == "半", !masked[index] else { return false }
+        guard let next = character(index + 1) else { return true }
+        return !SpokenNumbers.halfWords.contains(next)
+    }
+
+    private func lead(_ run: Run) -> Lead? {
+        guard !run.isUnclear, let last = amounts(run.pieces).last, last.bottom == 1,
+              let found = measure(at: run.end), SpokenNumbers.trailed.contains(found.name) else { return nil }
+        return Lead(amount: last, unit: found.unit, end: found.end)
+    }
+
+    /// 單位後面當小數的一、兩個數字。
+    private func decimals(_ run: Run) -> String? {
+        guard !run.isUnclear else { return nil }
+        var text = ""
+        for piece in run.pieces {
+            switch piece.part {
+            case .digit(let digit): text += String(digit)
+            case .figures(let figures): text += figures
+            case .small, .big, .fraction: return nil
+            }
+        }
+        return text.count == 1 || text.count == 2 ? text : nil
+    }
+
+    private func reading(_ lead: Lead, _ decimals: String) -> SpokenNumber.Reading {
+        var top = lead.amount.top
+        for digit in decimals { top = top * 10 + Decimal(digit.wholeNumberValue ?? 0) }
+        return SpokenNumber.Reading(top: top, bottom: SpokenNumbers.power(decimals.count), unit: lead.unit)
+    }
+
+    /// 同一個數字的其他讀法。
+    private func others(_ amount: Amount, _ run: Run, start: Int, previous: Lead?) -> [SpokenNumber.Reading] {
+        var result: [SpokenNumber.Reading] = []
+        if let unit = half(after: run.end) {
+            result.append(SpokenNumber.Reading(top: amount.top * 2 + amount.bottom, bottom: amount.bottom * 2, unit: unit))
+        }
+        // 一米七五：「一」和「七五」哪個被拿去比都要認得。
+        if let previous, previous.end == start, let text = decimals(run) {
+            result.append(reading(previous, text))
+        }
+        if let here = lead(run), isNumeric(here.end), let text = decimals(readRun(from: here.end)) {
+            result.append(reading(here, text))
+        }
+        return result
     }
 
     /// 幾十、十幾、數百：沒有確定的值。「五十一起」分不出是五十一還是五十，也不抽。
@@ -595,7 +806,10 @@ private struct Reader {
             if before == "期", character(start - 2) == "星" { return .number }
             if before == "拜", character(start - 2) == "禮" { return .number }
         }
-        guard let next = character(run.end), SpokenNumbers.measures.contains(next) else { return .word }
+        guard let next = character(run.end) else { return .word }
+        // 一到三天。
+        if next == "到" || next == "至", isNumeric(run.end + 1) { return .weak }
+        guard SpokenNumbers.measures.contains(next) else { return .word }
         return .weak
     }
 
@@ -636,8 +850,13 @@ private struct Reader {
             spelling.append(SpokenNumbers.spelled[extra])
             end += 1
         }
+        // 三成半。
+        var half: [SpokenNumber.Reading] = []
+        if isHalf(end) {
+            half.append(SpokenNumber.Reading(top: top * 2 + amount.bottom, bottom: amount.bottom * scale * 2, unit: nil))
+        }
         let number = make(.ratio, top: top, bottom: amount.bottom, scale: scale, from: amount.from, to: end,
-                          spelling: spelling)
+                          spelling: spelling, others: half)
         return (number, end)
     }
 
@@ -650,10 +869,13 @@ private struct Reader {
     }
 
     private func make(_ kind: SpokenNumber.Kind, top: Decimal, bottom: Decimal, scale: Decimal, from: Int, to: Int,
-                      spelling: String, isWeak: Bool = false) -> SpokenNumber {
-        SpokenNumber(kind: kind, numerator: top, denominator: bottom * scale, scale: scale,
-                     text: String(source[from..<to]), range: offsets[from]..<offsets[to], spelling: spelling,
-                     isWeak: isWeak)
+                      spelling: String, isWeak: Bool = false, unit: SpokenNumber.Unit? = nil,
+                      others: [SpokenNumber.Reading] = []) -> SpokenNumber {
+        // 折數只和折數比，不給別的讀法。
+        let base = SpokenNumber.Reading(top: top, bottom: bottom * scale, unit: unit)
+        return SpokenNumber(kind: kind, numerator: top, denominator: bottom * scale, scale: scale,
+                            text: String(source[from..<to]), range: offsets[from]..<offsets[to], spelling: spelling,
+                            isWeak: isWeak, readings: kind == .discount ? [] : [base] + others)
     }
 
     private func spell(_ amount: Amount) -> String {

@@ -1201,8 +1201,23 @@ struct CaptionDoubtFinder {
     private static let notNegations: [[Character]] = [
         "不過", "不管", "不論", "不但", "不僅", "不然", "不如", "不妨", "不得了", "差不多", "了不起", "對不起", "不好意思",
         "只不過", "無論", "非常", "非洲", "除非", "是非", "特別", "別人", "分別", "個別", "性別", "類別", "級別", "區別",
-        "差別", "告別", "離別", "別墅", "未來"
+        "差別", "告別", "離別", "別墅", "未來",
+        // 加不加都是同一個意思的。「好不公平」是真的否定，所以「好不」不能整個放進來。
+        "好不容易", "好不熱鬧", "好不威風", "好不快活", "好不得意", "不也", "不正是", "豈不", "恨不得", "巴不得", "不由得",
+        "不愧", "不外乎", "未免", "莫非", "無非", "非得", "非要", "難免不會", "小心不要", "小心別", "當心不要", "當心別"
     ].map { Array($0) }
+    /// 「不就」是反問（這不就好了），但不就業、不就醫、不就近是否定。
+    private static let afterNotJust: Set<Character> = [
+        "業", "醫", "職", "學", "讀", "寢", "範", "任", "位", "座", "近", "事", "地"
+    ]
+    /// 「差點沒摔倒」和「差點摔倒」一樣；「差點沒趕上」就不一樣。
+    private static let mishaps: Set<Character> = [
+        "摔", "跌", "死", "昏", "暈", "氣", "笑", "嚇", "哭", "吐", "瘋", "撞", "崩", "累", "掉"
+    ]
+    /// 「不得不、不能不」兩個「不」一起少，意思一樣。
+    private static let doubled: Set<Character> = ["得", "能", "可", "會", "敢"]
+    /// 句尾是「嗎」的反問。
+    private static let rhetorical: [[Character]] = ["不是", "不覺得"].map { Array($0) }
 
     private let pair: [Int]
     private let hit: [Bool]
@@ -1217,6 +1232,8 @@ struct CaptionDoubtFinder {
     private let heardNumbers: [Placed]
     /// 稿子第幾個音在數字裡。
     private let isInNumber: [Bool]
+    /// 聽到的第幾個音有配到稿子。
+    private let isPaired: [Bool]
 
     init(script: [CaptionBreaker.Glyph], heard: CaptionAligner.Heard, pair: [Int], hit: [Bool],
          failed: [ClosedRange<Double>]) {
@@ -1232,23 +1249,29 @@ struct CaptionDoubtFinder {
         }
         // 和稿子同音、稿子那裡又不是數字的，用稿子的字：「是」聽成「四」不能當成講了四。
         // 前後要緊接著，不然「是11」聽成「是十一」，稿子的「是」可能配到「十」。
+        let heardText: [Character] = heard.glyphs.filter { $0.key != nil }.map { $0.character }
         var swaps: [Int: Character] = [:]
         for index in pair.indices where hit[index] && !inside[index] {
             let other = pair[index]
             let left = index == 0 ? other == 0 : pair[index - 1] == other - 1
             let right = index + 1 == pair.count || inside[index + 1] || pair[index + 1] == other + 1
-            if left, right { swaps[other] = scriptText[index] }
+            // 前一個就是稿子的那個字，這個「十」是真的十（「開始是十九」的「是」配到了「十」）。
+            let isShifted = other > 0 && heardText[other - 1] == scriptText[index]
+            if left, right, !isShifted { swaps[other] = scriptText[index] }
         }
         self.pair = pair
         self.hit = hit
         self.failed = failed
         self.scriptText = scriptText
-        heardText = heard.glyphs.filter { $0.key != nil }.map { $0.character }
+        self.heardText = heardText
         isJoined = joined
         heardKeys = heard.keys
         scriptNumbers = numbers
         heardNumbers = Self.numbers(heard.glyphs, swapping: swaps)
         isInNumber = inside
+        var paired = [Bool](repeating: false, count: heard.keys.count)
+        for other in pair where other >= 0 { paired[other] = true }
+        isPaired = paired
     }
 
     private static func numbers(_ glyphs: [CaptionBreaker.Glyph], swapping: [Int: Character]) -> [Placed] {
@@ -1328,10 +1351,34 @@ struct CaptionDoubtFinder {
            SpokenNumbers.spelling(scriptText[from..<to]) == SpokenNumbers.spelling(heardText[lower..<upper]) {
             return nil
         }
+        if isRunTogether(missing.map { scriptNumbers[$0] }, rest) { return nil }
         if let own { return differs(mine, own) }
         // 沒有和這個數字重疊，範圍又拉得很大，可能是別句的數字。
         guard upper - lower <= mine.keys.count + Self.reach else { return nil }
         return differs(mine, rest[min(turn, rest.count - 1)])
+    }
+
+    /// 「五到十分鐘」少聽一個「到」，辨識會寫成 510 分鐘。聽到的是國字（五百一十）就是真的講了那個數。
+    private func isRunTogether(_ mine: [Placed], _ said: [Placed]) -> Bool {
+        guard said.count < mine.count, said.allSatisfy({ isWrittenInFigures($0.number.text) }) else { return false }
+        for index in mine.indices.dropFirst()
+        where mine[index].keys.lowerBound - mine[index - 1].keys.upperBound > 1 { return false }
+        guard let first = figures(mine), let second = figures(said) else { return false }
+        return first == second
+    }
+
+    private func isWrittenInFigures(_ text: String) -> Bool {
+        text.allSatisfy { $0.isASCII || $0 == "趴" || $0 == "％" }
+    }
+
+    /// 寫成阿拉伯數字接起來。有小數就不接。
+    private func figures(_ numbers: [Placed]) -> String? {
+        var result = ""
+        for placed in numbers {
+            guard placed.number.denominator == placed.number.scale else { return nil }
+            result += placed.number.numerator.description
+        }
+        return result
     }
 
     private func spelling(_ numbers: [Placed]) -> String {
@@ -1359,6 +1406,8 @@ struct CaptionDoubtFinder {
     private func unspoken(_ mine: Placed, _ row: Row) -> Found? {
         let keys = mine.keys
         guard !mine.number.isWeak, keys.allSatisfy({ pair[$0] < 0 }) else { return nil }
+        // 「一公尺七三」聽成 1.73 公尺，七三在公尺前面講了。
+        if heardNumbers.contains(where: { $0.keys.overlaps(row.heard) && mine.number.isReread(as: $0.number) }) { return nil }
         let left = keys.lowerBound - 1
         let right = keys.upperBound
         // F16、B2B 這種和英文黏在一起的，辨識的寫法太多。
@@ -1446,6 +1495,7 @@ struct CaptionDoubtFinder {
         let after: Character? = index + 1 < text.count ? text[index + 1] : nil
         if before == character || after == character { return false }
         if let before, before == after { return false }
+        if isFiller(text, index) { return false }
         for word in notNegations {
             for (offset, letter) in word.enumerated() where letter == character {
                 let start = index - offset
@@ -1456,9 +1506,78 @@ struct CaptionDoubtFinder {
         return true
     }
 
+    /// 語氣用的「不、沒」，要看前後的字才知道。
+    private static func isFiller(_ text: [Character], _ index: Int) -> Bool {
+        func at(_ offset: Int) -> Character? {
+            let place = index + offset
+            return place >= 0 && place < text.count ? text[place] : nil
+        }
+        if text[index] == "不" {
+            if at(1) == "就" {
+                // 「再不就來不及」「要不就算了」的「不」不能少。
+                let heads: [Character] = ["再", "要", "若", "還"]
+                if let before = at(-1), heads.contains(before) { return false }
+                guard let next = at(2) else { return true }
+                return !afterNotJust.contains(next)
+            }
+            // 何不試試。如何不、為何不、任何不 是另一回事。
+            if at(-1) == "何" {
+                let heads: [Character] = ["如", "為", "任", "奈"]
+                guard let before = at(-2) else { return true }
+                return !heads.contains(before)
+            }
+        }
+        if text[index] == "沒", at(-1) == "點", at(-2) == "差" || (at(-2) == "一" && at(-3) == "差"), let next = at(1) {
+            return mishaps.contains(next)
+        }
+        return false
+    }
+
+    /// 少掉或多出來的這幾個字不改變意思。`left`、`right` 是稿子裡前後緊接著的音。
+    private func isHarmless(_ words: [Character], before left: Int, after right: Int) -> Bool {
+        // 稿子從這裡到下一個標點。
+        var clause: [Character] = []
+        for key in right..<scriptText.count {
+            clause.append(scriptText[key])
+            if !isJoined[key] { break }
+        }
+        let phrase: [Character] = words + clause
+        if clause.count <= 14, clause.last == "嗎", Self.rhetorical.contains(where: { phrase.starts(with: $0) }) { return true }
+        // 「還沒開始之前」就是「開始之前」。
+        guard words.contains("沒") || words.contains("未") else { return false }
+        let heads: [Character] = ["還", "尚", "在"]
+        guard words.contains("還") || words.contains("尚") || heads.contains(scriptText[left]) else { return false }
+        for index in clause.indices.prefix(6) where index + 1 < clause.count {
+            guard clause[index] == "之" || clause[index] == "以", clause[index + 1] == "前" else { continue }
+            // 「還沒去過之前那家店」的「之前」跟後面是一起的。
+            let next: Character? = index + 2 < clause.count ? clause[index + 2] : nil
+            return next != "的" && next != "那" && next != "這"
+        }
+        return false
+    }
+
+    /// 稿子的「不得不」兩個「不」都沒講。
+    private func isDoubleDropped(_ key: Int) -> Bool {
+        for other in [key - 2, key + 2] where other >= 0 && other < pair.count {
+            let first = min(key, other)
+            if pair[other] < 0, hit[first + 1], isJoined[first], isJoined[first + 1],
+               Self.doubled.contains(scriptText[first + 1]), Self.isNegation(scriptText, other) { return true }
+        }
+        return false
+    }
+
+    /// 聽到的「不得不」比稿子多兩個「不」。`place` 是聽到的第幾個音。
+    private func isDoubleAdded(_ place: Int) -> Bool {
+        for other in [place - 2, place + 2] where other >= 0 && other < heardText.count {
+            let middle = min(place, other) + 1
+            if !isPaired[other], Self.doubled.contains(heardText[middle]), Self.isNegation(heardText, other) { return true }
+        }
+        return false
+    }
+
     /// 稿子有「不」，前後的字緊接著對上，中間沒聽到。
     private func dropped(_ key: Int) -> Found? {
-        guard pair[key] < 0, isJoined[key], Self.isNegation(scriptText, key) else { return nil }
+        guard pair[key] < 0, isJoined[key], Self.isNegation(scriptText, key), !isDoubleDropped(key) else { return nil }
         // 「沒有漲」漏成「漲」，一次少兩個字。
         let candidates: [Range<Int>] = [key..<(key + 1), key..<(key + 2), max(0, key - 1)..<(key + 1)]
         for gone in candidates {
@@ -1467,6 +1586,7 @@ struct CaptionDoubtFinder {
             guard left >= 0, right < pair.count, gone.allSatisfy({ pair[$0] < 0 && isJoined[$0] }),
                   hit[left], hit[right], pair[right] == pair[left] + 1,
                   !fails(heardKeys[pair[left]].end, heardKeys[pair[right]].start) else { continue }
+            if isHarmless(Array(scriptText[gone]), before: left, after: right) { return nil }
             return Found(kind: .word, script: String(scriptText[gone.lowerBound...right]),
                          heard: String(heardText[pair[right]]), time: heardKeys[pair[right]].start)
         }
@@ -1492,7 +1612,8 @@ struct CaptionDoubtFinder {
         let first = pair[key] + 1
         let next = pair[key + 1]
         guard next - first == 1 || next - first == 2,
-              (first..<next).contains(where: { Self.isNegation(heardText, $0) }) else { return nil }
+              let place = (first..<next).first(where: { Self.isNegation(heardText, $0) }), !isDoubleAdded(place),
+              !isHarmless(Array(heardText[first..<next]), before: key, after: key + 1) else { return nil }
         return Found(kind: .word, script: String(scriptText[key + 1]), heard: String(heardText[first...next]),
                      time: heardKeys[first].start)
     }
