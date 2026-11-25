@@ -41,6 +41,26 @@ enum CompanionLayout: String, CaseIterable, Identifiable {
     }
 }
 
+/// 錄的時候看多少字。和有沒有人聽分開選。
+enum PromptAmount: String, CaseIterable, Identifiable {
+    /// 整篇稿子照著唸
+    case full
+    /// 只看每一點的關鍵字，用自己的話講
+    case outline
+    /// 不看稿
+    case none
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .full: return "全稿"
+        case .outline: return "提綱"
+        case .none: return "不看"
+        }
+    }
+}
+
 /// 三位聆聽者。不取名字，畫面上只用頭像分辨。
 enum CompanionPerson: String, CaseIterable, Identifiable {
     case a, b, c
@@ -169,14 +189,22 @@ final class SettingsStore: ObservableObject {
         }
     }
 
-    /// 陪伴模式：不看稿，畫面上有一位聆聽者。關閉就是提詞模式。
-    @Published var companionMode: Bool { didSet { defaults.set(companionMode, forKey: "companionMode") } }
-    /// 陪伴模式的聆聽者擺法
+    /// 看多少字
+    @Published var promptAmount: PromptAmount { didSet { defaults.set(promptAmount.rawValue, forKey: "promptAmount") } }
+    /// 畫面上有沒有一位聆聽者
+    @Published var hasListener: Bool { didSet { defaults.set(hasListener, forKey: "hasListener") } }
+    /// 聆聽者擺法
     @Published var companionLayout: CompanionLayout { didSet { defaults.set(companionLayout.rawValue, forKey: "companionLayout") } }
     /// 選哪一位聆聽者
     @Published var companionPerson: CompanionPerson { didSet { defaults.set(companionPerson.rawValue, forKey: "companionPerson") } }
     /// 聆聽者跟著講話的停頓和音量反應。關掉就是隨機點頭
     @Published var instantReaction: Bool { didSet { defaults.set(instantReaction, forKey: "instantReaction") } }
+    /// 開錄後看不到自己，跑出框才淡回來
+    @Published var hideSelf: Bool { didSet { defaults.set(hideSelf, forKey: "hideSelf") } }
+    /// 用 AirPods 高品質收音（iOS 26 以上才有作用）
+    @Published var airPodsMic: Bool { didSet { defaults.set(airPodsMic, forKey: "airPodsMic") } }
+    /// 錄完一段自動檢查漏講和講錯的數字
+    @Published var takeCheck: Bool { didSet { defaults.set(takeCheck, forKey: "takeCheck") } }
     /// 手機橫放時錄橫式 16:9
     @Published var autoLandscape: Bool { didSet { defaults.set(autoLandscape, forKey: "autoLandscape") } }
 
@@ -231,10 +259,16 @@ final class SettingsStore: ObservableObject {
         captionCharsLandscape = (d.object(forKey: "captionCharsLandscape") as? Double) ?? 18
         captionStyle = d.data(forKey: "captionStyle")
             .flatMap { try? JSONDecoder().decode(CaptionStyle.self, from: $0) } ?? CaptionStyle()
-        companionMode = (d.object(forKey: "companionMode") as? Bool) ?? false
+        // 舊版只有「提詞／陪伴」一個開關：陪伴等於不看稿加有人聽。
+        let wasCompanion = (d.object(forKey: "companionMode") as? Bool) ?? false
+        promptAmount = PromptAmount(rawValue: d.string(forKey: "promptAmount") ?? "") ?? (wasCompanion ? .none : .full)
+        hasListener = (d.object(forKey: "hasListener") as? Bool) ?? wasCompanion
         companionLayout = CompanionLayout(rawValue: d.string(forKey: "companionLayout") ?? "") ?? .fullCall
         companionPerson = CompanionPerson(rawValue: d.string(forKey: "companionPerson") ?? "") ?? .a
         instantReaction = (d.object(forKey: "instantReaction") as? Bool) ?? true
+        hideSelf = (d.object(forKey: "hideSelf") as? Bool) ?? false
+        airPodsMic = (d.object(forKey: "airPodsMic") as? Bool) ?? false
+        takeCheck = (d.object(forKey: "takeCheck") as? Bool) ?? true
         autoLandscape = (d.object(forKey: "autoLandscape") as? Bool) ?? true
         scriptTextScale = (d.object(forKey: "scriptTextScale") as? Double) ?? 1.0
         segmentedRecording = (d.object(forKey: "segmentedRecording") as? Bool) ?? true
@@ -251,18 +285,13 @@ final class SettingsStore: ObservableObject {
         !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    /// 現在要不要顯示提詞：有稿子，而且不是陪伴模式。
+    /// 現在要不要顯示提詞：有稿子，而且沒有選不看。
     var usesPrompter: Bool {
-        hasScript && !companionMode
+        hasScript && promptAmount != .none
     }
 
-    /// 錄影流程實際要用的稿子。陪伴模式不看稿。
+    /// 錄影流程實際要用的稿子。選不看就沒有。
     var activeScript: String {
-        companionMode ? "" : script
-    }
-
-    /// 稿件依空行切出的各段。關掉分段錄影就是一整段。
-    var segments: [String] {
-        ScriptSegments.segments(of: script, segmented: segmentedRecording)
+        promptAmount == .none ? "" : script
     }
 }
