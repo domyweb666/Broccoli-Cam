@@ -130,6 +130,65 @@ struct CaptionStyle: Codable, Equatable {
     var position: Position = .bottom
 }
 
+/// 一段影片聽到的字。時間是影片檔自己的秒數，不管接片怎麼裁都能換算。
+/// 錄完檢查時聽一次就存著，加字幕直接拿來用。
+struct TakeHearing: Codable, Equatable {
+    var words: [CaptionWord]
+    /// 辨識失敗的時間範圍。
+    var failed: [ClosedRange<Double>]
+    /// 例如「裝置端」「連網」。
+    var engine: String
+    var onDevice: Bool
+    /// 影片檔畫面的結尾在第幾秒，用來認是不是同一個檔。0 是不知道。
+    var fileLength: Double
+    /// 聽的是檔案的哪一段。
+    var from: Double
+    var to: Double
+
+    /// 從頭到尾都聽成了，才可以拿來用。
+    var isComplete: Bool {
+        failed.isEmpty && fileLength > 0 && to > from
+    }
+
+    init(words: [CaptionWord], failed: [ClosedRange<Double>], engine: String, onDevice: Bool,
+         fileLength: Double, from: Double, to: Double) {
+        // 錄影清單用一般的 JSON 存，混進一個無限大就整份存不進去，這裡先濾掉。取到毫秒，檔案也小一點。
+        self.words = words.filter { $0.start.isFinite && $0.end.isFinite }.map { word in
+            CaptionWord(text: word.text, start: Self.rounded(word.start), end: Self.rounded(word.end))
+        }
+        self.failed = failed.filter { $0.lowerBound.isFinite && $0.upperBound.isFinite }
+        self.engine = engine
+        self.onDevice = onDevice
+        let known = fileLength.isFinite && from.isFinite && to.isFinite
+        self.fileLength = known ? fileLength : 0
+        self.from = known ? from : 0
+        self.to = known ? to : 0
+    }
+
+    /// 讀壞了就當成沒聽過，不可以連累整份錄影清單讀不進來。
+    init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        let words = try? box.decode([CaptionWord].self, forKey: .words)
+        let failed = try? box.decode([ClosedRange<Double>].self, forKey: .failed)
+        let length = try? box.decode(Double.self, forKey: .fileLength)
+        let lower = try? box.decode(Double.self, forKey: .from)
+        let upper = try? box.decode(Double.self, forKey: .to)
+        let isWhole = words != nil && failed != nil
+        self.init(words: words ?? [], failed: failed ?? [],
+                  engine: (try? box.decode(String.self, forKey: .engine)) ?? "",
+                  onDevice: (try? box.decode(Bool.self, forKey: .onDevice)) ?? false,
+                  fileLength: isWhole ? (length ?? 0) : 0, from: lower ?? 0, to: upper ?? 0)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case words, failed, engine, onDevice, fileLength, from, to
+    }
+
+    private static func rounded(_ seconds: Double) -> Double {
+        (seconds * 1000).rounded() / 1000
+    }
+}
+
 /// 組成影片的一段。單支影片就只有一段。
 struct CaptionClip: Codable, Equatable {
     /// 專案資料夾裡的檔名。
@@ -139,6 +198,8 @@ struct CaptionClip: Codable, Equatable {
     var end: Double?
     /// 照著唸的稿子，沒有就是空字串。
     var script: String
+    /// 錄完檢查時聽到的字。沒有檢查過、舊的專案是 nil。
+    var hearing: TakeHearing?
 }
 
 /// 辨識的經過，給畫面提醒和除錯用。

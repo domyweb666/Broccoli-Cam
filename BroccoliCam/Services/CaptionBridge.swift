@@ -38,11 +38,12 @@ enum CaptionBridge {
                         isLandscape: known ? width > height : nil)
     }
 
-    /// 對字幕。progress 可能在任何執行緒。
-    static func build(_ project: CaptionProject, timeline: Timeline, maxChars: Int,
+    /// 對字幕。progress 可能在任何執行緒。fresh：聽過的也重新辨識一次。
+    /// hearings 是各段聽到的字，沒辨識的是 nil。
+    static func build(_ project: CaptionProject, timeline: Timeline, maxChars: Int, fresh: Bool,
                       log: @escaping (String) -> Void,
                       progress: @escaping (Double) -> Void)
-    async throws -> (lines: [CaptionLine], recognition: CaptionRecognition) {
+    async throws -> (lines: [CaptionLine], recognition: CaptionRecognition, hearings: [TakeHearing?]) {
         let count = min(project.clips.count, timeline.offsets.count, timeline.durations.count)
         let result = try await CaptionBuilder.build(
             clips: (0..<count).map { index in
@@ -52,10 +53,11 @@ enum CaptionBridge {
                  duration: timeline.durations[index])
             },
             maxChars: maxChars,
+            fresh: fresh,
             log: log,
             progress: progress
         )
-        return (lines: result.lines, recognition: result.recognition)
+        return (lines: result.lines, recognition: result.recognition, hearings: result.hearings)
     }
 
     /// 整支都沒聽到（沒網路、不能辨識）。只有部分失敗不算。

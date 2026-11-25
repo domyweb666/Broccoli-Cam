@@ -8,6 +8,14 @@ struct VideoReviewView: View {
     @EnvironmentObject private var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
     let video: RecordedVideo
+    /// 錄完的檢查。
+    @ObservedObject var checker: TakeChecker
+    /// 這個檔檢查時聽到的字。
+    var hearing: (String) -> TakeHearing? = { _ in nil }
+    /// 對字幕時聽到的字，交回去存。
+    var onHeard: (TakeHearing, String) -> Void = { _, _ in }
+    /// 這一頁關掉之後要重錄哪一個檔。
+    var onRetake: (String) -> Void = { _ in }
     /// 存到照片成功。
     var onSaved: () -> Void = {}
     /// 使用者不要這一支了。檔案由外面在這一頁關掉之後刪，這裡不刪。
@@ -39,6 +47,10 @@ struct VideoReviewView: View {
     /// 這支影片已經有字幕專案了。
     @State private var captionProject: CaptionProject?
     @State private var sendsAudioOut = false
+    /// 正在聽檢查出來的那一處。
+    @State private var playback: TakePlayback?
+    /// 在播放視窗按了重錄，等視窗關掉。
+    @State private var retakeFile: String?
 
     private enum SubtitleState: Equatable {
         case idle
@@ -52,6 +64,10 @@ struct VideoReviewView: View {
         prompts
             .sheet(item: $sharedSubtitle) { file in
                 ShareSheet(items: [file.url])
+            }
+            .sheet(item: $playback, onDismiss: playbackClosed) { item in
+                TakePlaybackView(playback: item, retakeTitle: retakeTitle,
+                                 onRetake: { retakeFile = item.file })
             }
             .fullScreenCover(item: $captionTicket, onDismiss: captionClosed) { ticket in
                 CaptionEditorView(projectID: ticket.id)
@@ -120,11 +136,63 @@ struct VideoReviewView: View {
                         .padding(.horizontal, 24)
                 }
 
+                checkRow
                 captionRow
                 subtitleRow
                 bottomRow
             }
         }
+    }
+
+    // MARK: - 這段檢查
+
+    /// 接好的看各段，單支就看自己。沒有檢查的（沒有稿子、沒開）不列。
+    private var checkEntries: [TakeCheckEntry] {
+        guard video.isStitched else {
+            guard let check = checker.checks[video.url.lastPathComponent] else { return [] }
+            return [TakeCheckEntry(title: nil, url: video.url, check: check)]
+        }
+        return video.takes.enumerated().compactMap { index, file -> TakeCheckEntry? in
+            guard let check = checker.checks[file] else { return nil }
+            return TakeCheckEntry(title: "第 \(index + 1) 段", url: TakeStore.shared.url(file), check: check)
+        }
+    }
+
+    @ViewBuilder
+    private var checkRow: some View {
+        let entries = checkEntries
+        if !entries.isEmpty {
+            TakeCheckCard(entries: entries, sendsAudioOut: checker.sendsAudioOut) { entry, issue in
+                guard playback == nil, captionTicket == nil, !isMakingProject else { return }
+                player?.pause()
+                playback = TakePlayback(url: entry.url, title: entry.title, issues: entry.issues, time: issue.time)
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    /// 存到照片之後各段就要收掉了，正在做別的事也不能丟，都不給重錄。
+    private var retakeTitle: String? {
+        switch saveState {
+        case .saving, .saved: return nil
+        case .idle, .failed: break
+        }
+        guard !isMakingProject else { return nil }
+        return video.isStitched ? "重錄這段" : "重新錄影"
+    }
+
+    private func playbackClosed() {
+        guard let file = retakeFile else { return }
+        retakeFile = nil
+        guard video.isStitched else {
+            // 單支丟了就沒了，照樣先問。
+            confirmDiscard = true
+            return
+        }
+        // 丟掉的只是接好的這支，各段都還在，重錄完再接一次。
+        onDiscard()
+        onRetake(file)
+        close()
     }
 
     private var bottomRow: some View {
@@ -224,29 +292,44 @@ struct VideoReviewView: View {
         isMakingProject = true
         captionProblem = nil
         player?.pause()
+        // 兩邊一起聽會互相打斷，檢查先讓開，校對頁關掉再繼續。
+        checker.hold(.captions, true)
         let video = self.video
         let style = settings.captionStyle
+        let sources = heard(video.captionSources)
+        let whole = heard(video.wholeSource)
         Task { @MainActor in
             do {
-                let project = try await Self.project(for: video, style: style)
+                let project = try await Self.project(for: video, sources: sources, whole: whole, style: style)
                 openedProject = project.id
                 captionTicket = CaptionTicket(id: project.id)
             } catch {
+                checker.hold(.captions, false)
                 captionProblem = "字幕專案沒有建成：\(error.localizedDescription)"
             }
             isMakingProject = false
         }
     }
 
-    private static func project(for video: RecordedVideo, style: CaptionStyle) async throws -> CaptionProject {
+    /// 檢查時聽過的帶進去，同一段不辨識兩次。
+    private func heard(_ sources: [CaptionSource]) -> [CaptionSource] {
+        sources.map { source in
+            var result = source
+            result.hearing = hearing(source.url.lastPathComponent)
+            return result
+        }
+    }
+
+    private static func project(for video: RecordedVideo, sources: [CaptionSource], whole: [CaptionSource],
+                                style: CaptionStyle) async throws -> CaptionProject {
         if let made = await existingProject(for: video) { return made }
         let store = CaptionStore.shared
         do {
-            return try await store.create(sources: video.captionSources, isLandscape: video.isLandscape, style: style)
+            return try await store.create(sources: sources, isLandscape: video.isLandscape, style: style)
         } catch {
             // 有一段連不到，就拿接好的整支來做。
             guard !video.parts.isEmpty else { throw error }
-            return try await store.create(sources: video.wholeSource, isLandscape: video.isLandscape, style: style)
+            return try await store.create(sources: whole, isLandscape: video.isLandscape, style: style)
         }
     }
 
@@ -275,7 +358,13 @@ struct VideoReviewView: View {
             if let opened, FileManager.default.fileExists(atPath: video.url.path) {
                 await CaptionStore.shared.discardIfEmpty(opened)
             }
-            captionProject = await Self.existingProject(for: video)
+            let project = await Self.existingProject(for: video)
+            captionProject = project
+            // 校對頁剛聽過的那幾段，檢查就不用再聽。
+            for clip in project?.clips ?? [] {
+                if let hearing = clip.hearing { onHeard(hearing, clip.file) }
+            }
+            checker.hold(.captions, false)
         }
     }
 
@@ -325,6 +414,7 @@ struct VideoReviewView: View {
     private func makeSubtitles() {
         subtitleState = .working
         player?.pause()
+        checker.hold(.subtitles, true)
         let url = video.url
         let script = video.script
         let maxChars = Int(settings.subtitleMaxChars)
@@ -334,11 +424,13 @@ struct VideoReviewView: View {
                     camera.log(message)
                 }
                 await MainActor.run {
+                    checker.hold(.subtitles, false)
                     subtitleState = .done(Self.subtitleNote(result, script: script))
                     sharedSubtitle = SharedFile(url: result.url)
                 }
             } catch {
                 await MainActor.run {
+                    checker.hold(.subtitles, false)
                     subtitleState = .failed(error.localizedDescription)
                     camera.log("字幕失敗：\(error.localizedDescription)")
                 }

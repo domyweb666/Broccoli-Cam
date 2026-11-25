@@ -5,6 +5,8 @@ struct SavedTake: Codable, Equatable {
     var file: String
     var firstSound: Double?
     var lastSound: Double?
+    /// 錄完檢查時聽到的字，加字幕直接拿來用。沒檢查過、舊檔是 nil。
+    var hearing: TakeHearing?
 }
 
 /// 分段錄到一半的進度。
@@ -67,6 +69,14 @@ struct SavedSession: Codable, Equatable {
         return result.count == 0 ? nil : result
     }
 
+    /// 不含聽到的字。
+    var withoutHearings: SavedSession {
+        var result = self
+        for index in takes.keys { result.takes[index]?.hearing = nil }
+        result.pending?.hearing = nil
+        return result
+    }
+
     /// 這支接好的影片是不是就由現在這幾段接成的。
     func matches(_ files: [String]?) -> Bool {
         guard let files, !files.isEmpty else { return false }
@@ -98,6 +108,8 @@ struct SavedVideo: Codable, Equatable {
     var notice: String?
     /// 由哪幾段接成。存到照片之後只刪這幾段。
     var takes: [String]?
+    /// 一鏡到底那支錄完檢查時聽到的字。
+    var hearing: TakeHearing?
 }
 
 struct TakeManifest: Codable, Equatable {
@@ -106,6 +118,15 @@ struct TakeManifest: Codable, Equatable {
     var shelf: SavedSession?
     var recordings: [SavedRecording] = []
     var videos: [SavedVideo] = []
+
+    /// 不含聽到的字，小很多，提到的檔案一樣。聽到的字可以再聽一次，檔案清單不行。
+    var withoutHearings: TakeManifest {
+        var result = self
+        result.session = session?.withoutHearings
+        result.shelf = shelf?.withoutHearings
+        for index in result.videos.indices { result.videos[index].hearing = nil }
+        return result
+    }
 
     /// 有提到的檔案。
     var files: Set<String> {
@@ -192,11 +213,11 @@ final class TakeStore: @unchecked Sendable {
     private func commit(_ manifest: TakeManifest, deleting files: [String]) {
         deferred.formUnion(files)
         if !blocked, manifest != lastWritten {
-            guard write(manifest) else {
+            guard let written = write(manifest) else {
                 lastSaveOK = false
                 return
             }
-            lastWritten = manifest
+            lastWritten = written
         }
         lastSaveOK = true
         let mentioned = manifest.files
@@ -206,7 +227,8 @@ final class TakeStore: @unchecked Sendable {
         deferred.removeAll()
     }
 
-    private func write(_ manifest: TakeManifest) -> Bool {
+    /// 回傳真的寫進去的那份，沒寫成功是 nil。
+    private func write(_ manifest: TakeManifest) -> TakeManifest? {
         do {
             try writeOnce(manifest)
         } catch {
@@ -214,14 +236,17 @@ final class TakeStore: @unchecked Sendable {
             try? FileManager.default.removeItem(at: url(Self.reserveName))
             do {
                 try writeOnce(manifest)
+                return manifest
             } catch {
+                // 聽到的字可能比預留的空間還大，先不存它，清單要寫得進去才要緊。
+                let light = manifest.withoutHearings
+                if light != manifest, (try? writeOnce(light)) != nil { return light }
                 onLog?("錄影清單沒存成功：\(error.localizedDescription)")
-                return false
+                return nil
             }
-            return true
         }
         makeReserve()
-        return true
+        return manifest
     }
 
     private func writeOnce(_ manifest: TakeManifest) throws {

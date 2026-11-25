@@ -15,17 +15,33 @@ enum CaptionBuilder {
     /// 連續幾次失敗就不再試，多半是沒有網路或用完當天的次數。
     private static let maxFailures = 3
 
-    /// log 和 progress（0 到 1）在背景執行緒呼叫。
-    static func build(clips: [Clip], maxChars: Int, log: @escaping (String) -> Void,
+    /// log 和 progress（0 到 1）在背景執行緒呼叫。錄完檢查聽過的段落直接拿來用，fresh 是一律重新辨識。
+    /// hearings 是各段聽到的字，沒辨識的是 nil。
+    static func build(clips: [Clip], maxChars: Int, fresh: Bool = false, log: @escaping (String) -> Void,
                       progress: @escaping (Double) -> Void) async throws
-        -> (lines: [CaptionLine], recognition: CaptionRecognition) {
+        -> (lines: [CaptionLine], recognition: CaptionRecognition, hearings: [TakeHearing?]) {
         guard !clips.isEmpty else { throw SubtitleError.nothingToWrite }
-        let engine = try await Engine.prepare()
-        if engine.isOff {
-            // 有稿子就照字數平均排時間，還是給得出字幕；沒稿子就真的做不了。
-            guard clips.contains(where: { hasWords($0.clip.script) }) else { throw SubtitleError.unavailable }
-            log("字幕：語音辨識不可用，照字數平均排時間")
+        var remembered: [Int: Hearing] = [:]
+        if !fresh {
+            for (index, item) in clips.enumerated() {
+                if let known = await recall(item) { remembered[index] = known }
+            }
         }
+        var engine = Engine.off
+        // 全部聽過就不碰辨識，沒有網路也做得出來。
+        if remembered.count < clips.count {
+            engine = try await Engine.prepare()
+            if engine.isOff {
+                // 有稿子就照字數平均排時間，還是給得出字幕；沒稿子就真的做不了。
+                guard !remembered.isEmpty || clips.contains(where: { hasWords($0.clip.script) }) else {
+                    throw SubtitleError.unavailable
+                }
+                log("字幕：語音辨識不可用，照字數平均排時間")
+            }
+        }
+        if !remembered.isEmpty { log("字幕：\(remembered.count) 段沿用錄完檢查聽到的字") }
+        // 整支都沒有辨識。
+        let isOff = engine.isOff && remembered.isEmpty
 
         let total = max(0.1, clips.reduce(0) { $0 + $1.duration })
         var done = 0.0
@@ -37,13 +53,21 @@ enum CaptionBuilder {
         var confidences: [Double] = []
         var lastError: Error?
         var hasAudio = false
+        var hearings: [TakeHearing?] = []
         progress(0)
 
         for (index, item) in clips.enumerated() {
             try Task.checkCancellation()
             let before = done
-            let hearing = try await listen(item, engine: engine) { seconds in
-                progress(min(0.98, (before + seconds) / total))
+            let hearing: Hearing
+            if let known = remembered[index] {
+                hearing = known
+                hearings.append(item.clip.hearing)
+            } else {
+                hearing = try await listen(item, engine: engine) { seconds in
+                    progress(min(0.98, (before + seconds) / total))
+                }
+                hearings.append(record(hearing, duration: item.duration))
             }
             done += item.duration
             progress(min(0.98, done / total))
@@ -79,16 +103,76 @@ enum CaptionBuilder {
             if let lastError { throw SubtitleError.failed(lastError.localizedDescription) }
             throw SubtitleError.nothingToWrite
         }
-        if engine.isOff || lines.allSatisfy({ $0.status == .unrecognized }) {
-            recognition.problem = await problem(engine, lastError, onDevice: recognition.onDevice).rawValue
+        if isOff || lines.allSatisfy({ $0.status == .unrecognized }) {
+            recognition.problem = await problem(isOff, lastError, onDevice: recognition.onDevice).rawValue
         }
         progress(1)
-        return (lines, recognition)
+        return (lines, recognition, hearings)
+    }
+
+    // MARK: - 錄完檢查
+
+    /// 現在能不能直接聽，不會跳出權限視窗。
+    static var canListenQuietly: Bool {
+        #if targetEnvironment(simulator)
+        if FakeCaptionRecognizer.scenario != nil { return true }
+        #endif
+        return SpeechFollower.isAuthorized
+    }
+
+    /// 只聽一支影片，不排字幕。聽不成就丟錯；只聽到一部分的，失敗的範圍會寫在裡面。
+    static func hear(_ url: URL, script: String) async throws -> TakeHearing {
+        guard canListenQuietly else { throw SubtitleError.notAuthorized }
+        let engine = try await Engine.prepare()
+        guard !engine.isOff else { throw SubtitleError.unavailable }
+        guard let span = try await fileSpan(AVURLAsset(url: url)) else { throw SubtitleError.noAudio }
+        let duration: Double = span.upperBound - span.lowerBound
+        let clip = CaptionClip(file: url.lastPathComponent, start: nil, end: nil, script: script)
+        let item: Clip = (url: url, clip: clip, offset: 0, duration: duration)
+        let hearing = try await listen(item, engine: engine) { _ in }
+        guard let result = record(hearing, duration: duration) else { throw SubtitleError.noAudio }
+        return result
+    }
+
+    /// 換成影片檔自己的秒數留著。沒有真的聽到的是 nil。
+    private static func record(_ hearing: Hearing, duration: Double) -> TakeHearing? {
+        guard hearing.hasAudio, let info = hearing.info else { return nil }
+        let start: Double = hearing.start
+        let words: [CaptionWord] = hearing.words.map { heard in
+            CaptionWord(text: heard.word.text, start: heard.word.start + start, end: heard.word.end + start)
+        }
+        let failed: [ClosedRange<Double>] = hearing.failed.map { range in
+            (range.lowerBound + start)...(range.upperBound + start)
+        }
+        return TakeHearing(words: words, failed: failed, engine: info.engine, onDevice: info.onDevice,
+                           fileLength: hearing.fileLength, from: start, to: start + duration)
+    }
+
+    /// 這一段之前聽過、而且整段都聽成了，就換成這一段的秒數拿來用。裁掉的地方的字不要。
+    private static func recall(_ item: Clip) async -> Hearing? {
+        guard let known = item.clip.hearing, known.isComplete else { return nil }
+        guard let found = try? await fileSpan(AVURLAsset(url: item.url)) else { return nil }
+        let span: ClosedRange<Double> = found
+        let start: Double = fileStart(span, item.clip)
+        guard abs(span.upperBound - known.fileLength) <= 0.1, known.from <= start + 0.1,
+              known.to >= start + item.duration - 0.1 else { return nil }
+        var hearing = Hearing()
+        hearing.start = start
+        hearing.fileLength = known.fileLength
+        hearing.info = CaptionRecognizerInfo(engine: known.engine, onDevice: known.onDevice, maxSeconds: nil)
+        hearing.words = known.words.compactMap { word -> HeardWord? in
+            let middle: Double = (word.start + word.end) / 2 - start
+            guard middle >= 0, middle <= item.duration else { return nil }
+            let moved = CaptionWord(text: word.text, start: max(0, word.start - start),
+                                    end: min(item.duration, word.end - start))
+            return HeardWord(word: moved, confidence: nil)
+        }
+        return hearing
     }
 
     /// 整支都沒聽到，是卡在哪裡。查得出來的才講，不要什麼都說成沒網路。
-    private static func problem(_ engine: Engine, _ error: Error?, onDevice: Bool) async -> CaptionProblem {
-        if engine.isOff {
+    private static func problem(_ isOff: Bool, _ error: Error?, onDevice: Bool) async -> CaptionProblem {
+        if isOff {
             #if targetEnvironment(simulator)
             if let scenario = FakeCaptionRecognizer.scenario {
                 return scenario.contains("offline") ? .noNetwork : .unavailable
@@ -125,6 +209,7 @@ enum CaptionBuilder {
         var moved = line
         moved.start += offset
         moved.end += offset
+        moved.doubtTime = moved.doubtTime.map { $0 + offset }
         for index in moved.words.indices {
             moved.words[index].start += offset
             moved.words[index].end += offset
@@ -187,6 +272,9 @@ enum CaptionBuilder {
         var hasAudio = true
         var error: Error?
         var info: CaptionRecognizerInfo?
+        /// 這一段從影片檔的第幾秒開始、檔案的畫面到第幾秒。
+        var start = 0.0
+        var fileLength = 0.0
     }
 
     private struct Chunk {
@@ -197,21 +285,29 @@ enum CaptionBuilder {
         var heardTo: Double?
     }
 
-    /// 這一段在影片檔裡的起點。規則和接片一樣：裁完太短就整段保留。
-    private static func fileStart(_ asset: AVAsset, _ clip: CaptionClip) async throws -> Double {
-        guard let track = try await asset.loadTracks(withMediaType: .video).first else { return clip.start ?? 0 }
+    /// 影片檔畫面的範圍（秒）。
+    private static func fileSpan(_ asset: AVAsset) async throws -> ClosedRange<Double>? {
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else { return nil }
         let range = try await track.load(.timeRange)
         let lower = range.start.seconds
         let upper = range.end.seconds
-        let start = max(lower, clip.start ?? lower)
-        let end = min(upper, clip.end ?? upper)
-        return end - start < 0.5 ? lower : start
+        guard lower.isFinite, upper.isFinite, upper >= lower else { return nil }
+        return lower...upper
+    }
+
+    /// 這一段在影片檔裡的起點。規則和接片一樣：裁完太短就整段保留。
+    private static func fileStart(_ span: ClosedRange<Double>?, _ clip: CaptionClip) -> Double {
+        guard let span else { return clip.start ?? 0 }
+        let start = max(span.lowerBound, clip.start ?? span.lowerBound)
+        let end = min(span.upperBound, clip.end ?? span.upperBound)
+        return end - start < 0.5 ? span.lowerBound : start
     }
 
     private static func listen(_ item: Clip, engine: Engine, tick: (Double) -> Void) async throws -> Hearing {
         let asset = AVURLAsset(url: item.url)
         let hasScript = hasWords(item.clip.script)
-        let start = try await fileStart(asset, item.clip)
+        let span = try await fileSpan(asset)
+        let start = fileStart(span, item.clip)
         var lower = 0.0
         var upper = item.duration
         let available: CaptionRecognizing?
@@ -283,6 +379,8 @@ enum CaptionBuilder {
         hearing.failed = gaps(chunks, lower: lower, upper: upper)
         hearing.error = lastError
         hearing.info = recognizer.info
+        hearing.start = start
+        hearing.fileLength = span?.upperBound ?? 0
         return hearing
     }
 

@@ -79,10 +79,15 @@ final class RecordingViewModel: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle {
         didSet {
+            // 語音跟隨優先，錄影的時候不檢查。
+            if phase != .idle { checker.hold(.recording, true) }
             guard phase == .idle, oldValue != .idle else { return }
             // 錄完的那一段要先記下來，再看有沒有等著套用的新稿。
             DispatchQueue.main.async { [weak self] in
-                self?.reconsiderScript()
+                guard let self else { return }
+                self.reconsiderScript()
+                // 剛錄完的那一段排最前面，要等它記下來才放行。
+                if self.phase == .idle { self.checker.hold(.recording, false) }
             }
         }
     }
@@ -116,6 +121,12 @@ final class RecordingViewModel: ObservableObject {
     private var shelf: SavedSession?
     /// 現在是不是照「不看」在錄（段落已經收好）。
     private var isOff = false
+    /// 正在聽檢查出來的那一處。
+    @Published var checkPlayback: TakePlayback?
+    /// 視窗關掉之後要重錄哪一個檔。
+    private var retakeFile: String?
+    /// 各檔聽到的字，照檔名記。
+    private var hearings: [String: TakeHearing] = [:]
     /// 跳轉、切換之後在畫面上閃一下的字，約 1.2 秒自己消失。
     @Published private(set) var jumpNote: String?
     /// 按下錄影那一刻介面轉的角度，錄影中不跟著手機晃動改變。
@@ -150,6 +161,7 @@ final class RecordingViewModel: ObservableObject {
     private let alertGap: TimeInterval = 0.45
 
     let prompter = TeleprompterModel()
+    let checker = TakeChecker()
     private let follower = SpeechFollower()
 
     /// 稿件或設定頁開著的時候，不回應音量鍵。
@@ -161,6 +173,7 @@ final class RecordingViewModel: ObservableObject {
     var hasWindow: Bool {
         review != nil || openingVideo || recovery != nil || scriptChange != nil
             || mergeError != nil || orientationError != nil || recordingError != nil
+            || checkPlayback != nil
     }
 
     private weak var camera: CameraService?
@@ -263,6 +276,17 @@ final class RecordingViewModel: ObservableObject {
                 self?.recordingChanged(recording)
             }
             .store(in: &cancellables)
+        checker.onLog = { [weak camera] message in
+            camera?.log(message)
+        }
+        checker.onHeard = { [weak self] file, hearing in
+            self?.keepHearing(hearing, for: file)
+        }
+        checker.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
         store.onLog = { [weak camera] message in
             camera?.log(message)
         }
@@ -278,7 +302,9 @@ final class RecordingViewModel: ObservableObject {
     /// 把現在的狀態存下來，存成功之後才刪 urls。狀態一變就呼叫，內容沒變不會重寫。
     private func persist(deleting urls: [URL] = []) {
         guard loaded else { return }
+        for url in urls { hearings[url.lastPathComponent] = nil }
         store.save(manifest(), deleting: urls.map { $0.lastPathComponent })
+        syncChecks()
     }
 
     private func manifest() -> TakeManifest {
@@ -302,16 +328,24 @@ final class RecordingViewModel: ObservableObject {
 
     private func liveSession() -> SavedSession {
         SavedSession(
-            segments: pieces.map(\.text), currentIndex: currentIndex, takes: takes.mapValues { $0.saved },
-            takesLandscape: takesLandscape, pending: pending?.saved,
+            segments: pieces.map(\.text), currentIndex: currentIndex, takes: takes.mapValues { saved($0) },
+            takesLandscape: takesLandscape, pending: pending.map { saved($0) },
             pendingAngle: lockedAngle, declinedSegments: declinedPieces?.map(\.text),
             captionScripts: pieces.map(\.captionScript), points: pieces.map(\.isPoint),
             declinedPoints: declinedPieces?.map(\.isPoint)
         )
     }
 
+    private func saved(_ take: SegmentTake) -> SavedTake {
+        var result = take.saved
+        result.hearing = hearings[result.file]
+        return result
+    }
+
     /// 把存下來的進度放回畫面。
     private func apply(_ saved: SavedSession) {
+        for take in saved.takes.values { hearings[take.file] = take.hearing }
+        if let take = saved.pending { hearings[take.file] = take.hearing }
         pieces = saved.pieces
         currentIndex = saved.currentIndex
         takes = saved.takes.mapValues { SegmentTake($0, in: store) }
@@ -338,6 +372,7 @@ final class RecordingViewModel: ObservableObject {
         let saved = result.manifest
         recordings = saved.recordings
         videos = saved.videos
+        for video in videos { hearings[video.file] = video.hearing }
         // 兩個不會同時有東西：分段進度只在有字的時候，切到「不看」就整個收著。
         recoveredSession = saved.session ?? saved.shelf
         recoveredCount = recoveredSession?.count ?? 0
@@ -437,7 +472,7 @@ final class RecordingViewModel: ObservableObject {
         if !videos.contains(where: { $0.file == file }) {
             videos.append(SavedVideo(file: file, isStitched: video.isStitched, script: video.script,
                                      isLandscape: video.isLandscape, notice: video.notice,
-                                     takes: video.isStitched ? video.takes : nil))
+                                     takes: video.isStitched ? video.takes : nil, hearing: hearings[file]))
         }
         shownVideo = video.url
         review = video
@@ -466,6 +501,8 @@ final class RecordingViewModel: ObservableObject {
                 persist(deleting: [url])
             }
         }
+        syncChecks()
+        goRetake()
         askRecovery(after: alertGap)
     }
 
@@ -792,6 +829,115 @@ final class RecordingViewModel: ObservableObject {
         }
         persist(deleting: files)
         prompter.reset()
+    }
+
+    // MARK: - 這段檢查
+
+    /// 現在該檢查哪些，剛錄完的排最前面。任何會增減影片的動作之後都要叫，重複呼叫沒有關係。
+    func syncChecks() {
+        checker.sync(checkJobs())
+    }
+
+    private func checkJobs() -> [TakeChecker.Job] {
+        guard loaded, settings?.takeCheck ?? false, CaptionBuilder.canListenQuietly else { return [] }
+        var jobs: [TakeChecker.Job] = []
+        func add(_ url: URL, _ script: String) {
+            // 提綱的重點沒有稿子，不檢查。
+            guard TakeChecker.canCheck(script) else { return }
+            jobs.append(TakeChecker.Job(url: url, script: script, hearing: hearings[url.lastPathComponent]))
+        }
+        if let pending, pieces.indices.contains(currentIndex) {
+            add(pending.url, pieces[currentIndex].captionScript)
+        }
+        // 接好的那種看各段就好，不用整支再聽一次。
+        if let review, !review.isStitched { add(review.url, review.script) }
+        for index in takes.keys.sorted() where pieces.indices.contains(index) {
+            if let take = takes[index] { add(take.url, pieces[index].captionScript) }
+        }
+        return jobs
+    }
+
+    /// 聽到的字存起來，加字幕的時候同一段不用再聽一次。
+    private func keepHearing(_ hearing: TakeHearing, for file: String) {
+        hearings[file] = hearing
+        if let index = videos.firstIndex(where: { $0.file == file }) { videos[index].hearing = hearing }
+        persist()
+    }
+
+    /// 對字幕時聽到的，自己還沒聽過才收。
+    func adoptHearing(_ hearing: TakeHearing, for file: String) {
+        guard hearing.isComplete, !(hearings[file]?.isComplete ?? false),
+              checker.checks[file] != nil else { return }
+        keepHearing(hearing, for: file)
+    }
+
+    func hearing(of file: String) -> TakeHearing? {
+        hearings[file]
+    }
+
+    /// 剛錄完那一段的檢查。沒有要檢查就是 nil。
+    var pendingCheck: TakeCheckEntry? {
+        guard let take = pending, let check = checker.checks[take.url.lastPathComponent] else { return nil }
+        return TakeCheckEntry(title: nil, url: take.url, check: check)
+    }
+
+    /// 已經留用、檢查出東西的段落。正在錄、還沒決定留用的時候不提。
+    var checkFlags: [TakeCheckFlag] {
+        guard !isBusy, pending == nil else { return [] }
+        return takes.keys.sorted().compactMap { index -> TakeCheckFlag? in
+            guard let take = takes[index], let report = checker.checks[take.url.lastPathComponent]?.report,
+                  !report.issues.isEmpty else { return nil }
+            return TakeCheckFlag(index: index, count: report.issues.count)
+        }
+    }
+
+    /// 目前這段已經留用、但沒檢查到。
+    var currentIsUnchecked: Bool {
+        guard pending == nil, let take = takes[currentIndex] else { return false }
+        return checker.checks[take.url.lastPathComponent]?.isUnchecked ?? false
+    }
+
+    func openPendingCheck(_ issue: TakeIssue) {
+        guard let entry = pendingCheck else { return }
+        openCheck(entry, title: "第 \(currentIndex + 1) 段", at: issue.time)
+    }
+
+    /// 跳到那一段，打開第一處。
+    func openSegmentCheck(_ index: Int) {
+        guard !isBusy, pending == nil, !restoring, !hasWindow, let take = takes[index],
+              let check = checker.checks[take.url.lastPathComponent],
+              let first = check.report?.issues.first else { return }
+        step(index - currentIndex)
+        openCheck(TakeCheckEntry(title: nil, url: take.url, check: check), title: "第 \(index + 1) 段", at: first.time)
+    }
+
+    private func openCheck(_ entry: TakeCheckEntry, title: String, at time: Double) {
+        guard phase == .idle, !isMerging, !restoring, !hasWindow else { return }
+        checkPlayback = TakePlayback(url: entry.url, title: title, issues: entry.issues, time: time)
+    }
+
+    /// 在播放視窗按了重錄。檔案還在播，等視窗（或完成頁）關掉才動手。
+    func requestRetake(_ file: String) {
+        retakeFile = file
+    }
+
+    /// 播放視窗關掉了。
+    func playbackClosed() {
+        goRetake()
+    }
+
+    /// 還沒決定留用的就丟掉重錄；已經留用的跳到那一段，錄好新的、按了留用才會換掉。
+    private func goRetake() {
+        guard let file = retakeFile else { return }
+        retakeFile = nil
+        if pending?.url.lastPathComponent == file {
+            retakePending()
+            return
+        }
+        guard !isBusy, pending == nil,
+              let index = takes.first(where: { $0.value.url.lastPathComponent == file })?.key else { return }
+        step(index - currentIndex)
+        showNote("第 \(index + 1) 段")
     }
 
     // MARK: - 倒數

@@ -7,6 +7,8 @@ struct CaptionSource: Equatable {
     var start: Double?
     var end: Double?
     var script = ""
+    /// 錄完檢查時聽到的字，有就不用再辨識一次。
+    var hearing: TakeHearing?
 }
 
 /// 字幕專案列表的一列。
@@ -251,7 +253,8 @@ final class CaptionStore: @unchecked Sendable {
                 var name = source.url.lastPathComponent
                 if clips.contains(where: { $0.file == name }) { name = "\(index)-\(name)" }
                 try attach(source.url, to: staging.appendingPathComponent(name))
-                clips.append(CaptionClip(file: name, start: source.start, end: source.end, script: source.script))
+                clips.append(CaptionClip(file: name, start: source.start, end: source.end, script: source.script,
+                                         hearing: source.hearing))
             }
             let project = CaptionProject(id: id, isLandscape: isLandscape, duration: 0, clips: clips, style: style)
             let data = try Self.encode(project)

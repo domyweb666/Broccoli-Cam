@@ -117,7 +117,8 @@ struct RecordingView: View {
         let keysOnRight = uiAngle >= 0
 
         return ZStack {
-            if !showLook {
+            // 檢查的小卡會長到開關那裡，留用或重錄之前先收起來。
+            if !showLook, viewModel.pendingCheck == nil {
                 QuickToggles(
                     isBusy: viewModel.isBusy,
                     showsVoice: settings.usesPrompter && !viewModel.currentIsPoint,
@@ -179,7 +180,8 @@ struct RecordingView: View {
     private func sideStrip(previewHeight: CGFloat) -> some View {
         let topInset: CGFloat = previewHeight * 0.40 + 20
         let length: CGFloat = max(200, min(previewHeight - topInset - 110, 440))
-        let thickness: CGFloat = viewModel.isSegmented ? 150 : 44
+        let checkHeight: CGFloat = viewModel.pendingCheck.map { TakeCheckCard.height([$0]) + 8 } ?? flagHeight
+        let thickness: CGFloat = viewModel.isSegmented ? 150 + checkHeight : 44
         let edge: Alignment = uiAngle > 0 ? .leading : .trailing
         return statusAndSegments
             .frame(width: length)
@@ -277,6 +279,9 @@ struct RecordingView: View {
             .onChange(of: scenePhase) { _, phase in
                 sceneChanged(phase)
             }
+            .onChange(of: settings.takeCheck) { _, _ in
+                viewModel.syncChecks()
+            }
     }
 
     private func appeared() {
@@ -294,9 +299,16 @@ struct RecordingView: View {
     private func sceneChanged(_ phase: ScenePhase) {
         switch phase {
         case .active:
-            if viewModel.review == nil && !viewModel.isCaptionEditing { startCamera() }
+            // 播放視窗、完成頁、校對頁自己會停相機，關掉才叫起來。
+            if viewModel.review == nil && !viewModel.isCaptionEditing && viewModel.checkPlayback == nil {
+                startCamera()
+            }
             clipPlayer.resume()
+            viewModel.checker.hold(.background, false)
+            viewModel.syncChecks()
         case .background:
+            // 在背景辨識會被系統收走，回來再聽。
+            viewModel.checker.hold(.background, true)
             viewModel.interrupt()
             camera.stop()
         default:
@@ -327,9 +339,22 @@ struct RecordingView: View {
             }
     }
 
+    /// 聽檢查出來的那一處。
+    private var checkPresented: some View {
+        recoveryAlerts
+            .sheet(item: $viewModel.checkPlayback, onDismiss: {
+                // 播放器收掉了才把相機叫起來，音訊才換得回去。
+                startCamera()
+                viewModel.playbackClosed()
+            }) { playback in
+                TakePlaybackView(playback: playback, retakeTitle: "重錄這段",
+                                 onRetake: { viewModel.requestRetake(playback.file) })
+            }
+    }
+
     /// 彈出視窗：提示、腳本、設定、完成頁。
     private var presented: some View {
-        recoveryAlerts
+        checkPresented
         .alert("接片沒有成功", isPresented: mergeErrorShown) {
             Button("好") {}
         } message: {
@@ -371,6 +396,10 @@ struct RecordingView: View {
         }) { video in
             VideoReviewView(
                 video: video,
+                checker: viewModel.checker,
+                hearing: { file in viewModel.hearing(of: file) },
+                onHeard: { hearing, file in viewModel.adoptHearing(hearing, for: file) },
+                onRetake: { file in viewModel.requestRetake(file) },
                 onSaved: { viewModel.reviewSaved(video) },
                 onDiscard: { viewModel.reviewDiscarded(video) },
                 onDiscardAll: { viewModel.discardTakes(of: video) }
@@ -447,8 +476,13 @@ struct RecordingView: View {
 
     /// 底下的狀態列、分段列、控制列蓋進預覽區多少。視訊通話的自己小窗要放在這之上。
     private func controlsOverlap(screenHeight: CGFloat, previewHeight: CGFloat) -> CGFloat {
-        let controls: CGFloat = 130 + (viewModel.isSegmented ? 110 : 0)
+        let controls: CGFloat = 130 + (viewModel.isSegmented ? 110 + flagHeight : 0)
         return max(0, controls - (screenHeight - previewHeight))
+    }
+
+    /// 「第 2 段有 1 處」那一列多佔的高度。沒有「接成一支」的按鈕時，原本就留了一列的位置。
+    private var flagHeight: CGFloat {
+        viewModel.allRecorded && !viewModel.checkFlags.isEmpty ? 52 : 0
     }
 
     /// 目前這段（或整篇）稿件預估要講多久；沒有稿件時不顯示。
@@ -490,6 +524,8 @@ struct RecordingView: View {
     /// 從設定打開或關掉字幕校對頁。校對頁自己會停相機，關掉再叫起來。
     private func captionEditing(_ open: Bool) {
         viewModel.isCaptionEditing = open
+        // 校對頁可能要辨識，檢查先讓開。
+        viewModel.checker.hold(.captions, open)
         if !open { startCamera() }
     }
 
@@ -1129,7 +1165,15 @@ private struct SegmentBar: View {
                             .font(.subheadline)
                             .foregroundStyle(Theme.good)
                     }
+                    if viewModel.currentIsUnchecked {
+                        // 錄好了的勾不可以讓人以為檢查過。
+                        Text("沒檢查到")
+                            .font(.footnote)
+                            .foregroundStyle(.yellow)
+                    }
                 }
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
 
                 Button {
                     viewModel.step(1)
@@ -1143,6 +1187,14 @@ private struct SegmentBar: View {
                 .opacity(canGoForward ? 1 : 0.3)
             }
             .foregroundStyle(.white)
+
+            if let entry = viewModel.pendingCheck {
+                TakeCheckCard(entries: [entry], sendsAudioOut: viewModel.checker.sendsAudioOut) { _, issue in
+                    viewModel.openPendingCheck(issue)
+                }
+            }
+
+            flags
 
             if viewModel.pending != nil {
                 HStack(spacing: 10) {
@@ -1186,6 +1238,36 @@ private struct SegmentBar: View {
         .padding(.vertical, 8)
         .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .padding(.horizontal, 10)
+    }
+
+    /// 留用了但檢查出東西的段落，點了跳過去聽。
+    @ViewBuilder
+    private var flags: some View {
+        let list: [TakeCheckFlag] = viewModel.checkFlags
+        if !list.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(list) { flag in
+                        Button {
+                            viewModel.openSegmentCheck(flag.index)
+                        } label: {
+                            flagLabel(flag)
+                        }
+                    }
+                }
+            }
+            .frame(height: 44)
+        }
+    }
+
+    private func flagLabel(_ flag: TakeCheckFlag) -> some View {
+        Label(flag.text, systemImage: "exclamationmark.circle.fill")
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(.yellow)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 44)
+            .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .contentShape(Rectangle())
     }
 }
 

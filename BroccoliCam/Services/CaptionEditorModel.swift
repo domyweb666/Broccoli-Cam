@@ -242,8 +242,9 @@ final class CaptionEditorModel: ObservableObject {
 
     // MARK: - 對字幕
 
-    /// keepsOnFailure：整支都沒聽到就丟錯、不換掉現有的字幕。
-    private func recognize(_ known: CaptionBridge.Timeline?, keepsOnFailure: Bool = false) async throws {
+    /// keepsOnFailure：整支都沒聽到就丟錯、不換掉現有的字幕。fresh：錄完檢查聽過的也重新辨識。
+    private func recognize(_ known: CaptionBridge.Timeline?, keepsOnFailure: Bool = false,
+                           fresh: Bool = false) async throws {
         phase = .recognizing
         progress = 0
         guard await authorized() else { throw CaptionEditorError.notAuthorized }
@@ -264,7 +265,7 @@ final class CaptionEditorModel: ObservableObject {
         try Task.checkCancellation()
         let maxChars = source.isLandscape ? limits.landscape : limits.portrait
         let result = try await CaptionBridge.build(
-            source, timeline: timeline, maxChars: maxChars, log: log,
+            source, timeline: timeline, maxChars: maxChars, fresh: fresh, log: log,
             progress: { @Sendable [weak self] value in
                 Task { @MainActor [weak self] in
                     self?.recognitionMoved(value, ticket: ticket)
@@ -279,6 +280,10 @@ final class CaptionEditorModel: ObservableObject {
         var next = project
         next.lines = CaptionEditing.cleaned(result.lines, duration: next.duration)
         next.recognition = result.recognition
+        // 這次聽到的留著，錄完檢查還沒聽的那幾段就不用再聽一次。
+        for (index, hearing) in result.hearings.enumerated() where next.clips.indices.contains(index) {
+            if let hearing { next.clips[index].hearing = hearing }
+        }
         hidesProblem = false
         commit(next)
         // 打開時的備份是空的，第一次對好就換上。重新對的不換，備份留著打開時的字。
@@ -316,7 +321,7 @@ final class CaptionEditorModel: ObservableObject {
         loadTask?.cancel()
         loadTask = Task {
             do {
-                try await recognize(nil, keepsOnFailure: !before.lines.isEmpty)
+                try await recognize(nil, keepsOnFailure: !before.lines.isEmpty, fresh: true)
                 push(before)
                 selectedID = pending.first?.id
             } catch {
@@ -450,6 +455,7 @@ final class CaptionEditorModel: ObservableObject {
         }
         var next = project
         next.lines[index].text = text
+        next.lines[index].clearDoubt()
         commit(next)
     }
 
@@ -489,6 +495,7 @@ final class CaptionEditorModel: ObservableObject {
         update(lineID) { line in
             line.text = text
             line.isConfirmed = true
+            line.clearDoubt()
         }
         goToNextPending(after: start)
     }
