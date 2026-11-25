@@ -101,6 +101,7 @@ private struct QuickButton: View {
     let side: CGFloat
     var badge: String?
     /// 錄影時各顆自己淡，還能按的那顆淡得少一點。
+    /// 不要改成整條一起 .opacity：iOS 26 實測那樣錄影中連還能按的語音跟隨都收不到點擊。
     var dim: Double = 1
     let action: () -> Void
 
@@ -143,11 +144,14 @@ private struct QuickButton: View {
 struct JumpKeys: View {
     let angle: Double
     let side: CGFloat
+    /// 底下有自己的小窗時左右排，往下的那顆才不會疊到小窗。
+    var sideBySide = false
     let onJump: (_ forward: Bool) -> Void
 
     var body: some View {
         // 橫放時使用者看到的「上」是手機的右邊（90）或左邊（-90），兩顆改成左右排，看起來還是上下。
-        let stack: AnyLayout = angle == 0 ? AnyLayout(VStackLayout(spacing: 6)) : AnyLayout(HStackLayout(spacing: 6))
+        let isColumn: Bool = angle == 0 && !sideBySide
+        let stack: AnyLayout = isColumn ? AnyLayout(VStackLayout(spacing: 6)) : AnyLayout(HStackLayout(spacing: 6))
         stack {
             if angle > 0 {
                 key(forward: true)

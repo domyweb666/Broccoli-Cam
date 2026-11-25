@@ -140,7 +140,7 @@ struct RecordingView: View {
 
             // 重點整張看得到的話，只有分段錄影要換段時才用得到跳轉鍵。
             if settings.usesPrompter, viewModel.currentScrolls || viewModel.isSegmented {
-                JumpKeys(angle: uiAngle, side: side) { forward in
+                JumpKeys(angle: uiAngle, side: side, sideBySide: showsListener) { forward in
                     viewModel.jump(forward: forward)
                 }
                 .padding(.horizontal, 8)
