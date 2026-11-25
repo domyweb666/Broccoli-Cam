@@ -6,9 +6,24 @@ struct ModeSheet: View {
     @EnvironmentObject private var settings: SettingsStore
     @Environment(\.dismiss) private var dismiss
 
+    /// 預設展開的高度，照裡面實際有的東西一段段加起來，剛好看到全部、不會切一半。
+    /// 放不下的時候系統會收到最高，裡面可以捲。
     private var height: CGFloat {
-        guard settings.hasListener else { return 330 }
-        return CompanionAssets.available.count > 1 ? 760 : 670
+        // 上下留白（20＋8、20），加上拖拉把手和底部安全區約 60。
+        var total: CGFloat = 28 + 20 + 60
+        total += 80                                  // 全稿／提綱／不看
+        total += 12 + SwitchCard.detailHeight        // 有人聽（兩行說明）
+        total += 12 + SwitchCard.detailHeight        // 不看自己（兩行說明）
+        guard settings.hasListener else { return total }
+        total += 12 + SwitchCard.detailHeight        // 即時反應（兩行說明）
+        if CompanionAssets.available.count > 1 {
+            total += 12 + 88                         // 頭像列：72＋圈 8＋上下 8
+        }
+        if settings.usesPrompter {
+            total += 12 + 40                         // 只剩兩種擺法的說明，兩行
+        }
+        total += 12 + 140 * 2 + 12                   // 擺法兩列
+        return total
     }
 
     var body: some View {
@@ -22,12 +37,26 @@ struct ModeSheet: View {
     }
 }
 
-/// 看多少字、有沒有人聽、看不看自己，三件事分開選。設定頁和選單共用。
+/// 看多少字、有沒有人聽、看不看自己，三件事分開選。
+/// 只放在主畫面的「看多少字」選單裡，設定頁不再重複一份（QC-0012，回報 #94）。
 struct ModePicker: View {
     @EnvironmentObject private var settings: SettingsStore
     var onPick: () -> Void = {}
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
+
+    /// 有字的時候字要貼著鏡頭，聆聽者只能墊在字後面，只有這兩種擺得下（規則在 PreviewStack.layout）。
+    private static func worksWithPrompter(_ layout: CompanionLayout) -> Bool {
+        layout == .fullCall || layout == .alignFirst
+    }
+
+    /// 畫面上實際生效的擺法。選了用不了的那幾種，有字時會被當成視訊通話。
+    /// 只改顯示，不改存的值：切回「不看」時原本的選擇還在。
+    private var effectiveLayout: CompanionLayout {
+        let chosen: CompanionLayout = settings.companionLayout
+        guard settings.usesPrompter else { return chosen }
+        return Self.worksWithPrompter(chosen) ? chosen : .fullCall
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -36,8 +65,10 @@ struct ModePicker: View {
                     amountButton(amount)
                 }
             }
-            SwitchCard(title: "有人聽", systemImage: "person.wave.2.fill", isOn: $settings.hasListener)
-            SwitchCard(title: "不看自己", systemImage: "eye.slash.fill", isOn: $settings.hideSelf)
+            SwitchCard(title: "有人聽", systemImage: "person.wave.2.fill", isOn: $settings.hasListener,
+                       detail: "鏡頭旁邊多一位聆聽者，像對著真人講")
+            SwitchCard(title: "不看自己", systemImage: "eye.slash.fill", isOn: $settings.hideSelf,
+                       detail: "開錄後自己的畫面淡掉，不會一直盯著自己。臉跑出畫面會淡回來提醒你")
             if settings.hasListener {
                 listenerOptions
             }
@@ -46,8 +77,17 @@ struct ModePicker: View {
 
     @ViewBuilder
     private var listenerOptions: some View {
+        // 原本只在設定頁，設定頁的模式區拿掉後搬到這裡。
+        SwitchCard(title: "即時反應", systemImage: "face.smiling", isOn: $settings.instantReaction,
+                   detail: "聆聽者跟著你的停頓和音量點頭、抬眉")
         if CompanionAssets.available.count > 1 {
             PersonPicker()
+        }
+        if settings.usesPrompter {
+            Text("有字的時候字要貼著鏡頭，聆聽者只能墊在字後面，所以只有這兩種")
+                .font(.subheadline)
+                .foregroundStyle(Color.white.opacity(0.6))
+                .fixedSize(horizontal: false, vertical: true)
         }
         LazyVGrid(columns: columns, spacing: 12) {
             ForEach(CompanionLayout.allCases) { layout in
@@ -75,7 +115,10 @@ struct ModePicker: View {
     }
 
     private func layoutButton(_ layout: CompanionLayout) -> some View {
-        let selected: Bool = settings.companionLayout == layout
+        let usable: Bool = !settings.usesPrompter || Self.worksWithPrompter(layout)
+        // 選取框畫在實際生效的那顆，不畫在變灰、按不了的那顆上。
+        let selected: Bool = effectiveLayout == layout
+        let hint: String = usable ? "" : "有字的時候字要貼著鏡頭，只能用視訊通話或對位再開講"
         return Button {
             settings.companionLayout = layout
             onPick()
@@ -90,15 +133,26 @@ struct ModePicker: View {
             .modifier(ModeCard(selected: selected, height: 140))
         }
         .buttonStyle(.plain)
+        .disabled(!usable)
+        .opacity(usable ? 1 : 0.35)
         .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityHint(hint)
     }
 }
 
 /// 大顆的開關，一整條都能按。Toggle 只有右邊那一小塊會切，所以外面包一顆按鈕。
+/// 標題底下可以放一行到兩行小字，說這個開關是幹嘛的（回報 #90）。
 private struct SwitchCard: View {
     let title: String
     let systemImage: String
     @Binding var isOn: Bool
+    var detail: String? = nil
+
+    /// 沒有說明的高度。
+    static let plainHeight: CGFloat = 60
+    /// 有兩行說明的高度：標題一行約 25、空隙 4、說明兩行約 40，上下各留 12。
+    /// ModeSheet 估高度也用這個。
+    static let detailHeight: CGFloat = 96
 
     var body: some View {
         Button {
@@ -109,14 +163,26 @@ private struct SwitchCard: View {
         .buttonStyle(.plain)
         .accessibilityRepresentation {
             Toggle(title, isOn: $isOn)
+                .accessibilityHint(detail ?? "")
         }
     }
 
     private var card: some View {
         HStack(spacing: 12) {
-            Label(title, systemImage: systemImage)
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(Color.white)
+            VStack(alignment: .leading, spacing: 4) {
+                Label(title, systemImage: systemImage)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.white)
+                if let detail {
+                    Text(detail)
+                        .font(.subheadline)
+                        .foregroundStyle(Color.white.opacity(0.6))
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             Spacer(minLength: 0)
             Toggle(title, isOn: $isOn)
                 .labelsHidden()
@@ -124,7 +190,8 @@ private struct SwitchCard: View {
                 .allowsHitTesting(false)
         }
         .padding(.horizontal, 16)
-        .frame(maxWidth: .infinity, minHeight: 60)
+        .padding(.vertical, detail == nil ? 0 : 12)
+        .frame(maxWidth: .infinity, minHeight: detail == nil ? Self.plainHeight : Self.detailHeight)
         .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .contentShape(Rectangle())
     }

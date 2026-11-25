@@ -718,7 +718,13 @@ final class RecordingViewModel: ObservableObject {
         if prompter.isPlaying {
             prompter.pause()
             // 暫停中講的話不算在稿子裡。
-            if prompter.isFollowing { follower.suspend() }
+            if prompter.isFollowing {
+                // 先走一步的部分還沒被辨識確認，收回來，繼續時才會從確認過的地方接著聽。
+                let confirmed = follower.currentOffset
+                let ahead = follower.shownOffset != confirmed
+                follower.suspend()
+                if ahead { prompter.follow(utf16Offset: confirmed, in: currentText) }
+            }
         } else if prompter.isFollowing {
             prompter.play()
             let here = prompter.readingOffset(in: currentText)
@@ -1120,6 +1126,11 @@ final class RecordingViewModel: ObservableObject {
 
         let speaking = meter.isSpeaking
         if prompter.isFollowing {
+            // 辨識結果晚 0.5–1 秒才到：講話中畫面先照語速往前走一點，結果到了再校正。
+            // voiced 比 isSpeaking 嚴：isSpeaking 停了 0.7 秒才會變 false，停頓時不該再往前走。
+            if prompter.isPlaying {
+                follower.tick(speaking: speaking, voiced: speaking && meter.level > soundFloor)
+            }
             // 跟著聲音走的時候不用「停頓等人」，沒唸就不會動。
             // 講了一陣子卻一個字都沒對上，代表辨識沒作用，退回固定速度。
             if speaking && prompter.isPlaying { followSpeakingTicks += 1 }
@@ -1378,7 +1389,7 @@ final class RecordingViewModel: ObservableObject {
         let text = currentText
         guard settings?.voiceFollow ?? false, !currentIsPoint, !text.isEmpty, let camera else { return }
         let here = prompter.readingOffset(in: text)
-        guard follower.start(text: text, from: here) else {
+        guard follower.start(text: text, from: here, charsPerMinute: settings?.speechRate ?? 220) else {
             camera.log("語音跟隨無法啟動，使用固定速度")
             return
         }

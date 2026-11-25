@@ -45,11 +45,38 @@ final class FramePipeline: NSObject {
         /// 錄影中算不完，這一段剩下的時間降噪和柔膚都不做。
         var tooSlow = false
 
+        /// 一鍵優化後的過場，只有預覽會看。錄影那條路（render、ticket）完全不讀它。
+        var transition: PreviewTransition?
+
         var skipsHeavy: Bool { heavySkipped || tooSlow }
 
         /// 這組設定會動到畫面（按住比對的時候也算，才不會在原生預覽和處理過的預覽之間跳來跳去）。
         var changesPixels: Bool { lookEnabled && !look.needsNoPixelWork }
-        var needsMetal: Bool { CameraGPU.isAvailable && (stabilized || changesPixels) }
+        /// 過場中也要走處理過的預覽：舊的樣子可能是「沒開優化」，那時候原本看的是原生預覽，遮罩畫不上去。
+        var needsMetal: Bool {
+            CameraGPU.isAvailable && (stabilized || changesPixels || transitionRunning)
+        }
+        var transitionRunning: Bool {
+            transition?.progress(at: CACurrentMediaTime()) != nil
+        }
+    }
+
+    /// 過場：從 from（和當時開或關）換到現在的設定。新的樣子每一格都看當下的設定，過場中拉滑桿也跟得上。
+    private struct PreviewTransition {
+        var id: Int
+        var style: LookTransition
+        var from: LookParams
+        var fromEnabled: Bool
+        var start: CFTimeInterval
+        var duration: CFTimeInterval
+
+        /// 0…1；還沒開始算 0，已經結束回 nil。
+        func progress(at time: CFTimeInterval) -> CGFloat? {
+            guard duration > 0 else { return nil }
+            let passed: Double = (time - start) / duration
+            guard passed < 1 else { return nil }
+            return CGFloat(max(0, passed))
+        }
     }
 
     /// 臉的目標位置（0…1，原點左上，影格座標）和最後看到的時間。
@@ -72,12 +99,17 @@ final class FramePipeline: NSObject {
     private var paceLate = 0
     private var lastFrameAt: CFTimeInterval = 0
     private var lastFrameTime: CMTime = .invalid
+    private var transitionCount = 0
 
     // 以下只在 videoQueue 用
     /// 第一次用到才建（要算幾張色表），不拖慢開 App。
     private lazy var filter = LookFilter()
+    /// 過場時套舊參數用。和 filter 分開，兩組參數輪流套才不用每格重算色表。
+    private lazy var fromFilter = LookFilter()
     private var smoothedFace: CGRect?
     private var faceStrength: CGFloat = 0
+    /// 這次過場擴散的圓心（0…1，Core Image 方向：原點左下）。第一格決定好就不動，臉晃一下圓心才不會跟著跳。
+    private var transitionFocus: (id: Int, point: CGPoint)?
 
     /// 錄影中算不完、開始略過降噪和柔膚（videoQueue 回呼，只能做「丟到別的佇列」）。
     var onTooSlow: (() -> Void)?
@@ -124,6 +156,27 @@ final class FramePipeline: NSObject {
 
     func setHeavySkipped(_ on: Bool) {
         update { $0.heavySkipped = on }
+    }
+
+    /// 開始一段預覽過場：從 params（和 wasEnabled）換到之後 setLook 給的新設定。
+    /// 回傳過場多長（秒）；.none 不做過場，回 nil，進行中的也一起停掉。正在進行的會直接被新的取代。
+    @discardableResult
+    func beginTransition(from params: LookParams, wasEnabled: Bool, style: LookTransition) -> CFTimeInterval? {
+        guard let duration = LookTransitionMask.duration(of: style) else {
+            cancelTransition()
+            return nil
+        }
+        lock.lock()
+        transitionCount += 1
+        settings.transition = PreviewTransition(id: transitionCount, style: style, from: params,
+                                                fromEnabled: wasEnabled, start: CACurrentMediaTime(),
+                                                duration: duration)
+        lock.unlock()
+        return duration
+    }
+
+    func cancelTransition() {
+        update { $0.transition = nil }
     }
 
     var isMirrored: Bool { snapshot.mirrored }
@@ -360,6 +413,10 @@ final class FramePipeline: NSObject {
         lastFrameSize = size
         lastFrameAt = CACurrentMediaTime()
         lastFrameTime = time
+        // 過場結束就清掉。
+        if let running = settings.transition, running.progress(at: lastFrameAt) == nil {
+            settings.transition = nil
+        }
         let now: Settings = settings
         let recorder: FrameRecorder? = currentRecorder
         lock.unlock()
@@ -395,6 +452,11 @@ final class FramePipeline: NSObject {
         let image: CIImage
         if let finished {
             image = finished
+        } else if recorder == nil, !now.bypassed, let transition = now.transition,
+                  let progress = transition.progress(at: CACurrentMediaTime()) {
+            // 過場只在沒錄影、沒按住比對時畫，而且只進預覽，上面錄影那段完全沒看過場。
+            image = transitionImage(pixelBuffer, size: size, target: target, settings: now,
+                                    filtering: filtering, transition: transition, progress: progress)
         } else {
             image = previewImage(pixelBuffer, size: size, target: target, settings: now,
                                  filtering: filtering && !now.bypassed)
@@ -408,28 +470,67 @@ final class FramePipeline: NSObject {
                               settings: Settings, filtering: Bool) -> CIImage {
         let source = CameraGPU.image(pixelBuffer)
         guard filtering else { return source }
+        return filtered(shrunkForPreview(source, size: size, target: target), settings: settings)
+    }
+
+    /// 縮到預覽框的大小。差不多大就不縮，省一道取樣。
+    private func shrunkForPreview(_ source: CIImage, size: CGSize, target: CGSize) -> CIImage {
         let shortSide: CGFloat = min(size.width, size.height)
         let targetShort: CGFloat = min(target.width, target.height)
+        guard shortSide > 0 else { return source }
         let wanted: CGFloat = min(1, max(0.2, targetShort / shortSide))
-        // 差不多大就不縮，省一道取樣。
         let factor: CGFloat = wanted > 0.9 ? 1 : wanted
-        guard factor < 1 else {
-            return filtered(source, settings: settings)
-        }
+        guard factor < 1 else { return source }
         let extent = CGRect(x: 0, y: 0, width: (size.width * factor).rounded(.down),
                             height: (size.height * factor).rounded(.down))
-        let small: CIImage = source
+        return source
             .clampedToExtent()
             .transformed(by: CGAffineTransform(scaleX: factor, y: factor))
             .cropped(to: extent)
-        return filtered(small, settings: settings)
+    }
+
+    /// 過場中的預覽：同一張縮小過的影格，舊參數、新參數各套一次，再用遮罩換過去。
+    /// filtering：新設定要不要處理（和一般預覽同一個判斷）。舊的沒開優化或沒事做就是原圖。
+    private func transitionImage(_ pixelBuffer: CVPixelBuffer, size: CGSize, target: CGSize, settings: Settings,
+                                 filtering: Bool, transition: PreviewTransition, progress: CGFloat) -> CIImage {
+        // 兩邊都在預覽大小上算，4K 也只多算一張小圖。
+        let source: CIImage = shrunkForPreview(CameraGPU.image(pixelBuffer), size: size, target: target)
+        let after: CIImage = filtering ? filtered(source, settings: settings) : source
+        let fromFiltering: Bool = transition.fromEnabled && !transition.from.needsNoPixelWork
+            && LookFilter.hasWork(transition.from, skipHeavy: settings.skipsHeavy)
+        let before: CIImage = fromFiltering
+            ? filtered(source, look: transition.from, skipHeavy: settings.skipsHeavy, using: fromFilter)
+            : source
+        let focus: CGPoint = transitionFocusPoint(for: transition, in: source.extent)
+        return LookTransitionMask.compose(before: before, after: after, style: transition.style,
+                                          progress: progress, focus: focus)
+    }
+
+    /// 從臉擴散的圓心：看得到臉就用臉中心，不然用畫面中間偏上（由上往下 38%）。
+    private func transitionFocusPoint(for transition: PreviewTransition, in extent: CGRect) -> CGPoint {
+        let unit: CGPoint
+        if let saved = transitionFocus, saved.id == transition.id {
+            unit = saved.point
+        } else {
+            var point = CGPoint(x: 0.5, y: 1 - 0.38)
+            if faceStrength > 0.5, let rect = smoothedFace {
+                // smoothedFace 是原點左上，換成原點左下。
+                point = CGPoint(x: min(max(rect.midX, 0), 1), y: min(max(1 - rect.midY, 0), 1))
+            }
+            unit = point
+            transitionFocus = (id: transition.id, point: point)
+        }
+        return CGPoint(x: extent.minX + unit.x * extent.width, y: extent.minY + unit.y * extent.height)
     }
 
     private func filtered(_ image: CIImage, settings: Settings) -> CIImage {
+        filtered(image, look: settings.look, skipHeavy: settings.skipsHeavy, using: filter)
+    }
+
+    private func filtered(_ image: CIImage, look: LookParams, skipHeavy: Bool, using lookFilter: LookFilter) -> CIImage {
         let extent: CGRect = image.extent
         let scale: CGFloat = min(extent.width, extent.height) / 1080
-        return filter.apply(settings.look, to: image, face: face(in: extent.size), scale: scale,
-                            skipHeavy: settings.skipsHeavy)
+        return lookFilter.apply(look, to: image, face: face(in: extent.size), scale: scale, skipHeavy: skipHeavy)
     }
 
     /// 錄影用：套處理、轉到成品方向、畫進寫檔器的緩衝區。

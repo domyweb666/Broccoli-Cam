@@ -116,7 +116,13 @@ struct RecordingView: View {
             : controlsOverlap(screenHeight: screenHeight, previewHeight: preview.height) + 10
         // 跳轉鍵在直放時和開關分兩邊；橫放時排在同一側的上面，要多留一列。
         let room: CGFloat = preview.height - bandBottom - bottom - (sideways ? 60 : 0)
-        let side: CGFloat = room >= QuickToggles.fullHeight(side: 48) ? 48 : 44
+        let showsVoiceToggle: Bool = settings.usesPrompter && !viewModel.currentIsPoint
+        // 顆數和 QuickToggles 裡實際排的用同一套規則算，大小才不會估錯。
+        let toggleCount: Int = QuickToggles.count(showsVoice: showsVoiceToggle,
+                                                  showsAll: settings.showAllQuickToggles,
+                                                  stabilizationChoices: camera.availableStabilizations.count)
+        let fullHeight: CGFloat = QuickToggles.fullHeight(side: 48, count: toggleCount, sideways: sideways)
+        let side: CGFloat = room >= fullHeight ? 48 : 44
         let togglesOnRight = uiAngle > 0
         let keysOnRight = uiAngle >= 0
 
@@ -125,7 +131,7 @@ struct RecordingView: View {
             if !showLook, viewModel.pendingCheck == nil {
                 QuickToggles(
                     isBusy: viewModel.isBusy,
-                    showsVoice: settings.usesPrompter && !viewModel.currentIsPoint,
+                    showsVoice: showsVoiceToggle,
                     angle: uiAngle,
                     side: side,
                     onVoice: { viewModel.toggleVoiceFollow() },

@@ -98,6 +98,8 @@ struct LookPanel: View {
     private var actionRow: some View {
         HStack(spacing: 8) {
             Button {
+                // 過場中切換開關就直接換，不要接著播一半的過場。
+                camera.cancelLookTransition()
                 settings.lookEnabled.toggle()
             } label: {
                 PanelPill(title: settings.lookEnabled ? "優化 開" : "優化 關", isOn: settings.lookEnabled)
@@ -152,6 +154,7 @@ struct LookPanel: View {
         attempt += 1
         let current = attempt
         let store: SettingsStore = settings
+        let service: CameraService = camera
         camera.optimizeLook { result in
             // 等太久已經放棄的那次，結果不套。
             guard current == attempt, analyzing else { return }
@@ -162,6 +165,11 @@ struct LookPanel: View {
             }
             var params: LookParams = result.params
             params.smooth = store.look.smooth
+            // 先記下舊的樣子開始過場，再寫新的參數，預覽才會從舊的慢慢換成新的（QC-0012）。
+            let style: LookTransition = store.lookTransition
+            if style != LookTransition.none {
+                service.beginLookTransition(from: store.look, wasEnabled: store.lookEnabled, style: style)
+            }
             store.look = params
             store.lookEnabled = true
             note = Self.noteText(result)
@@ -179,6 +187,8 @@ struct LookPanel: View {
         attempt += 1
         analyzing = false
         camera.cancelOptimize()
+        // 還原不做過場，進行中的也停掉。
+        camera.cancelLookTransition()
         settings.look = .neutral
         settings.lookEnabled = false
         note = nil

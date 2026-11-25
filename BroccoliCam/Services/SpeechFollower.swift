@@ -8,7 +8,8 @@ import AVFoundation
 final class SpeechFollower {
     static let locale = Locale(identifier: "zh-TW")
 
-    /// 唸到的位置變了（主執行緒），往前或退回去重唸都會報。參數是「下一個要唸的字」在稿子裡的 UTF-16 位置。
+    /// 畫面上唸到的位置變了（主執行緒），往前、退回去重唸、先走一步、先走的收回來都會報。
+    /// 參數是「下一個要唸的字」在稿子裡的 UTF-16 位置。
     var onProgress: ((Int) -> Void)?
     /// 辨識一直開不起來，已經自己停掉了（主執行緒）。
     var onGaveUp: (() -> Void)?
@@ -32,6 +33,12 @@ final class SpeechFollower {
     private var generation = 0
     private var failures = 0
     private var taskStartedAt = Date()
+    /// 辨識結果晚到，畫面先照語速走一步，見 SpeechLead。
+    private var lead = SpeechLead(stops: [], position: 0, rate: 220 / 60)
+    /// 量到的語速，下一次開始跟的時候先用這個。
+    private var learnedRate: Double?
+    /// 最後一次報給畫面的位置（UTF-16），可能比 currentOffset 多走一點。
+    private(set) var shownOffset = 0
 
     static var isAuthorized: Bool {
         SFSpeechRecognizer.authorizationStatus() == .authorized
@@ -68,13 +75,13 @@ final class SpeechFollower {
 
     /// 下一個要唸的字在稿子裡的 UTF-16 位置。
     var currentOffset: Int {
-        let position = aligner.position
-        return keys.indices.contains(position) ? keys[position].utf16Offset : textLength
+        offset(ofKey: aligner.position)
     }
 
     /// 從稿子的 utf16Offset 開始跟。那裡之後已經沒有字可以唸，就從頭。
+    /// charsPerMinute 是設定裡的語速，還沒量到這個人講多快之前先用它。
     /// 回傳 false 代表沒辦法跟（沒授權、辨識不可用、稿子太短）。
-    func start(text: String, from utf16Offset: Int = 0) -> Bool {
+    func start(text: String, from utf16Offset: Int = 0, charsPerMinute: Double = 220) -> Bool {
         stop()
         guard isAvailable else { return false }
         let all = SpokenKeys.keys(of: text)
@@ -82,7 +89,11 @@ final class SpeechFollower {
         keys = all
         textLength = text.utf16.count
         let first = index(atUTF16: utf16Offset)
-        aligner = SpeechAligner(keys: all.map { $0.value }, position: first < all.count ? first : 0)
+        let position = first < all.count ? first : 0
+        aligner = SpeechAligner(keys: all.map { $0.value }, position: position)
+        lead = SpeechLead(stops: SpeechLead.sentenceStops(in: text, keys: all), position: position,
+                          rate: learnedRate ?? charsPerMinute / 60)
+        shownOffset = currentOffset
         matchCount = 0
         failures = 0
         suspended = false
@@ -96,6 +107,8 @@ final class SpeechFollower {
         suspended = false
         generation += 1
         endTask()
+        if let rate = lead.measuredRate { learnedRate = rate }
+        resetLead()
     }
 
     /// 跳到稿子的另一個位置接著聽。
@@ -103,6 +116,7 @@ final class SpeechFollower {
     func seek(toUTF16 utf16Offset: Int) {
         guard active else { return }
         aligner.seek(to: index(atUTF16: utf16Offset))
+        resetLead()
         guard !suspended else { return }
         relisten()
     }
@@ -113,6 +127,8 @@ final class SpeechFollower {
         suspended = true
         generation += 1
         endTask()
+        // 先走的部分不報給畫面，要收回來由呼叫端決定（回開頭時畫面已經自己歸零了）。
+        resetLead()
     }
 
     /// 提詞繼續：從指定的位置接著聽。
@@ -128,6 +144,34 @@ final class SpeechFollower {
         let current = request
         requestLock.unlock()
         current?.appendAudioSampleBuffer(buffer)
+    }
+
+    /// 錄影中每 0.1 秒：講話中辨識結果還沒到，畫面照語速先往前走一點；停下來太久就收回來。
+    /// speaking 是說話偵測（停一下下還算在講），voiced 是這一下真的有出聲。只動畫面，不動對位。
+    func tick(speaking: Bool, voiced: Bool) {
+        guard active, !suspended else { return }
+        lead.tick(now: ProcessInfo.processInfo.systemUptime, speaking: speaking, voiced: voiced)
+        report()
+    }
+
+    /// 第 index 個音在稿子裡的位置，唸完了是全長。
+    private func offset(ofKey index: Int) -> Int {
+        keys.indices.contains(index) ? keys[index].utf16Offset : textLength
+    }
+
+    /// 畫面該顯示到哪，和上次報的不一樣才報。
+    private func report() {
+        var target = offset(ofKey: lead.shown)
+        if let edge = lead.stopOffset { target = min(target, edge) }
+        guard target != shownOffset else { return }
+        shownOffset = target
+        onProgress?(target)
+    }
+
+    /// 位置換了：先走的全部重來，畫面另外由呼叫端處理，這裡不報。
+    private func resetLead() {
+        lead.reset(to: aligner.position)
+        shownOffset = currentOffset
     }
 
     /// 這個位置（含）之後第一個會唸出來的字，是第幾個音。
@@ -210,14 +254,16 @@ final class SpeechFollower {
         }
         guard ended else { return }
         // 聽了一陣子才結束多半是沒人講話；一開就結束的才算開不起來。
-        if failed && Date().timeIntervalSince(taskStartedAt) < 2 { failures += 1 }
+        let quick = Date().timeIntervalSince(taskStartedAt) < 2
+        if failed && quick { failures += 1 }
         if failures > 3 {
             onLog?("語音跟隨連續失敗，停止辨識")
             stop()
             onGaveUp?()
             return
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+        // 正常結束的馬上接著聽，隔一下的空檔裡剛開口的字會漏掉；一開就結束的才隔一下再試，免得一直空轉。
+        DispatchQueue.main.asyncAfter(deadline: .now() + (quick ? 0.2 : 0)) { [weak self] in
             guard let self, self.active, self.generation == mine else { return }
             self.restart()
         }
@@ -230,9 +276,13 @@ final class SpeechFollower {
         switch aligner.hear(spoken) {
         case .none:
             return
-        case .forward, .backward:
+        case .forward:
             matchCount += 1
-            onProgress?(currentOffset)
+            lead.confirmForward(to: aligner.position)
+        case .backward:
+            matchCount += 1
+            lead.confirmBackward(to: aligner.position)
         }
+        report()
     }
 }

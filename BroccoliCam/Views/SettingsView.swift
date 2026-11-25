@@ -57,8 +57,8 @@ struct SettingsView: View {
 
     // 每一區各自一個屬性，整張表寫在一起編譯器會算不完。
     private var form: some View {
+        // 看多少字、有人聽、不看自己、即時反應只放在主畫面的「看多少字」選單，這裡不再重複（QC-0012，回報 #94）。
         Form {
-            modeSection
             guideSection
             promptSection
             voiceSection
@@ -66,18 +66,6 @@ struct SettingsView: View {
             recordingSection
             subtitleSection
             advancedSection
-        }
-    }
-
-    private var modeSection: some View {
-        Section {
-            ModePicker()
-                .padding(.vertical, 8)
-            if settings.hasListener {
-                Toggle("即時反應", isOn: $settings.instantReaction)
-            }
-        } header: {
-            Text("模式")
         }
     }
 
@@ -93,6 +81,8 @@ struct SettingsView: View {
                 LabeledSlider(title: "頭像框大小", value: $settings.guideScale, range: 0.7...1.4, step: 0.05,
                               display: Self.percent(settings.guideScale))
             }
+            // 主畫面預設只放語音跟隨和一鍵優化，要的人自己打開（回報 #87）。
+            Toggle("主畫面也放構圖和防抖鍵", isOn: $settings.showAllQuickToggles)
         } header: {
             Text("構圖")
         }
@@ -145,6 +135,9 @@ struct SettingsView: View {
                 }
             }
             Toggle("畫面優化", isOn: $settings.lookEnabled)
+            Picker("優化過場", selection: $settings.lookTransition) {
+                ForEach(LookTransition.allCases) { Text($0.label).tag($0) }
+            }
             Toggle("影片左右鏡像", isOn: $settings.mirrorOutput)
         } header: {
             Text("影片")

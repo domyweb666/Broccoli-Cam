@@ -61,8 +61,11 @@ struct CompanionAssets {
 }
 
 /// 播放聆聽者的預錄短片：待機片隨機輪播，要反應時淡入反應片，播完淡回待機。
-/// 每支片的第一格和最後一格都是同一張定格圖，待機時動作又很小，所以任何時候切換都看不出接縫，
-/// 不用等待機播完才反應。
+/// 每支片的第一格和最後一格都接近同一張定格圖，但待機片中段的姿勢（頭的位置、大小、肩膀）和定格圖差很多：
+/// 2026-11 用 ffmpeg 比臉部 SSIM，5 秒的待機片只有頭約 0.2 秒、尾約 0.3–0.4 秒接近定格圖（#92）。
+/// 待機播到一半切反應片，畫面會看到人「跳一下」。所以反應只在接縫切：
+/// 待機片剛開始（seamWindow 內）就馬上換；其他時候先排隊，這支待機稍微播快一點，播完直接接反應片；
+/// 到接縫要等太久就不做這次反應。反應片頭尾也是定格圖，播完淡回待機沒有這個問題。
 /// 接下來可能要播的片（下一支待機、最可能的反應）先在後面的播放器載好，要用時馬上能從第 0 格播，
 /// 沒載好之前不換到前面，所以不會有黑格。
 /// 片子沒有音軌，播放器也靜音，不會碰到錄音用的 AVAudioSession。
@@ -88,12 +91,40 @@ final class CompanionClipPlayer: ObservableObject {
         let kind: Kind
     }
 
-    /// 交叉淡化的秒數。
-    static let fade: TimeInterval = 0.25
+    /// 排隊等接縫的反應：前面這支待機片播完就接著播。
+    private struct Queued {
+        let index: Int
+        let generation: Int
+        /// 每排一次加一，保險計時器回來時才認得出是不是同一次。
+        let token: Int
+    }
+
+    /// 交叉淡化的秒數。現在只在接縫切，兩邊畫面幾乎一樣，稍微拉長一點把剩下的小差異蓋掉。
+    static let fade: TimeInterval = 0.3
     /// 反應片這麼久還沒載好就算了，太晚才反應很怪。
     private static let lateLimit: TimeInterval = 0.4
     /// 片子可以播了，但一直沒回報第一格解好，等這麼久就當作好了。
     private static let prerollLimit: TimeInterval = 0.3
+    /// 待機片播不到這麼久，畫面還在定格圖附近，反應可以馬上切過去。
+    private static let seamWindow: TimeInterval = 0.15
+    /// 反應排隊時，待機片播快一點，早點回到接縫。待機動作很小，這個速度看不太出來；設 1 就不加速。
+    private static let catchUpRate: Float = 1.4
+    /// 保險：預估到接縫的時間過了這麼久，待機片還沒播完（片子卡住），就不等了。
+    private static let seamSlack: TimeInterval = 0.3
+
+    /// 排隊最多等多久（實際秒數，已經算進加速）。超過就不做這次反應，太晚做會對不上對方。
+    private static func seamWaitLimit(_ reaction: CompanionReaction) -> TimeInterval {
+        switch reaction {
+        // 停頓後點頭：晚一點點頭，對方接著講也還是自然的附和。
+        case .nod: return 2.0
+        // 抬眉是對「突然大聲」的反應，慢了就不知道在回應什麼。
+        case .brow: return 1.2
+        // 往前靠是對方重新開口時做的，講個一兩句內靠過去都還對得上。
+        case .lean: return 1.5
+        // 歪頭是等對方繼續講，停頓本來就長，可以等最久。
+        case .tilt: return 2.5
+        }
+    }
 
     /// 一台在前面播，其他的先載好接下來可能要播的：下一支待機、兩種最可能的反應。
     /// 媒體服務重啟之後舊的都不能用，會整組換新，畫面要跟著換。
@@ -109,6 +140,8 @@ final class CompanionClipPlayer: ObservableObject {
     private var assets: CompanionAssets?
     private var slots: [Slot] = [Slot(), Slot(), Slot(), Slot()]
     private var waiting: Waiting?
+    private var queued: Queued?
+    private var queueToken = 0
     private var current: Kind = .idle
     /// 前面那支播完了，還沒有片可以接（停在最後一格）。
     private var frontEnded = false
@@ -180,6 +213,7 @@ final class CompanionClipPlayer: ObservableObject {
 
     /// 媒體服務重啟：舊的播放器全部作廢，換一組新的，重新從定格圖開始。
     private func rebuild() {
+        dropQueued()
         if let endObserver {
             NotificationCenter.default.removeObserver(endObserver)
         }
@@ -198,6 +232,7 @@ final class CompanionClipPlayer: ObservableObject {
     }
 
     func stop() {
+        dropQueued()
         running = false
         modelCancellables = []
         model?.onReaction = nil
@@ -225,6 +260,8 @@ final class CompanionClipPlayer: ObservableObject {
     /// 回到前景時接著播（App 進背景時系統會把播放器停掉）。
     func resume() {
         guard running else { return }
+        // 進過背景，排隊時算的等待時間已經不準，這次反應放掉，待機片回原速。
+        dropQueued()
         if players.indices.contains(front), !frontEnded {
             players[front].play()
             return
@@ -262,6 +299,8 @@ final class CompanionClipPlayer: ObservableObject {
         person = next
         assets = loaded
         waiting = nil
+        // 排隊的是前一位的反應片，不播了；前一位的待機回原速，播到新的人載好。
+        dropQueued()
         broken = []
         lastClip = [:]
         nextIdle = nil
@@ -294,14 +333,86 @@ final class CompanionClipPlayer: ObservableObject {
 
     // MARK: - 挑片
 
-    /// 回傳有沒有接下來要播。
+    /// 回傳有沒有接下來要播（排隊等接縫也算，冷卻照算）。
+    /// 回 true 之後才放棄的（等太晚、載不起來、換人、進背景），會呼叫 model 的 reactionDropped 把冷卻退回來。
     private func react(_ reaction: CompanionReaction) -> Bool {
-        // 反應片還在播、正在換人、已經有一支反應在等，就不插隊，這一次直接丟掉。
-        guard running, !switching, current == .idle, waiting?.kind != .reaction,
-              let clip = upcoming(reaction), request(clip, kind: .reaction) else { return false }
+        // 反應片還在播、正在換人、已經有一支反應在等或在排隊，就不插隊，這一次直接丟掉。
+        // 排隊中又來新的，也是留先來的：先來的片已經在載、待機也加速了，換掉等於前面白等；
+        // 即時反應兩次之間至少隔 3 秒，比最長的排隊時間還久，實際上幾乎碰不到。
+        guard running, !switching, current == .idle, waiting?.kind != .reaction, queued == nil,
+              let clip = upcoming(reaction) else { return false }
+        // 先記成用掉了，換到前面時順手預載的才會挑下一支，不會把同一支再載一份。
+        let previousLast = lastClip[.reaction]
         nextReaction[reaction] = nil
         lastClip[.reaction] = clip
+        guard begin(clip, for: reaction) else {
+            nextReaction[reaction] = clip
+            lastClip[.reaction] = previousLast
+            return false
+        }
+        preload()
         return true
+    }
+
+    /// 看前面的待機片播到哪裡，決定馬上換、排隊等接縫，還是這次不做。
+    private func begin(_ clip: URL, for reaction: CompanionReaction) -> Bool {
+        // 前面停在最後一格、或還沒有片（只看到定格圖），都和反應片第一格一樣，馬上接。
+        guard players.indices.contains(front), !frontEnded else {
+            return request(clip, kind: .reaction)
+        }
+        guard waiting == nil, let position = idlePosition() else { return false }
+        // 待機片剛開始，還在定格圖附近：反應片已經載好就馬上換。
+        if position.elapsed < Self.seamWindow, let index = loadedSlot(clip), slots[index].ready {
+            present(index, kind: .reaction)
+            return true
+        }
+        return enqueue(clip, for: reaction, remaining: position.remaining)
+    }
+
+    /// 前面那支片播了幾秒、還剩幾秒（片子本身的秒數，沒算播放速度）。
+    private func idlePosition() -> (elapsed: TimeInterval, remaining: TimeInterval)? {
+        guard players.indices.contains(front), let item = players[front].currentItem else { return nil }
+        let elapsed = item.currentTime().seconds
+        let duration = item.duration.seconds
+        guard elapsed.isFinite, duration.isFinite, duration > 0 else { return nil }
+        return (elapsed, max(0, duration - elapsed))
+    }
+
+    /// 排隊等接縫：反應片先在後面載好，這支待機片稍微播快一點，播完就接反應片。
+    /// 照加速後的速度算，到接縫要等太久就不排。
+    private func enqueue(_ clip: URL, for reaction: CompanionReaction, remaining: TimeInterval) -> Bool {
+        let player = players[front]
+        // 沒在播（例如剛被系統停掉）就等不到接縫。
+        guard player.rate > 0 else { return false }
+        let rate: Float = player.currentItem?.canPlayFastForward == true ? Self.catchUpRate : 1
+        let wait = remaining / TimeInterval(rate)
+        guard wait <= Self.seamWaitLimit(reaction), let index = slot(for: clip) else { return false }
+        queueToken += 1
+        let token = queueToken
+        queued = Queued(index: index, generation: slots[index].generation, token: token)
+        if player.rate != rate { player.rate = rate }
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait + Self.seamSlack) { [weak self] in
+            guard let self, self.queued?.token == token else { return }
+            self.dropQueued()
+        }
+        return true
+    }
+
+    /// 放棄排隊中的反應：待機片回原速，告訴 model 這次沒做成（冷卻退回來）。
+    /// 排隊用的那台留著載好的片，之後由 preload 決定要不要換掉。
+    private func dropQueued() {
+        guard queued != nil else { return }
+        queued = nil
+        restoreRate()
+        model?.reactionDropped()
+    }
+
+    /// 前面那台如果被加速過，調回 1。rate 是 0 代表停著，設成 1 會讓它開始播，所以只動正在播的。
+    /// 停著的那台下次 play() 會用 defaultRate（1），不用管。
+    private func restoreRate() {
+        guard players.indices.contains(front) else { return }
+        let player = players[front]
+        if player.rate > 0, player.rate != 1 { player.rate = 1 }
     }
 
     private func playIdle() {
@@ -337,7 +448,7 @@ final class CompanionClipPlayer: ObservableObject {
 
     /// 看不到、可以拿來載片的播放器。
     private func isFree(_ index: Int) -> Bool {
-        index != front && !slots[index].fading && waiting?.index != index
+        index != front && !slots[index].fading && waiting?.index != index && queued?.index != index
     }
 
     private func loadedSlot(_ clip: URL) -> Int? {
@@ -428,6 +539,8 @@ final class CompanionClipPlayer: ObservableObject {
 
     private func loadFailed(_ clip: URL, index: Int) {
         broken.insert(clip)
+        // 排隊的反應片載不起來：放掉，前面的待機照常播完接下一支待機。
+        if queued?.index == index { dropQueued() }
         let wasWaiting = waiting?.index == index
         let kind = waiting?.kind
         if wasWaiting { waiting = nil }
@@ -443,27 +556,30 @@ final class CompanionClipPlayer: ObservableObject {
 
     /// 播這支片。載好了就馬上換到前面，還沒載好就等它。沒有播放器可以用時回傳 false。
     private func request(_ clip: URL, kind: Kind) -> Bool {
-        let index: Int
-        if let loaded = loadedSlot(clip) {
-            index = loaded
-        } else if let spare = spareSlot() {
-            load(clip, into: spare)
-            index = spare
-        } else {
-            return false
-        }
+        guard let index = slot(for: clip) else { return false }
         if slots[index].ready {
             present(index, kind: kind)
             return true
         }
-        let generation = slots[index].generation
-        waiting = Waiting(index: index, generation: generation, kind: kind)
-        if kind == .reaction {
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.lateLimit) { [weak self] in
-                self?.giveUpIfLate(index: index, generation: generation)
-            }
-        }
+        startWaiting(index: index, generation: slots[index].generation, kind: kind)
         return true
+    }
+
+    /// 拿一台裝著這支片的播放器：已經載好的優先，沒有就找一台來載。沒有播放器可以用時回傳 nil。
+    private func slot(for clip: URL) -> Int? {
+        if let loaded = loadedSlot(clip) { return loaded }
+        guard let spare = spareSlot() else { return nil }
+        load(clip, into: spare)
+        return spare
+    }
+
+    /// 等這台載好再換到前面。反應片等太久就算了。
+    private func startWaiting(index: Int, generation: Int, kind: Kind) {
+        waiting = Waiting(index: index, generation: generation, kind: kind)
+        guard kind == .reaction else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.lateLimit) { [weak self] in
+            self?.giveUpIfLate(index: index, generation: generation)
+        }
     }
 
     /// 臨時要載片時用哪一台：先用空的，再用載了但不是下一支待機的。
@@ -483,6 +599,8 @@ final class CompanionClipPlayer: ObservableObject {
 
     /// 從第 0 格開始播，換到前面。
     private func present(_ index: Int, kind: Kind) {
+        // 排隊的反應到接縫時已經先拿掉；這裡還有就是別的片先上了，那次反應不播。
+        dropQueued()
         let player = players[index]
         player.play()
         waiting = nil
@@ -536,6 +654,22 @@ final class CompanionClipPlayer: ObservableObject {
         frontEnded = true
         current = .idle
         model?.isReacting = false
+        if let queued {
+            // 接縫到了，換排隊的反應片上來。還沒載好就照一般的等法（最多 lateLimit），
+            // 這段時間畫面停在待機的最後一格，和反應片第一格一樣，晚一點接也看不出接縫。
+            self.queued = nil
+            guard slots[queued.index].generation == queued.generation else {
+                model?.reactionDropped()
+                playIdle()
+                return
+            }
+            if slots[queued.index].ready {
+                present(queued.index, kind: .reaction)
+            } else {
+                startWaiting(index: queued.index, generation: queued.generation, kind: .reaction)
+            }
+            return
+        }
         // 有反應片正在等，就讓它接；沒有才接待機。
         if waiting == nil { playIdle() }
     }

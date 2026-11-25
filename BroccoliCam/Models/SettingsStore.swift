@@ -126,6 +126,30 @@ enum StabilizationLevel: String, CaseIterable, Identifiable {
     }
 }
 
+/// 按了一鍵優化後，預覽從舊樣子換成新樣子的過場（QC-0012）。只畫在預覽上，不會錄進影片。
+/// 三種都做，多米在真機上切著比。
+enum LookTransition: String, CaseIterable, Identifiable {
+    /// 一條亮線從上往下掃，掃過的地方變成新的樣子
+    case scan
+    /// 從臉（畫面中間偏上）往外一圈圈擴散
+    case ripple
+    /// 像百葉窗，一條條橫的由上往下翻成新的
+    case blinds
+    /// 不要過場，直接換
+    case none
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .scan: return "由上往下掃"
+        case .ripple: return "從臉擴散"
+        case .blinds: return "百葉窗"
+        case .none: return "不要"
+        }
+    }
+}
+
 /// 跳轉一次跳多遠。
 enum JumpMode: String, CaseIterable, Identifiable {
     case paragraph
@@ -222,6 +246,14 @@ final class SettingsStore: ObservableObject {
         }
     }
     @Published var lookEnabled: Bool { didSet { defaults.set(lookEnabled, forKey: "lookEnabled") } }
+    /// 一鍵優化套上去時的過場
+    @Published var lookTransition: LookTransition {
+        didSet { defaults.set(lookTransition.rawValue, forKey: "lookTransition") }
+    }
+    /// 主畫面側邊也放構圖線、防抖兩顆（QC-0012 起預設收進設定，只留語音跟隨和一鍵優化）
+    @Published var showAllQuickToggles: Bool {
+        didSet { defaults.set(showAllQuickToggles, forKey: "showAllQuickToggles") }
+    }
     /// 藍牙踏板、翻頁器的按鍵對應
     @Published var remoteBindings: RemoteBindings {
         didSet {
@@ -276,6 +308,8 @@ final class SettingsStore: ObservableObject {
         stabilization = StabilizationLevel(rawValue: d.string(forKey: "stabilization") ?? "") ?? .off
         look = d.data(forKey: "look").flatMap { try? JSONDecoder().decode(LookParams.self, from: $0) } ?? .neutral
         lookEnabled = (d.object(forKey: "lookEnabled") as? Bool) ?? false
+        lookTransition = LookTransition(rawValue: d.string(forKey: "lookTransition") ?? "") ?? .scan
+        showAllQuickToggles = (d.object(forKey: "showAllQuickToggles") as? Bool) ?? false
         remoteBindings = d.data(forKey: "remoteBindings")
             .flatMap { try? JSONDecoder().decode(RemoteBindings.self, from: $0) } ?? .standard
         showDebug = (d.object(forKey: "showDebug") as? Bool) ?? false

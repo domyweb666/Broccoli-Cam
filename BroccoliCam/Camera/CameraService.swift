@@ -983,6 +983,26 @@ final class CameraService: NSObject, ObservableObject {
         pipeline.setBypassed(on)
     }
 
+    /// 一鍵優化的結果套上去之前呼叫：預覽從舊樣子用過場換成新樣子（QC-0012）。
+    /// 只畫在預覽上，錄進影片的畫面不受影響。請在主執行緒、把新參數交給 setLook 之前呼叫。
+    /// params、wasEnabled 是換之前的設定。.none 不做過場；錄影中不做。
+    func beginLookTransition(from params: LookParams, wasEnabled: Bool, style: LookTransition) {
+        guard !pipeline.isRecording,
+              let duration = pipeline.beginTransition(from: params, wasEnabled: wasEnabled, style: style) else { return }
+        // 原本沒開優化時看的是原生預覽，過場要先疊上處理過的那層。
+        refreshMetalPreview()
+        // 過場結束後，新的樣子不用逐格處理的話就換回原生預覽。
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.05) { [weak self] in
+            self?.refreshMetalPreview()
+        }
+    }
+
+    /// 停掉進行中的過場，直接顯示現在的設定（按還原、開關優化時用）。
+    func cancelLookTransition() {
+        pipeline.cancelTransition()
+        refreshMetalPreview()
+    }
+
     /// 拉滑桿時一秒會來很多次，排隊中就不重複排。
     private func queueExposureUpdate() {
         lookLock.lock()
