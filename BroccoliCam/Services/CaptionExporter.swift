@@ -602,27 +602,42 @@ private final class CaptionBurnJob: @unchecked Sendable {
         let total: Double = max(0.001, media.duration.seconds)
         let gate = self.gate
         let onProgress = self.onProgress
+        // 顯示晶片畫這一格的時候，同時去讀下一格、把上一格交給編碼器，不用每格都乾等它畫完。
+        // 最多兩格在路上，照讀進來的順序寫出去。
+        let depth = 2
+        var pending: [(frame: CaptionFrameMaker.Pending, time: CMTime)] = []
+        var noMore = false
         var last: CMTime = .invalid
         var shown: Double = 0
         return {
             guard gate.pass() else { return false }
-            guard let sample = frames.copyNextSampleBuffer() else { return false }
-            guard let source = CMSampleBufferGetImageBuffer(sample) else { return true }
-            var time: CMTime = CMSampleBufferGetPresentationTimeStamp(sample)
-            guard time.isNumeric else { return true }
-            time = CMTimeMaximum(time, .zero)
-            // 段和段的接縫可能有同一個時間的兩格，寫檔器不收倒退的時間。
-            if last.isNumeric, time <= last { return true }
+            while !noMore && pending.count < depth {
+                guard let sample = frames.copyNextSampleBuffer() else {
+                    noMore = true
+                    break
+                }
+                guard let source = CMSampleBufferGetImageBuffer(sample) else { continue }
+                var time: CMTime = CMSampleBufferGetPresentationTimeStamp(sample)
+                guard time.isNumeric else { continue }
+                time = CMTimeMaximum(time, .zero)
+                // 段和段的接縫可能有同一個時間的兩格，寫檔器不收倒退的時間。
+                if last.isNumeric, time <= last { continue }
 
-            let frame = try maker.frame(from: source, at: time.seconds) {
-                var buffer: CVPixelBuffer?
-                CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer)
-                return buffer
+                let started = try maker.start(from: source, at: time.seconds) {
+                    var buffer: CVPixelBuffer?
+                    CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer)
+                    return buffer
+                }
+                pending.append((frame: started, time: time))
+                last = time
             }
-            guard adaptor.append(frame, withPresentationTime: time) else {
+            guard !pending.isEmpty else { return false }
+            let next = pending.removeFirst()
+            let frame = try maker.finish(next.frame)
+            guard adaptor.append(frame, withPresentationTime: next.time) else {
                 throw writer.error ?? CaptionBurnError.cannotWrite
             }
-            last = time
+            let time: CMTime = next.time
             // 檔案收尾還要一點時間，先不到 100%。
             let fraction: Double = min(0.99, time.seconds / total)
             if fraction - shown >= 0.005 {

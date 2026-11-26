@@ -177,6 +177,8 @@ final class TakeStore: @unchecked Sendable {
     private var blocked = false
     /// 清單還沒寫成功，欠著沒刪的檔。
     private var deferred: Set<String> = []
+    /// 寫進硬碟幾次了。補寫完整清單前拿來看中間有沒有寫過更新的。
+    private var writeCount = 0
 
     private init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -213,11 +215,24 @@ final class TakeStore: @unchecked Sendable {
     private func commit(_ manifest: TakeManifest, deleting files: [String]) {
         deferred.formUnion(files)
         if !blocked, manifest != lastWritten {
-            guard let written = write(manifest) else {
-                lastSaveOK = false
-                return
+            if let light = quickVersion(of: manifest) {
+                // 清單提到新的檔（多半是馬上要開錄的那個），開錄要等這次寫完。
+                // 聽到的字很多時整份編碼要一下子，先寫不含聽到的字的那份（提到的檔案一樣，規矩 1 照樣成立），
+                // 開錄就不用等；完整的那份排在後面馬上補寫。補寫之前被滑掉，只少了聽到的字，可以再聽一次。
+                lastWritten = light
+                writeCount += 1
+                let mine = writeCount
+                queue.async {
+                    self.catchUp(manifest, after: mine)
+                }
+            } else {
+                guard let written = write(manifest) else {
+                    lastSaveOK = false
+                    return
+                }
+                lastWritten = written
+                writeCount += 1
             }
-            lastWritten = written
         }
         lastSaveOK = true
         let mentioned = manifest.files
@@ -225,6 +240,26 @@ final class TakeStore: @unchecked Sendable {
             try? FileManager.default.removeItem(at: url(file))
         }
         deferred.removeAll()
+    }
+
+    /// 提到新的檔、又帶著聽到的字時，先寫不含聽到的字的那份。寫成功回傳那份；不適用或沒寫成功是 nil，照一般的寫。
+    private func quickVersion(of manifest: TakeManifest) -> TakeManifest? {
+        // 開 App 第一次寫（還沒寫過）照一般的寫。
+        guard let known = lastWritten?.files, !manifest.files.isSubset(of: known) else { return nil }
+        let light = manifest.withoutHearings
+        guard light != manifest, (try? writeOnce(light)) != nil else { return nil }
+        makeReserve()
+        return light
+    }
+
+    /// 補寫完整的那份。中間已經寫過更新的就不寫，不然會蓋掉新的。
+    private func catchUp(_ manifest: TakeManifest, after count: Int) {
+        guard !blocked, writeCount == count else { return }
+        // 寫不進去（多半是硬碟滿了）就留著不含聽到的字的那份，和 write 寫不下時的做法一樣。
+        guard (try? writeOnce(manifest)) != nil else { return }
+        makeReserve()
+        lastWritten = manifest
+        writeCount += 1
     }
 
     /// 回傳真的寫進去的那份，沒寫成功是 nil。

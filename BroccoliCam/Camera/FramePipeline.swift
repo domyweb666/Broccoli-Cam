@@ -437,8 +437,11 @@ final class FramePipeline: NSObject {
         serveRequests(pixelBuffer, at: time, gpuAllowed: canDraw)
         updateFace()
 
+        // 只開柔膚、畫面裡又沒有臉時，濾鏡算出來就是原圖：當成不用處理，錄影直接寫原始影格（零 GPU）。
+        // 臉的判斷和 LookFilter.apply 裡一樣（同一格、同一個 faceStrength），有臉的那一格起才會重畫。
+        let hasFace: Bool = LookFilter.faceCounts(face(in: size))
         let filtering: Bool = canDraw && now.changesPixels
-            && LookFilter.hasWork(now.look, skipHeavy: now.skipsHeavy)
+            && LookFilter.hasWork(now.look, skipHeavy: now.skipsHeavy, hasFace: hasFace)
         // 按住比對只影響預覽，錄下來的不能跟著變。
         let compareOnly: Bool = filtering && now.bypassed
 
@@ -512,7 +515,8 @@ final class FramePipeline: NSObject {
         let source: CIImage = shrunkForPreview(CameraGPU.image(pixelBuffer), size: size, target: target)
         let after: CIImage = filtering ? filtered(source, settings: settings, forPreview: true) : source
         let fromFiltering: Bool = transition.fromEnabled && !transition.from.needsNoPixelWork
-            && LookFilter.hasWork(transition.from, skipHeavy: settings.skipsHeavy)
+            && LookFilter.hasWork(transition.from, skipHeavy: settings.skipsHeavy,
+                                  hasFace: LookFilter.faceCounts(face(in: source.extent.size)))
         let before: CIImage = fromFiltering
             ? filtered(source, look: transition.from, skipHeavy: settings.skipsHeavy, forPreview: true,
                        using: fromFilter)

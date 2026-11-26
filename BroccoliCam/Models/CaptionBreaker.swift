@@ -329,9 +329,19 @@ enum CaptionBreaker {
 
     // MARK: - 詞界
 
+    /// 斷詞器建一次重複用。它不能同時給兩條執行緒用，用鎖輪流。
+    private static let tokenizer = NLTokenizer(unit: .word)
+    private static let tokenizerLock = NSLock()
+
     /// 系統斷詞。回傳可以切的位置（第幾個字之前），頭尾也算。
     static func wordBoundaries(_ text: String) -> Set<Int> {
-        let tokenizer = NLTokenizer(unit: .word)
+        tokenizerLock.withLock {
+            cutPoints(of: text, using: tokenizer)
+        }
+    }
+
+    /// 每次都先換字再設語言，和每次新建一個的設定順序一樣。
+    private static func cutPoints(of text: String, using tokenizer: NLTokenizer) -> Set<Int> {
         tokenizer.string = text
         tokenizer.setLanguage(.traditionalChinese)
         var cuts: Set<Int> = [0, text.count]

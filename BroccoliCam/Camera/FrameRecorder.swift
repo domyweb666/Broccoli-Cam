@@ -479,7 +479,44 @@ final class FrameRecorder {
             return
         }
         let end: CMTime = lastVideoTime + frameDuration
-        drainTailLocked(until: end)
+        // phase 已經是 ended：之後進來的影格和聲音都不收，鎖放掉也不會有人動到 pendingAudio 和寫檔器。
+        if drainTailOnceLocked(until: end) {
+            closeLocked(at: end)
+        } else {
+            scheduleTailDrain(until: end, attempt: 1)
+        }
+    }
+
+    /// 最後留著的聲音最多寫幾輪，每輪之間等 5 毫秒（總共最多約 0.1 秒，和以前一樣）。
+    private static let tailDrainAttempts = 20
+
+    /// 寫一輪留著的聲音。回傳 true 代表寫完了（或不用再等），false 代表輸入暫時不能收、還有該寫的。
+    private func drainTailOnceLocked(until end: CMTime) -> Bool {
+        drainingAtEnd = true
+        drainAudioLocked(limit: end)
+        drainingAtEnd = false
+        guard let first = pendingAudio.first, writer.status == .writing else { return true }
+        return CMSampleBufferGetPresentationTimeStamp(first) > end
+    }
+
+    /// 輸入暫時不能收：過 5 毫秒在 finishQueue 上再試，不拿著鎖睡（以前拿著鎖 usleep，
+    /// 影格和聲音的佇列最多被卡 0.1 秒）。
+    private func scheduleTailDrain(until end: CMTime, attempt: Int) {
+        finishQueue.asyncAfter(deadline: .now() + 0.005) { [self] in
+            lock.lock()
+            defer { lock.unlock() }
+            let done: Bool = drainTailOnceLocked(until: end) || attempt >= Self.tailDrainAttempts - 1
+            if done {
+                closeLocked(at: end)
+            } else {
+                scheduleTailDrain(until: end, attempt: attempt + 1)
+            }
+        }
+    }
+
+    /// 聲音寫完了，關檔。
+    private func closeLocked(at end: CMTime) {
+        pendingAudio.removeAll()
         guard writer.status == .writing else {
             salvage("寫檔失敗：\(errorText())")
             return
@@ -499,25 +536,12 @@ final class FrameRecorder {
         }
     }
 
-    /// 把最後留著的聲音寫完。輸入暫時不能收就等一下，最多 0.1 秒。
-    private func drainTailLocked(until end: CMTime) {
-        drainingAtEnd = true
-        for _ in 0..<20 {
-            drainAudioLocked(limit: end)
-            guard let first = pendingAudio.first, writer.status == .writing else { break }
-            if CMSampleBufferGetPresentationTimeStamp(first) > end { break }
-            usleep(5000)
-        }
-        drainingAtEnd = false
-        pendingAudio.removeAll()
-    }
-
     /// 寫到一半出錯。前面的片段可能還能看，交給 salvage 判斷。
     private func failLocked(_ message: String) {
         let wasEnding = phase == .ended
         phase = .ended
         pendingAudio.removeAll()
-        // 收尾途中（drainTailLocked）才發現的，由 endLocked 接手回報。
+        // 收尾途中（drainTailOnceLocked）才發現的，由 closeLocked 接手回報。
         guard !wasEnding else { return }
         if sessionStarted, lastVideoTime.isValid {
             salvage(message)

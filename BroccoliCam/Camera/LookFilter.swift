@@ -199,6 +199,10 @@ final class LookFilter {
 
     private let colorCube = CIFilter.colorCube()
     private var colorCubeKey: LookParams?
+    /// colorCube 上一次拿來套影格的時間（systemUptime）。
+    private var colorCubeUsedAt: TimeInterval = 0
+    /// 舊色表超過這麼久沒用，就不拿來頂著用（秒）。
+    private static let staleCubeAfter: TimeInterval = 0.5
     private let skinCube = CIFilter.colorCube()
     private let flatCube = CIFilter.colorCube()
     private let noise = CIFilter.noiseReduction()
@@ -218,10 +222,20 @@ final class LookFilter {
     }
 
     /// 這組參數在目前狀況下要不要做事。skipHeavy：過熱，降噪和柔膚先不做。
-    static func hasWork(_ params: LookParams, skipHeavy: Bool) -> Bool {
+    /// hasFace：畫面裡有沒有柔膚用得到的臉（和 apply 裡 face.strength > 0.01 同一個判斷）。
+    /// 只開柔膚、又沒有臉時，apply 算出來就是原圖，回 false 讓錄影直接寫原始影格、不用整張重畫。
+    static func hasWork(_ params: LookParams, skipHeavy: Bool, hasFace: Bool = true) -> Bool {
         if params.sharpen > 0 { return true }
         if !LookMath.Recipe(params).isIdentity { return true }
-        return !skipHeavy && usesHeavy(params)
+        if skipHeavy { return false }
+        if params.denoise > 0 { return true }
+        return params.smooth > 0 && hasFace
+    }
+
+    /// 柔膚認得的「有臉」：和 apply 裡的條件一樣。
+    static func faceCounts(_ face: LookFace?) -> Bool {
+        guard let face else { return false }
+        return face.strength > 0.01
     }
 
     static func usesHeavy(_ params: LookParams) -> Bool {
@@ -252,6 +266,8 @@ final class LookFilter {
 
     // MARK: - 色彩
 
+    /// 色表要換時：做好的就直接換；還沒做好、手上有舊的，就先用舊的、交給背景去做，
+    /// 下一格再來看（拉滑桿時影像佇列不用停下來算 3 萬多個點）。手上一張都沒有才當場做，絕不會有一格沒上色。
     private func colored(_ image: CIImage, params: LookParams) -> CIImage {
         var key: LookParams = params
         key.exposure = 0
@@ -259,17 +275,37 @@ final class LookFilter {
         key.sharpen = 0
         key.smooth = 0
         guard key != LookParams.neutral else { return image }
+        let now: TimeInterval = ProcessInfo.processInfo.systemUptime
         if colorCubeKey != key {
-            let recipe = LookMath.Recipe(key)
-            colorCube.cubeDimension = Float(Self.cubeSize)
-            colorCube.cubeData = LookMath.cubeData(size: Self.cubeSize) { recipe.apply($0) }
-            colorCubeKey = key
+            // 舊的那張要是剛剛還在用（一直有影格在套，例如正在拉滑桿），沿用一兩格看不出來；
+            // 很久沒用的舊色表（例如關掉優化一陣子再打開）可能差很多，那就照以前當場做，不閃一下別的顏色。
+            let oldIsFresh: Bool = colorCubeKey != nil && now - colorCubeUsedAt < Self.staleCubeAfter
+            if let ready = LookCubeStore.shared.cached(key) {
+                useCube(ready, key: key)
+            } else if oldIsFresh {
+                LookCubeStore.shared.prepare(key)
+            } else {
+                useCube(LookCubeStore.shared.makeNow(key), key: key)
+            }
         }
+        colorCubeUsedAt = now
         colorCube.inputImage = image
         let output: CIImage? = colorCube.outputImage
         // 濾鏡會一直留著，放掉影格才不會佔住相機的緩衝區。
         colorCube.inputImage = nil
         return output ?? image
+    }
+
+    private func useCube(_ data: Data, key: LookParams) {
+        colorCube.cubeDimension = Float(Self.cubeSize)
+        colorCube.cubeData = data
+        colorCubeKey = key
+    }
+
+    /// 色表的資料（給 LookCubeStore 用）。和以前在 colored 裡當場算的是同一個公式、同一個大小。
+    fileprivate static func makeCubeData(_ key: LookParams) -> Data {
+        let recipe = LookMath.Recipe(key)
+        return LookMath.cubeData(size: cubeSize) { recipe.apply($0) }
     }
 
     // MARK: - 降噪
@@ -408,5 +444,89 @@ final class LookFilter {
         blend.backgroundImage = nil
         blend.maskImage = nil
         return output ?? bottom
+    }
+}
+
+/// 色表（color cube 的資料）在背景做好、存幾張起來。任何執行緒都能叫，裡面用鎖交接。
+/// 過場時套舊參數的那個 LookFilter 也從這裡拿：舊參數的色表通常剛剛才做過，第一格就不用新舊兩張一起算。
+final class LookCubeStore {
+    static let shared = LookCubeStore()
+
+    /// 一張約 512KB（32³ × 4 個 Float），留 4 張：現在的、過場的舊樣子、拉滑桿中的上一兩個值。
+    private static let capacity = 4
+
+    private let lock = NSLock()
+    private let queue = DispatchQueue(label: "org.domyweb.broccolicam.cube", qos: .userInitiated)
+    // 以下都在 lock 裡面讀寫
+    /// 越後面越新。
+    private var entries: [(key: LookParams, data: Data)] = []
+    /// 排著要做的（只留最新一個：拉滑桿時中間的值不用做）。
+    private var waiting: LookParams?
+    /// 正在做的。
+    private var working: LookParams?
+
+    /// 做好了就回傳，沒有回 nil。
+    func cached(_ key: LookParams) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = entries.firstIndex(where: { $0.key == key }) else { return nil }
+        return entries[index].data
+    }
+
+    /// 排進背景去做。已經做好、正在做、或已經排著就不重複。
+    func prepare(_ key: LookParams) {
+        lock.lock()
+        if entries.contains(where: { $0.key == key }) || working == key || waiting == key {
+            lock.unlock()
+            return
+        }
+        waiting = key
+        let idle: Bool = working == nil
+        if idle {
+            working = key
+            waiting = nil
+        }
+        lock.unlock()
+        if idle {
+            queue.async { [self] in
+                runQueue()
+            }
+        }
+    }
+
+    /// 當場做（手上一張都沒有的時候用），做完也存起來。
+    func makeNow(_ key: LookParams) -> Data {
+        if let ready = cached(key) { return ready }
+        let data: Data = LookFilter.makeCubeData(key)
+        lock.lock()
+        storeLocked(key, data)
+        lock.unlock()
+        return data
+    }
+
+    /// 在 queue 上跑：做完一張再看有沒有新排進來的。
+    private func runQueue() {
+        while true {
+            lock.lock()
+            guard let key = working else {
+                lock.unlock()
+                return
+            }
+            lock.unlock()
+            let data: Data = LookFilter.makeCubeData(key)
+            lock.lock()
+            storeLocked(key, data)
+            working = waiting
+            waiting = nil
+            lock.unlock()
+        }
+    }
+
+    private func storeLocked(_ key: LookParams, _ data: Data) {
+        entries.removeAll { $0.key == key }
+        entries.append((key: key, data: data))
+        if entries.count > Self.capacity {
+            entries.removeFirst(entries.count - Self.capacity)
+        }
     }
 }

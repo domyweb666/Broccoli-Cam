@@ -71,6 +71,18 @@ final class CaptionStore: @unchecked Sendable {
     private static let trashPrefix = ".trash-"
     private static let reserveName = "reserve.bin"
     private static let reserveSize = 512 * 1024
+    private static let indexName = "index.json"
+
+    /// 小索引：每個專案用了哪些影片檔，和記下時 project.json 的修改時間、大小。
+    /// 找舊專案時，時間和大小都沒變、檔名又對不上的就不用讀整份 JSON。
+    private struct IndexEntry: Codable, Equatable {
+        var files: [String]
+        var modified: Double
+        var size: Int64
+    }
+
+    /// 只在 queue 上用。nil 是還沒從檔案讀過。
+    private var fileIndex: [String: IndexEntry]?
 
     private init() {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -151,7 +163,7 @@ final class CaptionStore: @unchecked Sendable {
     func existing(for sources: [CaptionSource]) async -> CaptionProject? {
         let wanted: [String] = sources.map { $0.url.lastPathComponent }
         let scripts: [String] = sources.map { Self.flat($0.script) }
-        let found: [CaptionProject] = await candidates { project in
+        let found: [CaptionProject] = await candidates(files: wanted) { project in
             project.clips.map(\.file) == wanted && project.clips.map({ Self.flat($0.script) }) == scripts
         }
         guard !found.isEmpty else { return nil }
@@ -182,19 +194,70 @@ final class CaptionStore: @unchecked Sendable {
     /// 檔名和順序都一樣、總長也一樣，才是同一支。length 讀不到（nil）就只看檔名。
     func existing(takes: [String], length: Double?) async -> CaptionProject? {
         guard !takes.isEmpty else { return nil }
-        let found: [CaptionProject] = await candidates { $0.clips.map(\.file) == takes }
+        let found: [CaptionProject] = await candidates(files: takes) { $0.clips.map(\.file) == takes }
         guard let length, length.isFinite else { return Self.best(found) }
         return Self.best(found.filter { abs($0.duration - length) <= 0.5 })
     }
 
-    private func candidates(_ fits: @escaping (CaptionProject) -> Bool) async -> [CaptionProject] {
+    /// files 是 fits 一定會比的檔名順序。索引說檔名不同、而且 project.json 從那之後沒動過，才跳過不讀；
+    /// 其他（索引沒有、壞了、時間或大小變了）都照舊整份讀，順手更新索引。
+    private func candidates(files: [String], _ fits: @escaping (CaptionProject) -> Bool) async -> [CaptionProject] {
         let found: [CaptionProject]? = try? await run { () -> [CaptionProject] in
-            self.ids().compactMap { id -> CaptionProject? in
-                guard let project = try? self.read(id), fits(project), !self.isMissingVideo(project) else { return nil }
-                return project
+            let known: [String: IndexEntry] = self.loadIndex()
+            var entries: [String: IndexEntry] = [:]
+            var result: [CaptionProject] = []
+            for id in self.ids() {
+                let key: String = id.uuidString
+                if let entry = known[key], let now = self.stamp(id),
+                   entry.modified == now.modified, entry.size == now.size {
+                    entries[key] = entry
+                    if entry.files != files { continue }
+                }
+                guard let project = try? self.read(id) else {
+                    entries[key] = nil
+                    continue
+                }
+                // 讀的時候可能從備份救回來重寫過，時間和大小在讀完之後才記。
+                if let now = self.stamp(id) {
+                    entries[key] = IndexEntry(files: project.clips.map(\.file), modified: now.modified, size: now.size)
+                } else {
+                    entries[key] = nil
+                }
+                if fits(project), !self.isMissingVideo(project) { result.append(project) }
             }
+            if entries != known { self.saveIndex(entries) }
+            return result
         }
         return found ?? []
+    }
+
+    private func loadIndex() -> [String: IndexEntry] {
+        if let fileIndex { return fileIndex }
+        var loaded: [String: IndexEntry] = [:]
+        // 沒有或壞了就當空的，這次全部讀一遍再重建。
+        if let data = try? Data(contentsOf: root.appendingPathComponent(Self.indexName)),
+           let decoded = try? JSONDecoder().decode([String: IndexEntry].self, from: data) {
+            loaded = decoded
+        }
+        fileIndex = loaded
+        return loaded
+    }
+
+    /// 寫不進去沒關係，下次全部讀一遍就好，不動用預留的空間。
+    private func saveIndex(_ entries: [String: IndexEntry]) {
+        fileIndex = entries
+        guard manager.fileExists(atPath: root.path), let data = try? JSONEncoder().encode(entries) else { return }
+        try? data.write(to: root.appendingPathComponent(Self.indexName), options: .atomic)
+    }
+
+    /// project.json 的修改時間和大小。讀不到是 nil。
+    private func stamp(_ id: UUID) -> (modified: Double, size: Int64)? {
+        guard let attributes = try? manager.attributesOfItem(atPath: url(Self.projectName, in: id).path),
+              let date = attributes[.modificationDate] as? Date,
+              let size = (attributes[.size] as? NSNumber)?.int64Value else { return nil }
+        let modified: Double = date.timeIntervalSince1970
+        guard modified.isFinite else { return nil }
+        return (modified, size)
     }
 
     /// 對得上的不只一個時，有字幕的優先，再來是最近改過的。

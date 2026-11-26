@@ -84,14 +84,16 @@ final class SpeechFollower {
     func start(text: String, from utf16Offset: Int = 0, charsPerMinute: Double = 220) -> Bool {
         stop()
         guard isAvailable else { return false }
-        let all = SpokenKeys.keys(of: text)
+        // 換稿時多半已經在背景算好了，沒算好才當下算。
+        let prepared = SpokenScriptCache.shared.entry(for: text)
+        let all = prepared.keys
         guard all.count >= 4 else { return false }
         keys = all
         textLength = text.utf16.count
         let first = index(atUTF16: utf16Offset)
         let position = first < all.count ? first : 0
         aligner = SpeechAligner(keys: all.map { $0.value }, position: position)
-        lead = SpeechLead(stops: SpeechLead.sentenceStops(in: text, keys: all), position: position,
+        lead = SpeechLead(stops: prepared.stops, position: position,
                           rate: learnedRate ?? charsPerMinute / 60)
         shownOffset = currentOffset
         matchCount = 0
@@ -199,7 +201,9 @@ final class SpeechFollower {
         let mine = generation
         taskStartedAt = Date()
         task = recognizer.recognitionTask(with: next) { [weak self] result, error in
-            let transcript = result?.bestTranscription.formattedString
+            // 裝置端辨識整段不換新，講越久整串越長。比對只看最後 40 個字（advance），
+            // 在這裡就先切好，不要每次都把整串搬到主執行緒。
+            let transcript = result.map { String($0.bestTranscription.formattedString.suffix(SpeechFollower.tailLength)) }
             let ended = error != nil || (result?.isFinal ?? false)
             let failed = error != nil
             DispatchQueue.main.async {
@@ -269,9 +273,12 @@ final class SpeechFollower {
         }
     }
 
+    /// 比對只看辨識結果的最後幾個字。
+    private static let tailLength = 40
+
     /// 只看最後一小段，講很久的時候不用每次整串重轉拼音。
     private func advance(with transcript: String) {
-        let recent = String(transcript.suffix(40))
+        let recent = String(transcript.suffix(Self.tailLength))
         let spoken = SpokenKeys.keys(of: recent).map { $0.value }
         switch aligner.hear(spoken) {
         case .none:

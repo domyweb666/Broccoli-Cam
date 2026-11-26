@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Combine
 
 /// 收音狀態與說話／停頓偵測。
 /// 音量來源是相機音訊分流的 RMS（由 CameraService 提供），
@@ -11,7 +12,26 @@ final class SpeechActivityMonitor: ObservableObject {
         case noSignal
     }
 
-    @Published private(set) var level: Float = -160
+    /// 目前音量（dBFS），每 0.1 秒更新。讀這個值永遠是最新的。
+    /// 不用 @Published：以前每 0.1 秒一定發布一次，就算沒變也讓音量條重畫。
+    /// 現在畫面上看得出差別（levelStep）才通知畫面；每一次的值另外由 levelSamples 送出。
+    private(set) var level: Float = -160 {
+        willSet {
+            if Self.shown(newValue, differsFrom: shownLevel) {
+                shownLevel = newValue
+                objectWillChange.send()
+            }
+        }
+        didSet {
+            levelSamples.send(level)
+        }
+    }
+    /// 每一次設定音量都會送出（和以前 $level 一樣的時機與次數），給要每一筆都看的人（聆聽者）。
+    let levelSamples = PassthroughSubject<Float, Never>()
+    /// 上次通知畫面時的音量。
+    private var shownLevel: Float = -160
+    /// 音量條是 -60…0 dB 畫成 44pt，差不到這麼多 dB 畫出來不到半點，不用重畫。
+    private static let levelStep: Float = 0.5
     @Published private(set) var micStatus: MicStatus = .unknown
     @Published private(set) var isSpeaking = false
     @Published private(set) var route = "—"
@@ -53,6 +73,13 @@ final class SpeechActivityMonitor: ObservableObject {
         let inputs = AVAudioSession.sharedInstance().currentRoute.inputs
         let text = inputs.map { "\($0.portName) [\($0.portType.rawValue)]" }.joined(separator: ", ")
         route = text.isEmpty ? "無輸入" : text
+    }
+
+    /// 音量條上看得出差別：夾在 -60…0 之後差 levelStep 以上。
+    private static func shown(_ value: Float, differsFrom old: Float) -> Bool {
+        let a = min(0, max(-60, value))
+        let b = min(0, max(-60, old))
+        return abs(a - b) >= levelStep
     }
 
     private func currentLevel() -> Float? {

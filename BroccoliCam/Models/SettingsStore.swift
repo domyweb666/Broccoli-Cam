@@ -164,14 +164,23 @@ final class SettingsStore: ObservableObject {
     private let defaults = UserDefaults.standard
 
     /// 正在用的那篇稿子的內文。列表在 ScriptLibrary，這裡是它的鏡像，由 ScriptLibrary 寫入。
-    @Published var script: String {
+    ///
+    /// 不用 @Published：腳本頁打字停一下就會改一次，發布的話每個看設定的畫面（整個相機主畫面）都要重算。
+    /// 只有「有沒有字」變了才通知，提詞要不要顯示（usesPrompter）看的是它。
+    /// 內文本身只有 RecordingView 的 onChange 在看。這個值只由 ScriptLibrary.syncScript 改，
+    /// 每次都和 library 的 items 或 activeID 一起變，RecordingView 也看著 library，會一起重算到。
+    /// 要在別的地方改它，記得自己叫 objectWillChange.send()。
+    var script: String {
+        willSet {
+            if SettingsStore.hasText(newValue) != hasScript { objectWillChange.send() }
+        }
         didSet {
             defaults.set(script, forKey: "script")
             hasScript = SettingsStore.hasText(script)
         }
     }
     /// 稿子裡有沒有字（空白不算）。usesPrompter 一次畫面更新會叫十幾次，每次都整篇去頭尾太浪費，
-    /// 改成稿子一改就算好存著。不用 @Published：script 本身改了就會通知。
+    /// 改成稿子一改就算好存著。不用 @Published：它一變，script 的 willSet 就會通知。
     private(set) var hasScript: Bool
 
     @Published var resolution: VideoResolution { didSet { defaults.set(resolution.rawValue, forKey: "resolution") } }

@@ -4,8 +4,8 @@ import CoreVideo
 import Foundation
 import Metal
 
-/// 畫面處理共用的 Metal 資源。錄影（videoQueue）和預覽（預覽佇列）用同一個 CIContext，
-/// CIContext 本身可以跨執行緒使用。
+/// 畫面處理共用的 Metal 資源。錄影（videoQueue）用 context；預覽（預覽佇列）用 previewContext，
+/// 兩個設定一樣，只是各自排在不同的 GPU 佇列上。CIContext 本身可以跨執行緒使用。
 enum CameraGPU {
     /// 影格是 709 的 SDR。工作色彩空間也用 709，等於直接在 gamma 編碼後的數值上運算：
     /// 1. 分析（LookAnalyzer）和濾鏡看到的是同一組數字。
@@ -61,13 +61,27 @@ enum CameraGPU {
 
     static let context: CIContext? = {
         guard let queue = CameraGPU.commandQueue else { return nil }
-        let options: [CIContextOption: Any] = [
+        return CIContext(mtlCommandQueue: queue, options: CameraGPU.contextOptions)
+    }()
+
+    /// 預覽自己的一條 GPU 佇列。錄影那格（videoQueue 上同步算圖）和預覽排在同一條佇列時，
+    /// 預覽那張還沒畫完，錄影的就得排在後面等，4K60 開優化最容易掉格。分開之後兩邊各排各的。
+    /// 只有 MetalPreviewRenderer 和預覽過場的預熱用；錄影、分析、燒錄一律用上面的 context。
+    static let previewCommandQueue: MTLCommandQueue? = CameraGPU.device?.makeCommandQueue()
+
+    /// 和 context 同一組設定（同一個工作色彩空間），畫出來的顏色一樣，只是排在 previewCommandQueue 上。
+    static let previewContext: CIContext? = {
+        guard let queue = CameraGPU.previewCommandQueue else { return nil }
+        return CIContext(mtlCommandQueue: queue, options: CameraGPU.contextOptions)
+    }()
+
+    private static var contextOptions: [CIContextOption: Any] {
+        [
             // 影片每格都不一樣，快取中間結果只會吃記憶體。
             .cacheIntermediates: false,
             .workingColorSpace: CameraGPU.colorSpace
         ]
-        return CIContext(mtlCommandQueue: queue, options: options)
-    }()
+    }
 
     static var isAvailable: Bool { context != nil }
 }

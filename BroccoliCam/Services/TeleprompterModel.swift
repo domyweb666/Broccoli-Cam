@@ -82,9 +82,20 @@ final class PromptLayout {
     let height: CGFloat
 
     private let plain: Engine
-    /// 唸過的字用的另一個顏色。排版和 plain 一樣，唸到才建。
-    private lazy var spokenEngine = Engine(text: text, width: width, fontSize: fontSize, color: spokenColor)
+    /// 唸過的字用的另一個顏色。排版和 plain 一樣，唸到才建（或先在背景建好，見 prepareSpokenInBackground）。
+    /// 只在主執行緒讀寫。
+    private var spokenStorage: Engine?
+    private var spokenEngine: Engine {
+        if let spokenStorage { return spokenStorage }
+        let built = Engine(text: text, width: width, fontSize: fontSize, color: spokenColor)
+        spokenStorage = built
+        return built
+    }
+    /// 背景正在排變色用的那一份。
+    private var spokenBuilding = false
     private let spokenColor: UIColor
+    /// 背景排版用的佇列，一次排一份。
+    private static let spokenQueue = DispatchQueue(label: "org.domyweb.broccolicam.prompt-spoken", qos: .utility)
 
     init(text: String, width: CGFloat, fontSize: CGFloat, spokenColor: UIColor) {
         self.text = text
@@ -118,9 +129,31 @@ final class PromptLayout {
         plain = engine
     }
 
-    /// 先把變色用的那一份排好。
+    /// 先把變色用的那一份排好。背景已經排好就不用再排；還在背景排就當下自己排（保底，和以前一樣）。
     func prepareSpoken() {
         _ = spokenEngine
+    }
+
+    /// 在背景把變色用的那一份排好，排好了交回主執行緒。在主執行緒呼叫。
+    /// 這一份 TextKit 物件只在背景那條執行緒建、建完才交出來，之後只有主執行緒碰，不會兩邊同時用。
+    func prepareSpokenInBackground() {
+        guard spokenStorage == nil, !spokenBuilding else { return }
+        spokenBuilding = true
+        let text = self.text
+        let width = self.width
+        let fontSize = self.fontSize
+        let color = spokenColor
+        Self.spokenQueue.async { [weak self] in
+            // 已經不用了（換稿、換字級）就不排。
+            guard self != nil else { return }
+            let built = Engine(text: text, width: width, fontSize: fontSize, color: color)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.spokenBuilding = false
+                // 等的時候主執行緒已經自己排好了，就用那一份。
+                if self.spokenStorage == nil { self.spokenStorage = built }
+            }
+        }
     }
 
     /// 畫一行，唸過的部分用另一個顏色。origin 是整篇左上角在目前畫布上的位置。
@@ -195,7 +228,16 @@ final class TeleprompterModel: ObservableObject {
     private var fontSize: CGFloat = 26
     private var contentHeight: CGFloat = 0
     private var cachedLayout: PromptLayout?
+    /// 同一篇、同字級、別的寬度的排版，轉回原來的方向直接拿來用。
+    private var spareLayouts: [PromptLayout] = []
     private var cachedPoint: PointFit?
+    /// 語音跟隨開著（唸過的字要變色）。開著的話排好版就在背景先排變色用的那份，開錄時不用在主執行緒排。
+    var prefersSpoken = false {
+        didSet {
+            if prefersSpoken && !oldValue { scheduleSpokenPrebuild() }
+        }
+    }
+    private var spokenPrebuildToken = 0
     /// 上一次整篇排版的時間，拉字級時用來節流。
     private var lastBuild: CFTimeInterval = 0
     private var rebuildQueued = false
@@ -510,16 +552,46 @@ final class TeleprompterModel: ObservableObject {
         if let cached = cachedLayout, cached.width == layoutWidth, cached.fontSize == fontSize, cached.text == text {
             return cached
         }
-        let built = PromptLayout(text: text, width: layoutWidth, fontSize: fontSize, spokenColor: UIColor(Theme.good))
-        cachedLayout = built
-        lastBuild = CACurrentMediaTime()
-        let height = built.height + Self.topPadding
+        // 轉方向時寬度在兩個值之間來回，長稿每轉一次就整篇重排。同一篇、同字級的舊排版留著，轉回來直接用。
+        let width = layoutWidth
+        let size = fontSize
+        var spares = spareLayouts.filter { $0.fontSize == size && $0.text == text }
+        let next: PromptLayout
+        if let index = spares.firstIndex(where: { $0.width == width }) {
+            next = spares.remove(at: index)
+        } else {
+            next = PromptLayout(text: text, width: width, fontSize: size, spokenColor: UIColor(Theme.good))
+            lastBuild = CACurrentMediaTime()
+        }
+        if let previous = cachedLayout, previous.fontSize == size, previous.width != width, previous.text == text {
+            spares.insert(previous, at: 0)
+        }
+        spareLayouts = Array(spares.prefix(Self.spareLimit))
+        cachedLayout = next
+        let height = next.height + Self.topPadding
         if height != contentHeight {
             contentHeight = height
             roomChanged()
         }
-        return built
+        scheduleSpokenPrebuild()
+        return next
     }
+
+    /// 別的寬度的排版最多留幾份（直放、橫放各一份就夠）。
+    private static let spareLimit = 2
+
+    /// 排好版之後過一下，語音跟隨開著就在背景把變色用的那份也排好。拉字級時一直在重排，只排最後那份。
+    private func scheduleSpokenPrebuild() {
+        guard prefersSpoken else { return }
+        spokenPrebuildToken += 1
+        let token = spokenPrebuildToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.spokenPrebuildDelay) { [weak self] in
+            guard let self, self.prefersSpoken, self.spokenPrebuildToken == token else { return }
+            self.cachedLayout?.prepareSpokenInBackground()
+        }
+    }
+
+    private static let spokenPrebuildDelay: TimeInterval = 0.5
 
     /// 字級、版面變了，捲得到的最遠位置跟著變。停在最後幾行而停掉的每一幀要再開，重新看還有沒有得捲。
     private func roomChanged() {

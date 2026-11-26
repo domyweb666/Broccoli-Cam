@@ -146,9 +146,19 @@ final class TakeChecker: ObservableObject {
                 hearing = try await CaptionBuilder.hear(job.url, script: job.script)
             }
             try Task.checkCancellation()
-            return .heard(hearing, TakeReport(script: job.script, hearing: hearing, maxChars: job.maxChars))
+            let report: TakeReport = Self.report(job, hearing)
+            try Task.checkCancellation()
+            return .heard(hearing, report)
         } catch {
             return .failed(error.localizedDescription)
+        }
+    }
+
+    /// 對稿子很長的時候要算一陣子。被錄影打斷（取消）就中途放棄，這一份結果不用。
+    /// 刻意不是 async：在 async 裡 withValue 會挑到 async 的那個版本。
+    private static func report(_ job: Job, _ hearing: TakeHearing) -> TakeReport {
+        CaptionAligner.$stopsWhenCancelled.withValue(true) {
+            TakeReport(script: job.script, hearing: hearing, maxChars: job.maxChars)
         }
     }
 

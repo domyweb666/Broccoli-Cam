@@ -24,6 +24,11 @@ final class CompanionModel: ObservableObject {
     private var nextNod: Date?
     private var instant = false
     private var reactor = ListenerReactor()
+    /// 換預載的反應片要等這麼久都沒再變才換。講話停一下下又開口，不用把兩台預載的片整批換掉又換回來。
+    private let expectingDelay: TimeInterval = 0.5
+    /// 等著換成的那一組，和它的計時。
+    private var expectingWork: DispatchWorkItem?
+    private var expectingTarget: [CompanionReaction]?
 
     func start(meter: SpeechActivityMonitor) {
         guard timer == nil else { return }
@@ -39,8 +44,8 @@ final class CompanionModel: ObservableObject {
                 self?.speakingChanged(value)
             }
         // 直接跟著收音每 0.1 秒的更新走，不等自己的計時器，反應才不會再慢一拍。
-        levelCancellable = meter.$level
-            .dropFirst()
+        // 每一次量到的音量都會送來（畫面上的音量條則是變夠多才重畫）。
+        levelCancellable = meter.levelSamples
             .sink { [weak self] value in
                 self?.heard(value)
             }
@@ -61,6 +66,7 @@ final class CompanionModel: ObservableObject {
         nextNod = nil
         isReacting = false
         reactor.reset()
+        cancelPendingExpecting()
     }
 
     private func setInstant(_ value: Bool) {
@@ -70,7 +76,8 @@ final class CompanionModel: ObservableObject {
         if !value && speaking {
             nextNod = Date().addingTimeInterval(Double.random(in: 2.5...4.5))
         }
-        updateExpecting()
+        // 使用者自己切的，馬上換。
+        updateExpecting(immediately: true)
     }
 
     private func heard(_ level: Float) {
@@ -92,9 +99,37 @@ final class CompanionModel: ObservableObject {
         reactor.declined()
     }
 
-    private func updateExpecting() {
+    /// 接下來最可能的反應變了，告訴播放器換預載的片。講話中途的變化要穩定 expectingDelay 秒才換。
+    private func updateExpecting(immediately: Bool = false) {
         let next: [CompanionReaction] = instant ? reactor.expecting : [.nod]
-        if next != expecting.value { expecting.send(next) }
+        guard next != expecting.value else {
+            // 又變回現在載著的那組，等著的就不用換了。
+            cancelPendingExpecting()
+            return
+        }
+        if immediately {
+            cancelPendingExpecting()
+            expecting.send(next)
+            return
+        }
+        // 已經在等換成同一組，照原本的時間。
+        guard expectingTarget != next else { return }
+        cancelPendingExpecting()
+        expectingTarget = next
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let target = self.expectingTarget else { return }
+            self.expectingTarget = nil
+            self.expectingWork = nil
+            if target != self.expecting.value { self.expecting.send(target) }
+        }
+        expectingWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + expectingDelay, execute: work)
+    }
+
+    private func cancelPendingExpecting() {
+        expectingWork?.cancel()
+        expectingWork = nil
+        expectingTarget = nil
     }
 
     private func speakingChanged(_ value: Bool) {

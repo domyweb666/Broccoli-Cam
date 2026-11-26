@@ -48,6 +48,7 @@ private struct ScriptEditorContent: View {
     @State private var title: String
     @State private var text: String
     @State private var sync: ScriptEditorSync
+    @State private var statsCache = ScriptStatsCache()
     @State private var confirmClear = false
 
     @ScaledMetric(relativeTo: .title2) private var baseSize: CGFloat = 22
@@ -66,6 +67,12 @@ private struct ScriptEditorContent: View {
 
     private var fontSize: CGFloat {
         baseSize * CGFloat(settings.scriptTextScale)
+    }
+
+    /// 字數、時長、各段時長。上面的小標籤和底部列共用一份，字沒變就不重算。
+    private var stats: ScriptStats {
+        statsCache.stats(text: text, speechRate: settings.speechRate,
+                         segmented: settings.segmentedRecording, amount: settings.promptAmount)
     }
 
     // body 拆成幾層（版面、工具列、監聽），串太長編譯器會算不完。
@@ -141,13 +148,7 @@ private struct ScriptEditorContent: View {
             titleField
             Divider()
                 .padding(.horizontal, textInset)
-            ScriptSegmentChips(
-                text: text,
-                speechRate: settings.speechRate,
-                segmented: settings.segmentedRecording,
-                amount: settings.promptAmount,
-                inset: textInset
-            )
+            ScriptSegmentChips(durations: stats.durations, inset: textInset)
             bodyEditor
             bottomBar
         }
@@ -251,13 +252,8 @@ private struct ScriptEditorContent: View {
 
     private var bottomBar: some View {
         HStack(spacing: 8) {
-            ScriptStatsText(
-                text: text,
-                speechRate: settings.speechRate,
-                segmented: settings.segmentedRecording,
-                amount: settings.promptAmount
-            )
-            .frame(maxWidth: .infinity, alignment: .leading)
+            ScriptStatsText(countText: stats.countText, detail: stats.detail)
+                .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 4) {
                 sizeButton("A−", label: "字縮小", enabled: canShrink, delta: -0.1)
                 sizeButton("A＋", label: "字放大", enabled: canGrow, delta: 0.1)
@@ -348,17 +344,75 @@ private struct UsePill: ViewModifier {
     }
 }
 
-/// 字數、預估時長、段數。只吃值，字沒變就不重算。
+/// 編輯頁顯示的字數、預估時長、段數、各段時長。
+/// 以前底部列和上面的小標籤各算各的，長稿每打一個字要把全文掃好幾遍；現在一起算一次。
+/// 算法和以前一樣，顯示的字一模一樣。
+private struct ScriptStats {
+    let countText: String
+    let detail: String
+    /// 每一段各自要講多久，兩段以上才有。
+    let durations: [String]
+
+    init(text: String, speechRate: Double, segmented: Bool, amount: PromptAmount) {
+        let count: Int = ScriptSegments.spokenCount(text)
+        countText = "\(count) 字"
+        // 提綱是用自己的話講，照字數估的時長不準。
+        if amount == .outline {
+            durations = []
+            if count > 0 {
+                let points: Int = ScriptSegments.outline(of: text, segmented: segmented).count
+                detail = points > 1 ? "\(points) 段" : ""
+            } else {
+                detail = ""
+            }
+            return
+        }
+        let segments = ScriptSegments.segments(of: text, segmented: segmented)
+        if segments.count > 1 {
+            durations = segments.map { segment in
+                ScriptSegments.formatDuration(
+                    ScriptSegments.estimatedSeconds(segment, charsPerMinute: speechRate))
+            }
+        } else {
+            durations = []
+        }
+        guard count > 0 else {
+            detail = ""
+            return
+        }
+        // 和 ScriptSegments.estimatedSeconds(text, ...) 同一個算法，字數上面已經數過了。
+        let seconds: TimeInterval = speechRate > 0 ? Double(count) / speechRate * 60 : 0
+        var summary = "約 \(ScriptSegments.formatDuration(seconds))"
+        if segments.count > 1 {
+            summary += " · \(segments.count) 段"
+        }
+        detail = summary
+    }
+}
+
+/// 記著上一次算的，字和設定都沒變就直接拿。放在參考型別裡，更新它不會讓畫面重算。
+private final class ScriptStatsCache {
+    private var key: (text: String, speechRate: Double, segmented: Bool, amount: PromptAmount)?
+    private var value: ScriptStats?
+
+    func stats(text: String, speechRate: Double, segmented: Bool, amount: PromptAmount) -> ScriptStats {
+        if let key, let value, key.speechRate == speechRate, key.segmented == segmented,
+           key.amount == amount, key.text == text {
+            return value
+        }
+        let computed = ScriptStats(text: text, speechRate: speechRate, segmented: segmented, amount: amount)
+        key = (text, speechRate, segmented, amount)
+        value = computed
+        return computed
+    }
+}
+
+/// 字數、預估時長、段數。
 private struct ScriptStatsText: View {
-    let text: String
-    let speechRate: Double
-    let segmented: Bool
-    let amount: PromptAmount
+    let countText: String
+    let detail: String
 
     var body: some View {
-        let count: Int = ScriptSegments.spokenCount(text)
-        let countText: String = "\(count) 字"
-        let detail: String = detailText(count: count)
         ViewThatFits(in: .horizontal) {
             Text(detail.isEmpty ? countText : countText + " · " + detail)
                 .lineLimit(1)
@@ -376,41 +430,12 @@ private struct ScriptStatsText: View {
         .foregroundStyle(.secondary)
         .monospacedDigit()
     }
-
-    private func detailText(count: Int) -> String {
-        guard count > 0 else { return "" }
-        let seconds = ScriptSegments.estimatedSeconds(text, charsPerMinute: speechRate)
-        // 提綱是用自己的話講，照字數估的時長不準。
-        if amount == .outline {
-            let points: Int = ScriptSegments.outline(of: text, segmented: segmented).count
-            return points > 1 ? "\(points) 段" : ""
-        }
-        var detail = "約 \(ScriptSegments.formatDuration(seconds))"
-        let segments = ScriptSegments.segments(of: text, segmented: segmented).count
-        if segments > 1 {
-            detail += " · \(segments) 段"
-        }
-        return detail
-    }
 }
 
 /// 每一段各自要講多久，兩段以上才顯示。
 private struct ScriptSegmentChips: View {
-    let text: String
-    let speechRate: Double
-    let segmented: Bool
-    let amount: PromptAmount
+    let durations: [String]
     let inset: CGFloat
-
-    private var durations: [String] {
-        guard amount != .outline else { return [] }
-        let segments = ScriptSegments.segments(of: text, segmented: segmented)
-        guard segments.count > 1 else { return [] }
-        return segments.map { segment in
-            ScriptSegments.formatDuration(
-                ScriptSegments.estimatedSeconds(segment, charsPerMinute: speechRate))
-        }
-    }
 
     var body: some View {
         let chips: [String] = durations

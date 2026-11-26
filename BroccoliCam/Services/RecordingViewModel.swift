@@ -102,7 +102,14 @@ final class RecordingViewModel: ObservableObject {
 
     // 分段錄影
     /// 要錄的各段。
-    @Published private(set) var pieces: [ScriptPiece] = []
+    @Published private(set) var pieces: [ScriptPiece] = [] {
+        didSet {
+            // 換稿了：語音跟隨要用的拼音先在背景算好，開錄那一刻才不用在主執行緒整篇轉。
+            if pieces != oldValue {
+                SpokenScriptCache.shared.prepare(pieces.filter { !$0.isPoint }.map(\.text))
+            }
+        }
+    }
     @Published private(set) var currentIndex = 0
     @Published private(set) var takes: [Int: SegmentTake] = [:]
     /// 剛錄完、還沒決定留用或重錄的那一段。
@@ -290,6 +297,13 @@ final class RecordingViewModel: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] recording in
                 self?.recordingChanged(recording)
+            }
+            .store(in: &cancellables)
+        // 語音跟隨開著，唸過的字要變色：變色用的那份排版在排好版之後就先在背景排，不等到按錄影。
+        settings.$voiceFollow
+            .removeDuplicates()
+            .sink { [weak self] on in
+                self?.prompter.prefersSpoken = on
             }
             .store(in: &cancellables)
         checker.onLog = { [weak camera] message in
@@ -1262,7 +1276,7 @@ final class RecordingViewModel: ObservableObject {
     /// 這兩個位置之間有幾個會唸出來的字。
     private func spokenCount(from start: Int, to end: Int, in text: String) -> Int {
         guard end > start else { return 0 }
-        return SpokenKeys.keys(of: text).filter { $0.utf16Offset >= start && $0.utf16Offset < end }.count
+        return SpokenScriptCache.shared.keys(for: text).filter { $0.utf16Offset >= start && $0.utf16Offset < end }.count
     }
 
     /// 提詞捲過去，語音跟隨也從那裡接著聽。

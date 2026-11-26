@@ -16,12 +16,27 @@ final class MetalPreviewRenderer {
     private var busy = false
     private var drawnCount = 0
     private var skippedCount = 0
+    /// 目前這個圖層第一張畫好時要通知誰（只通知一次）。
+    private var onFirstFrame: ((CAMetalLayer) -> Void)?
 
     /// 掛上（或拿掉）要畫的圖層。size 是 drawable 的像素大小。
-    func setLayer(_ next: CAMetalLayer?, size nextSize: CGSize) {
+    /// onFirstFrame：這個圖層第一張處理過的畫面送出去之後，在主執行緒呼叫一次（參數是那個圖層）。
+    func setLayer(_ next: CAMetalLayer?, size nextSize: CGSize, onFirstFrame firstFrame: ((CAMetalLayer) -> Void)? = nil) {
         lock.lock()
         layer = next
         size = next == nil ? .zero : nextSize
+        onFirstFrame = next == nil ? nil : firstFrame
+        lock.unlock()
+    }
+
+    /// 拿掉圖層，但只在現在掛著的還是 old 時才拿：新的預覽 view 先掛上、舊的才拆掉時，不會把新的拿掉。
+    func detach(_ old: CAMetalLayer) {
+        lock.lock()
+        if layer === old {
+            layer = nil
+            size = .zero
+            onFirstFrame = nil
+        }
         lock.unlock()
     }
 
@@ -69,8 +84,18 @@ final class MetalPreviewRenderer {
 
     /// 回傳 false 代表這一格沒有送出去（拿不到 drawable 等等），由呼叫端解除忙碌。
     private func draw(_ image: CIImage, mirrored: Bool, on target: CAMetalLayer) -> Bool {
-        guard let context = CameraGPU.context,
-              let commandBuffer = CameraGPU.commandQueue?.makeCommandBuffer(),
+        // 預覽用自己的 GPU 佇列，不跟錄影那格搶。建不起來（理論上不會）才退回共用的那組。
+        let context: CIContext?
+        let queue: MTLCommandQueue?
+        if let previewContext = CameraGPU.previewContext, let previewQueue = CameraGPU.previewCommandQueue {
+            context = previewContext
+            queue = previewQueue
+        } else {
+            context = CameraGPU.context
+            queue = CameraGPU.commandQueue
+        }
+        guard let context,
+              let commandBuffer = queue?.makeCommandBuffer(),
               let drawable = target.nextDrawable() else { return false }
         let texture: MTLTexture = drawable.texture
         let width: Int = texture.width
@@ -93,21 +118,32 @@ final class MetalPreviewRenderer {
         }
         commandBuffer.present(drawable)
         commandBuffer.addCompletedHandler { [weak self] _ in
-            self?.finish(success: true)
+            self?.finish(success: true, on: target)
         }
         commandBuffer.commit()
         return true
     }
 
-    private func finish(success: Bool) {
+    private func finish(success: Bool, on drawnLayer: CAMetalLayer? = nil) {
         lock.lock()
         busy = false
+        var notify: ((CAMetalLayer) -> Void)?
         if success {
             drawnCount += 1
+            // 畫完的還是現在掛著的那個圖層，才算它的第一張。
+            if let drawnLayer, layer === drawnLayer, let firstFrame = onFirstFrame {
+                notify = firstFrame
+                onFirstFrame = nil
+            }
         } else {
             skippedCount += 1
         }
         lock.unlock()
+        if let notify, let drawnLayer {
+            DispatchQueue.main.async {
+                notify(drawnLayer)
+            }
+        }
     }
 
     /// 等比例放進框裡（和原生預覽的 resizeAspect 一樣）。
