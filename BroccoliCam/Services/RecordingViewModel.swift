@@ -1158,7 +1158,11 @@ final class RecordingViewModel: ObservableObject {
         activeFile = nil
         phase = .idle
         recordings.removeAll { $0.file == url.lastPathComponent }
-        let notice: String? = damaged ? "結尾有一小段沒存到" : nil
+        var notes: [String] = []
+        if damaged { notes.append("結尾有一小段沒存到") }
+        // 錄到一半外接麥斷線，影片照常存，但後段是另一支麥克風收的，要講清楚。
+        if let mic = camera?.takeMicNote(for: url) { notes.append(mic) }
+        let notice: String? = notes.isEmpty ? nil : notes.joined(separator: "\n")
         if isSegmented {
             pending = SegmentTake(url: url, firstSound: firstSound, lastSound: lastSound)
             recordingError = notice

@@ -64,6 +64,7 @@ struct SettingsView: View {
             voiceSection
             videoSection
             recordingSection
+            micSection
             subtitleSection
             advancedSection
         }
@@ -162,13 +163,72 @@ struct SettingsView: View {
             }
             Toggle("接片時裁掉每段頭尾的空白", isOn: $settings.trimSilence)
             Toggle("手機橫放時錄橫式影片", isOn: $settings.autoLandscape)
-            if CameraService.supportsBluetoothHQ {
-                Toggle("AirPods 收音", isOn: $settings.airPodsMic)
-            }
             Toggle("錄完檢查", isOn: $settings.takeCheck)
         } header: {
             Text("錄影")
         }
+    }
+
+    /// 收音：哪支麥克風、藍牙、雙聲道。這一區要講清楚現在用的是哪支、藍牙音質會變差，所以有說明文字。
+    private var micSection: some View {
+        Section {
+            Picker("麥克風", selection: $settings.micChoice) {
+                ForEach(micOptions) { option in
+                    Text(option.label).tag(option.id)
+                }
+            }
+            Toggle("藍牙麥克風", isOn: $settings.bluetoothMic)
+            Picker("雙聲道外接麥", selection: $settings.micChannelMode) {
+                ForEach(MicChannelMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            if CameraService.supportsBluetoothHQ {
+                Toggle("AirPods 高品質收音", isOn: $settings.airPodsMic)
+            }
+        } header: {
+            Text("收音")
+        } footer: {
+            Text(micFooter)
+                .font(.footnote)
+        }
+    }
+
+    private struct MicOption: Identifiable {
+        let id: String
+        let label: String
+    }
+
+    private var micOptions: [MicOption] {
+        var list = [MicOption(id: MicChoice.automatic.storage, label: "自動（有外接就用外接）"),
+                    MicOption(id: MicChoice.builtIn.storage, label: "手機麥克風")]
+        let external = camera.micRoute.available.filter { $0.kind != .builtIn }
+        for port in external {
+            list.append(MicOption(id: MicChoice.port(uid: port.id, name: port.name).storage, label: port.name))
+        }
+        // 指定過、現在沒接上的那支也列出來，選單才對得上。
+        if case .port(let uid, let name) = MicChoice(storage: settings.micChoice),
+           !external.contains(where: { $0.id == uid }) {
+            list.append(MicOption(id: settings.micChoice, label: "\(name)（沒接上，先自動挑）"))
+        }
+        return list
+    }
+
+    private var micFooter: String {
+        let route = camera.micRoute
+        var lines = ["現在：\(route.summary)"]
+        if let waiting = route.waitingFor {
+            lines.append("「\(waiting)」這段錄完就會換過去。")
+        }
+        if route.isPhoneQuality {
+            lines.append("藍牙麥克風走電話用的通道，聲音只有電話音質、會比較悶。DJI Mic Mini、Mic 3 要好音質，請把 USB-C 接收器插在手機上。")
+        } else if settings.bluetoothMic {
+            lines.append("藍牙麥克風（DJI 直連手機、AirPods）是電話音質，比 USB-C 接收器差。")
+        }
+        if settings.micChannelMode == .stereo {
+            lines.append("立體聲：兩支發射器各錄在左、右聲道。只有一支發射器時請選合成單聲道，不然只有一邊耳朵有聲音。")
+        }
+        return lines.joined(separator: "\n")
     }
 
     private var subtitleSection: some View {

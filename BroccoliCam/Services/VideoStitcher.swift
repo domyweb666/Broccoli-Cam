@@ -32,7 +32,7 @@ enum VideoStitcher {
             withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
             throw VideoStitchError.cannotExport
         }
-        var audioTrack: AVMutableCompositionTrack?
+        var audioTracks: [Int: AVMutableCompositionTrack] = [:]
         var cursor = CMTime.zero
         var transformSet = false
         var transform = CGAffineTransform.identity
@@ -69,15 +69,18 @@ enum VideoStitcher {
             }
 
             if let sourceAudio = try await asset.loadTracks(withMediaType: .audio).first {
-                if audioTrack == nil {
-                    audioTrack = composition.addMutableTrack(
+                // 單聲道（手機麥）和立體聲（外接麥）的段落分開放兩條音軌，
+                // 一條音軌裡混著不同聲道數，有些機器接起來會失敗。輸出和播放時兩條會混成一條。
+                let channels = try await Self.channelCount(of: sourceAudio)
+                if audioTracks[channels] == nil {
+                    audioTracks[channels] = composition.addMutableTrack(
                         withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
                 }
                 let audioRange = try await sourceAudio.load(.timeRange)
                 let clipped = range.intersection(audioRange)
                 if clipped.duration.seconds > 0 {
                     let at = cursor + (clipped.start - range.start)
-                    try audioTrack?.insertTimeRange(clipped, of: sourceAudio, at: at)
+                    try audioTracks[channels]?.insertTimeRange(clipped, of: sourceAudio, at: at)
                 }
             }
 
@@ -86,6 +89,13 @@ enum VideoStitcher {
             cursor = cursor + range.duration
         }
         return (composition, offsets, durations, transform)
+    }
+
+    /// 音軌是幾聲道（1 或 2，讀不到當 1）。
+    private static func channelCount(of track: AVAssetTrack) async throws -> Int {
+        let formats: [CMFormatDescription] = try await track.load(.formatDescriptions)
+        let counts = formats.compactMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee.mChannelsPerFrame }
+        return (counts.max() ?? 1) >= 2 ? 2 : 1
     }
 
     /// 輸出到 output，這個檔名不能已經存在。失敗時會把寫到一半的檔刪掉，各段不動。

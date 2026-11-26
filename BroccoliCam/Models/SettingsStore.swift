@@ -235,6 +235,12 @@ final class SettingsStore: ObservableObject {
     @Published var hideSelf: Bool { didSet { defaults.set(hideSelf, forKey: "hideSelf") } }
     /// 用 AirPods 高品質收音（iOS 26 以上才有作用）
     @Published var airPodsMic: Bool { didSet { defaults.set(airPodsMic, forKey: "airPodsMic") } }
+    /// 用哪支麥克風：auto（有外接就用外接）、builtin，或指定某一支。格式見 MicChoice。
+    @Published var micChoice: String { didSet { defaults.set(micChoice, forKey: "micChoice") } }
+    /// 藍牙麥克風（DJI Mic Mini／Mic 3 直連手機、AirPods）也能用
+    @Published var bluetoothMic: Bool { didSet { defaults.set(bluetoothMic, forKey: "bluetoothMic") } }
+    /// 外接麥是雙聲道時：合成單聲道或錄成立體聲
+    @Published var micChannelMode: MicChannelMode { didSet { defaults.set(micChannelMode.rawValue, forKey: "micChannelMode") } }
     /// 錄完一段自動檢查漏講和講錯的數字
     @Published var takeCheck: Bool { didSet { defaults.set(takeCheck, forKey: "takeCheck") } }
     /// 手機橫放時錄橫式 16:9
@@ -311,6 +317,9 @@ final class SettingsStore: ObservableObject {
         instantReaction = (d.object(forKey: "instantReaction") as? Bool) ?? true
         hideSelf = (d.object(forKey: "hideSelf") as? Bool) ?? false
         airPodsMic = (d.object(forKey: "airPodsMic") as? Bool) ?? false
+        micChoice = d.string(forKey: "micChoice") ?? "auto"
+        bluetoothMic = (d.object(forKey: "bluetoothMic") as? Bool) ?? true
+        micChannelMode = MicChannelMode(rawValue: d.string(forKey: "micChannelMode") ?? "") ?? .mono
         takeCheck = (d.object(forKey: "takeCheck") as? Bool) ?? true
         autoLandscape = (d.object(forKey: "autoLandscape") as? Bool) ?? true
         scriptTextScale = (d.object(forKey: "scriptTextScale") as? Double) ?? 1.0
@@ -324,6 +333,12 @@ final class SettingsStore: ObservableObject {
         remoteBindings = d.data(forKey: "remoteBindings")
             .flatMap { try? JSONDecoder().decode(RemoteBindings.self, from: $0) } ?? .standard
         showDebug = (d.object(forKey: "showDebug") as? Bool) ?? false
+    }
+
+    /// 給相機的收音設定。
+    var micPreferences: AudioRouter.Preferences {
+        AudioRouter.Preferences(choice: MicChoice(storage: micChoice), allowsBluetooth: bluetoothMic,
+                                channelMode: micChannelMode, bluetoothHQ: airPodsMic)
     }
 
     private static func hasText(_ text: String) -> Bool {

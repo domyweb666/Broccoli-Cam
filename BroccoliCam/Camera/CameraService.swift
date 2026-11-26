@@ -22,6 +22,10 @@ final class CameraService: NSObject, ObservableObject {
     @Published private(set) var availableStabilizations: [StabilizationLevel] = [.off]
     @Published private(set) var activeFormatText = "—"
     @Published private(set) var interruptionText: String?
+    /// 現在用哪支麥克風、幾聲道。
+    @Published private(set) var micRoute = MicRoute()
+    /// 麥克風剛插拔時跳的一句，幾秒後自己消失。
+    @Published private(set) var micNotice: String?
     @Published private(set) var lastError: String?
     @Published private(set) var logLines: [String] = []
 
@@ -69,6 +73,21 @@ final class CameraService: NSObject, ObservableObject {
     private let audioTapLock = NSLock()
     private var storedAudioSampleHandler: ((CMSampleBuffer) -> Void)?
     private var audioPacketCount = 0
+    /// 最近一包聲音的格式（除錯層用），audioTapLock 保護。
+    private var lastAudioChannels = 0
+    private var lastAudioRate: Double = 0
+    /// 語音辨識一律拿單聲道、格式不變的聲音：雙聲道會混成一軌，錄到一半換麥也轉回原本的格式。只在 audioQueue 用。
+    private let speechKeeper = AudioFormatKeeper(channels: 1)
+    /// 挑麥克風、設音訊。只在 sessionQueue 用。
+    private let router = AudioRouter()
+    /// 錄影中接上、錄完才換的那支。sessionQueue 讀寫。
+    private var micWaitingFor: String?
+    /// 這段錄影開始時用的麥克風。sessionQueue 讀寫。
+    private var recordingMicName: String?
+    /// 錄影中換過麥克風的段落，錄完交給完成頁講。micNoteLock 保護。
+    private let micNoteLock = NSLock()
+    private var micNotes: [URL: String] = [:]
+    private var micNoticeRun = 0
     private var videoDevice: AVCaptureDevice?
     private var isConfigured = false
     /// 現在該不該開著：start 之後、stop 之前。完成頁和校對頁開著時是 false。sessionQueue 讀寫。
@@ -77,8 +96,6 @@ final class CameraService: NSObject, ObservableObject {
     private var desiredFPS = 30
     private var desiredStabilization: StabilizationLevel = .off
     private var mirrorOutput = false
-    /// 要不要用 AirPods 高品質收音。
-    private var desiredBluetoothHQ = false
     /// 目前格式實際的幀率，sessionQueue 讀寫。
     private var activeFPS = 30
     /// 上次要求的曝光補償，sessionQueue 讀寫。裝置讀回來的值會慢慢變、也會四捨五入，拿來比會一直重設。
@@ -152,6 +169,9 @@ final class CameraService: NSObject, ObservableObject {
         pipeline.onTooSlow = { [weak self] in
             self?.log("影格來不及處理，這段先略過降噪和柔膚")
         }
+        router.onLog = { [weak self] text in
+            self?.log(text)
+        }
         refreshAuthorization()
     }
 
@@ -215,10 +235,11 @@ final class CameraService: NSObject, ObservableObject {
                 self.session.beginConfiguration()
                 self.applyFormat()
                 self.updateConnections()
-                self.applyBluetoothHQ()
                 self.session.commitConfiguration()
                 // 換格式會把曝光補償和測光點洗掉，補回來。
                 self.applyLookToDevice()
+                // 完成頁、校對頁會把音訊切成播放，回來要切回錄影用。
+                self.applyAudioRoute()
             }
             if !self.session.isRunning {
                 self.session.startRunning()
@@ -251,47 +272,70 @@ final class CameraService: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - AirPods 收音
+    // MARK: - 麥克風
 
     /// 這支手機的系統有沒有 AirPods 高品質收音。
-    static var supportsBluetoothHQ: Bool {
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) { return true }
-        #endif
-        return false
-    }
+    static var supportsBluetoothHQ: Bool { AudioRouter.supportsBluetoothHQ }
 
-    /// 開關 AirPods 高品質收音。錄影中不動，停下來才套用。
-    func setBluetoothHQ(_ on: Bool) {
+    /// 換收音設定。錄影中只記下來，停下來才套用，不然錄到一半聲音會斷。
+    func setMicPreferences(_ preferences: AudioRouter.Preferences) {
         sessionQueue.async {
-            self.desiredBluetoothHQ = on
-            self.applyBluetoothHQ()
+            guard self.router.preferences != preferences else { return }
+            self.router.preferences = preferences
+            self.applyAudioRoute()
         }
     }
 
-    /// 請在 sessionQueue 呼叫。錄影中換收音會斷掉聲音，寫檔器收完再套。
-    private func applyBluetoothHQ() {
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            guard isConfigured, !pipeline.isRecording else { return }
-            let wanted: Bool = desiredBluetoothHQ
-            guard session.configuresApplicationAudioSessionForBluetoothHighQualityRecording != wanted else { return }
-            session.beginConfiguration()
-            session.configuresApplicationAudioSessionForBluetoothHighQualityRecording = wanted
-            session.commitConfiguration()
-            log("AirPods 收音 \(wanted ? "開" : "關")")
+    /// 請在 sessionQueue 呼叫。把音訊設成錄影用、挑麥克風。相機沒在用（完成頁、校對頁開著）或錄影中不動。
+    private func applyAudioRoute() {
+        guard isConfigured, wantsRunning, !pipeline.isRecording else {
+            publishMicRoute()
+            return
         }
-        #endif
+        router.activate()
+        router.applyChoice(recording: false)
+        micWaitingFor = nil
+        publishMicRoute()
+    }
+
+    /// sessionQueue 呼叫。
+    private func publishMicRoute() {
+        let route = router.snapshot(waitingFor: micWaitingFor)
+        DispatchQueue.main.async {
+            if self.micRoute != route { self.micRoute = route }
+        }
+    }
+
+    /// 跳一句麥克風的提示，幾秒後自己收掉。任何執行緒都能呼叫。
+    private func showMicNotice(_ text: String) {
+        log(text)
+        DispatchQueue.main.async {
+            self.micNoticeRun += 1
+            let run = self.micNoticeRun
+            self.micNotice = text
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+                if self.micNoticeRun == run { self.micNotice = nil }
+            }
+        }
+    }
+
+    /// 錄影中換過麥克風的話，那段的說明（拿一次就清掉）。主執行緒呼叫。
+    func takeMicNote(for url: URL) -> String? {
+        micNoteLock.lock()
+        defer { micNoteLock.unlock() }
+        return micNotes.removeValue(forKey: url)
+    }
+
+    private func noteMicChange(_ text: String, for url: URL) {
+        micNoteLock.lock()
+        if micNotes[url] == nil { micNotes[url] = text }
+        micNoteLock.unlock()
     }
 
     /// 除錯層用的一行。
     private func bluetoothHQText() -> String {
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            return session.configuresApplicationAudioSessionForBluetoothHighQualityRecording ? "開" : "關"
-        }
-        #endif
-        return "系統不支援"
+        guard Self.supportsBluetoothHQ else { return "系統不支援" }
+        return micRoute.bluetoothHQ ? "開" : "關"
     }
 
     // MARK: - 預覽
@@ -464,6 +508,9 @@ final class CameraService: NSObject, ObservableObject {
     // MARK: - 設定
 
     private func configureSession() {
+        // 音訊自己管：要能挑外接麥、要能錄雙聲道，相機自動設定的音訊做不到。
+        session.automaticallyConfiguresApplicationAudioSession = false
+        router.activate()
         session.beginConfiguration()
         // 全程 709 SDR，不要被系統切到廣色域。
         session.automaticallyConfiguresCaptureDeviceForWideColor = false
@@ -541,6 +588,7 @@ final class CameraService: NSObject, ObservableObject {
         isConfigured = true
         computeCapabilities(camera)
         log("相機設定完成")
+        publishMicRoute()
     }
 
     /// 影格用 420v（和編碼器要的一樣，不用轉檔）。沒有就退而求其次。
@@ -835,10 +883,12 @@ final class CameraService: NSObject, ObservableObject {
         let width = Int(sideways ? upright.height : upright.width)
         let height = Int(sideways ? upright.width : upright.height)
 
+        let channels = router.recordingChannels()
         let recorder = try FrameRecorder(
             url: url, width: width, height: height, turn: finalTurn,
             videoSettings: videoSettings(width: width, height: height),
-            audioSettings: audioSettings(),
+            audioSettings: audioSettings(channels: channels),
+            audioChannels: channels,
             frameDuration: CMTime(value: 1, timescale: CMTimeScale(activeFPS)),
             // 畫面流程那邊 3 秒沒開始就放棄，這裡要比它早。
             startTimeout: 2.6,
@@ -855,10 +905,14 @@ final class CameraService: NSObject, ObservableObject {
                 self.pipeline.clearRecorder(recorder)
             }
             self.recordingEnded(outcome, url: url)
-            // 錄影中改過的收音設定，現在才套。
-            self.sessionQueue.async { self.applyBluetoothHQ() }
+            // 錄影中改過的收音設定、錄影中才接上的麥克風，現在才套。
+            self.sessionQueue.async {
+                self.recordingMicName = nil
+                self.applyAudioRoute()
+            }
         }
-        log("準備錄影 \(width)x\(height) 音軌\(recorder.hasAudio ? "有" : "無")")
+        recordingMicName = router.currentInputName
+        log("準備錄影 \(width)x\(height) 音軌\(recorder.hasAudio ? "有" : "無") \(channels) 聲道 · 麥克風 \(recordingMicName ?? "無")")
         return recorder
     }
 
@@ -892,20 +946,37 @@ final class CameraService: NSObject, ObservableObject {
         #endif
     }
 
-    /// 沒有麥克風就回 nil，只錄畫面。
-    private func audioSettings() -> [String: Any]? {
-        guard audioDataOutput.connection(with: .audio) != nil else { return nil }
+    /// 音軌的設定，依序試，第一個能用的就用。沒有麥克風就回空的，只錄畫面。
+    /// 系統建議的設定照現在的麥克風給，聲道數和要錄的不一樣（雙聲道合成單聲道）時改掉聲道。
+    private func audioSettings(channels: Int) -> [[String: Any]] {
+        guard audioDataOutput.connection(with: .audio) != nil else { return [] }
+        var choices: [[String: Any]] = []
         #if !targetEnvironment(simulator)
         if let recommended = audioDataOutput.recommendedAudioSettingsForAssetWriter(writingTo: .mov) {
-            return recommended
+            choices.append(Self.audioSettings(recommended, channels: channels))
         }
         #endif
-        return [
+        choices.append([
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 44100,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderBitRateKey: 128_000
-        ]
+            AVNumberOfChannelsKey: channels,
+            AVChannelLayoutKey: AudioFormatKeeper.channelLayoutData(channels: channels),
+            AVEncoderBitRateKey: channels == 2 ? 192_000 : 128_000
+        ])
+        return choices
+    }
+
+    private static func audioSettings(_ recommended: [String: Any], channels: Int) -> [String: Any] {
+        let given = (recommended[AVNumberOfChannelsKey] as? NSNumber)?.intValue ?? channels
+        guard given != channels else { return recommended }
+        var settings = recommended
+        settings[AVNumberOfChannelsKey] = channels
+        settings[AVChannelLayoutKey] = AudioFormatKeeper.channelLayoutData(channels: channels)
+        // 總位元率跟著聲道數縮放；每聲道的位元率不用動。
+        if let total = (settings[AVEncoderBitRateKey] as? NSNumber)?.intValue, given > 0 {
+            settings[AVEncoderBitRateKey] = min(320_000, max(64_000, total * channels / given))
+        }
+        return settings
     }
 
     /// 第一格寫進去了。在寫檔器的鎖裡面被呼叫，只能丟到主執行緒。
@@ -1241,6 +1312,8 @@ final class CameraService: NSObject, ObservableObject {
 
     @objc private func sessionInterruptionEnded(_ note: Notification) {
         log("中斷結束")
+        // 來電之類的中斷結束，音訊要重新拿回來。
+        sessionQueue.async { self.applyAudioRoute() }
         DispatchQueue.main.async {
             self.interruptionText = nil
             self.applyPreviewRotation()
@@ -1259,7 +1332,9 @@ final class CameraService: NSObject, ObservableObject {
             sessionQueue.async {
                 // 完成頁或校對頁開著就不叫起來，會把播放的音訊搶走。離開那一頁時畫面會自己再叫 start。
                 if self.wantsRunning, !self.session.isRunning {
+                    self.router.activate()
                     self.session.startRunning()
+                    self.applyAudioRoute()
                 }
                 let running = self.session.isRunning
                 DispatchQueue.main.async {
@@ -1270,9 +1345,65 @@ final class CameraService: NSObject, ObservableObject {
     }
 
     @objc private func audioRouteChanged(_ note: Notification) {
+        let raw = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? NSNumber)?.uintValue ?? 0
+        let reason = AVAudioSession.RouteChangeReason(rawValue: raw) ?? .unknown
+        let previous = note.userInfo?[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription
+        let previousInput = previous?.inputs.first
+        let previousName = previousInput?.portName
+        let previousKind = previousInput.map { MicKind($0.portType) } ?? .none
+        sessionQueue.async {
+            self.routeChanged(reason: reason, previousName: previousName, previousKind: previousKind)
+        }
         DispatchQueue.main.async {
             self.meter.refreshRoute()
-            self.log("音訊路由變更：\(self.meter.route)")
+            self.log("音訊路由變更（\(Self.reasonText(reason))）：\(self.meter.route)")
+        }
+    }
+
+    /// 插拔麥克風。sessionQueue 呼叫。
+    private func routeChanged(reason: AVAudioSession.RouteChangeReason, previousName: String?, previousKind: MicKind) {
+        guard isConfigured, wantsRunning else {
+            publishMicRoute()
+            return
+        }
+        let plugged = reason == .newDeviceAvailable || reason == .oldDeviceUnavailable
+        guard pipeline.isRecording, let url = pipeline.recorder?.url else {
+            // 沒在錄：直接照設定挑。
+            let before = router.currentInputName
+            applyAudioRoute()
+            if plugged, let after = router.currentInputName, after != before {
+                if router.currentKind == .bluetooth && !router.bluetoothHQActive {
+                    showMicNotice("改用「\(after)」收音。藍牙麥克風是電話音質，要好音質請接 USB-C 接收器")
+                } else {
+                    showMicNotice("改用「\(after)」收音")
+                }
+            }
+            return
+        }
+        // 錄影中：不主動換麥，免得聲音斷掉；外接麥掉了系統會自己退回手機麥克風，錄影照常。
+        micWaitingFor = router.applyChoice(recording: true)
+        let now = router.currentInputName ?? "沒有麥克風"
+        if let started = recordingMicName, now != started {
+            noteMicChange("錄到一半麥克風從「\(started)」換成「\(now)」，後面那段的音質會不一樣。", for: url)
+        }
+        if reason == .oldDeviceUnavailable, previousKind.isExternal, now != previousName {
+            showMicNotice("「\(previousName ?? "外接麥克風")」斷線了，這段後面改用「\(now)」收音，錄影沒有中斷")
+        } else if reason == .newDeviceAvailable, let waiting = micWaitingFor {
+            showMicNotice("接上了「\(waiting)」，這段錄完就換它收音")
+        }
+        publishMicRoute()
+    }
+
+    private static func reasonText(_ reason: AVAudioSession.RouteChangeReason) -> String {
+        switch reason {
+        case .newDeviceAvailable: return "接上新裝置"
+        case .oldDeviceUnavailable: return "裝置拔掉"
+        case .categoryChange: return "類別改變"
+        case .override: return "強制切換"
+        case .wakeFromSleep: return "喚醒"
+        case .noSuitableRouteForCategory: return "沒有可用路線"
+        case .routeConfigurationChange: return "路線設定改變"
+        default: return "其他"
         }
     }
 
@@ -1359,17 +1490,30 @@ final class CameraService: NSObject, ObservableObject {
         }
         audioTapLock.lock()
         let packets = audioPacketCount
+        let bufferChannels = lastAudioChannels
+        let bufferRate = lastAudioRate
         audioTapLock.unlock()
-        lines.append("音訊 收到 \(packets) 包")
+        lines.append("音訊 收到 \(packets) 包 · 實收 \(bufferChannels) 聲道 \(String(format: "%.0f", bufferRate)) Hz")
         lines.append("音訊路由 \(meter.route)")
-        lines.append("AirPods 收音 \(bluetoothHQText())")
-        let mic: String
-        switch meter.micStatus {
-        case .ok: mic = "正常"
-        case .noSignal: mic = "無訊號"
-        case .unknown: mic = "未知"
+        let mic = micRoute
+        lines.append("麥克風 \(mic.name)（\(mic.kind.label)）· 系統 \(mic.inputChannels) 聲道 \(String(format: "%.0f", mic.sampleRate)) Hz · 錄成\(mic.recordsStereo ? "立體聲" : "單聲道")\(mic.isPhoneQuality ? " · 電話音質" : "")")
+        if let waiting = mic.waitingFor {
+            lines.append("麥克風 錄完會換成 \(waiting)")
         }
-        lines.append(String(format: "音量 %.1f dB · 收音%@ · %@", meter.level, mic, meter.isSpeaking ? "說話中" : "停頓"))
+        let names = mic.available.map { $0.name }.joined(separator: "、")
+        lines.append("可用麥克風 \(names.isEmpty ? "無" : names)")
+        let perChannel = audioLevel.currentChannels()
+        if perChannel.count >= 2 {
+            lines.append(String(format: "左右音量 左 %.1f dB · 右 %.1f dB", perChannel[0], perChannel[1]))
+        }
+        lines.append("AirPods 收音 \(bluetoothHQText())")
+        let signal: String
+        switch meter.micStatus {
+        case .ok: signal = "正常"
+        case .noSignal: signal = "無訊號"
+        case .unknown: signal = "未知"
+        }
+        lines.append(String(format: "音量 %.1f dB · 收音%@ · %@", meter.level, signal, meter.isSpeaking ? "說話中" : "停頓"))
         if let face = faces.faceRect {
             lines.append(String(format: "臉部 x=%.0f y=%.0f w=%.0f h=%.0f", face.minX, face.minY, face.width, face.height))
         } else {
@@ -1419,11 +1563,20 @@ extension CameraService: AVCaptureAudioDataOutputSampleBufferDelegate {
                        from connection: AVCaptureConnection) {
         audioLevel.consume(sampleBuffer)
         pipeline.recorder?.appendAudio(sampleBuffer)
+        let basic = CMSampleBufferGetFormatDescription(sampleBuffer)
+            .flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }
         audioTapLock.lock()
         audioPacketCount += 1
+        if let basic {
+            lastAudioChannels = Int(basic.mChannelsPerFrame)
+            lastAudioRate = basic.mSampleRate
+        }
         let handler = storedAudioSampleHandler
         audioTapLock.unlock()
-        handler?(sampleBuffer)
+        // 語音辨識要單聲道、格式固定的聲音。
+        if let handler, let mono = speechKeeper.process(sampleBuffer) {
+            handler(mono)
+        }
     }
 }
 
