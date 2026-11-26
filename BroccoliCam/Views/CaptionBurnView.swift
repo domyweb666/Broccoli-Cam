@@ -5,6 +5,7 @@ import UIKit
 struct CaptionBurnView: View {
     @ObservedObject var model: CaptionEditorModel
     let onShare: () -> Void
+    let onExport: () -> Void
     let onShowSRT: () -> Void
 
     var body: some View {
@@ -75,6 +76,7 @@ struct CaptionBurnView: View {
             photoStatus
                 .padding(.bottom, 10)
             CaptionWideButton(title: "分享", icon: "square.and.arrow.up", prominent: true, action: onShare)
+            CaptionWideButton(title: "存到「檔案」", icon: "folder", prominent: false, action: onExport)
             originalButton
             CaptionWideButton(title: "看 SRT", icon: "doc.text", prominent: false, action: onShowSRT)
             CaptionWideButton(title: "完成", prominent: false) { model.dismissBurn() }

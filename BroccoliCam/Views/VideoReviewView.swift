@@ -53,6 +53,19 @@ struct VideoReviewView: View {
     @State private var retakeFile: String?
     /// 字幕檔做好的時候播放視窗還開著，等它關掉再分享。
     @State private var waitingSubtitle: SharedFile?
+    /// 正在開的存檔視窗。
+    @State private var exportFile: ExportFile?
+    /// 給存檔視窗取了好認檔名的那一份，視窗關掉要收掉。onDismiss 時 exportFile 已經是 nil 了，另外記。
+    @State private var exportPrepared: URL?
+    @State private var exportState: ExportState = .idle
+
+    /// 存到「檔案」。和存到照片分開算：存到檔案不算「已儲存」，各段照樣留著。
+    private enum ExportState: Equatable {
+        case idle
+        case preparing
+        case exported
+        case failed(String)
+    }
 
     private enum SubtitleState: Equatable {
         case idle
@@ -67,6 +80,15 @@ struct VideoReviewView: View {
             .sheet(item: $sharedSubtitle) { file in
                 ShareSheet(items: [file.url])
             }
+            .sheet(item: $exportFile, onDismiss: exportClosed) { file in
+                FileExportPicker(url: file.url) { done in
+                    if done {
+                        exportState = .exported
+                        camera.log("已存到檔案")
+                    }
+                }
+                .ignoresSafeArea()
+            }
             .sheet(item: $playback, onDismiss: playbackClosed) { item in
                 TakePlaybackView(playback: item, retakeTitle: retakeTitle,
                                  onRetake: { retakeFile = item.file })
@@ -79,7 +101,7 @@ struct VideoReviewView: View {
 
     private var prompts: some View {
         screen
-            .alert(video.isStitched ? "這支影片還沒儲存" : "這支影片還沒儲存，確定要丟掉重錄？",
+            .alert(discardTitle,
                    isPresented: $confirmDiscard) {
                 discardButtons
             }
@@ -93,6 +115,15 @@ struct VideoReviewView: View {
                 player?.pause()
                 player = nil
             }
+    }
+
+    private var discardTitle: String {
+        // 存到檔案的是複本，這裡丟掉不影響那一份，但照片裡還沒有。
+        let exported = exportState == .exported
+        if video.isStitched {
+            return exported ? "這支已存到「檔案」，還沒存到照片" : "這支影片還沒儲存"
+        }
+        return exported ? "這支已存到「檔案」，還沒存到照片。確定要丟掉重錄？" : "這支影片還沒儲存，確定要丟掉重錄？"
     }
 
     @ViewBuilder
@@ -141,6 +172,7 @@ struct VideoReviewView: View {
                 checkRow
                 captionRow
                 subtitleRow
+                exportRow
                 bottomRow
             }
         }
@@ -442,8 +474,8 @@ struct VideoReviewView: View {
                     checker.hold(.subtitles, false)
                     subtitleState = .done(Self.subtitleNote(result, script: script))
                     let file = SharedFile(url: result.url)
-                    // 播放視窗開著，分享選單跳不出來。
-                    if playback == nil {
+                    // 播放視窗或存檔視窗開著，分享選單跳不出來。
+                    if playback == nil, exportFile == nil {
                         sharedSubtitle = file
                     } else {
                         waitingSubtitle = file
@@ -482,6 +514,71 @@ struct VideoReviewView: View {
             return "大部分是直接聽出來的，可能有錯字。\(doubts)\(count)。"
         }
         return "\(count)，字用的是你的稿子。\(doubts)"
+    }
+
+    // MARK: - 存到檔案
+
+    /// 存到「檔案」：可以選 iCloud Drive。存的是複本，原檔照樣在完成頁。
+    private var exportRow: some View {
+        VStack(spacing: 6) {
+            Button {
+                exportToFiles()
+            } label: {
+                HStack(spacing: 8) {
+                    if exportState == .preparing {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: exportState == .exported ? "checkmark" : "folder")
+                    }
+                    Text(exportState == .exported ? "已存到「檔案」，再存一份" : "存到「檔案」（可選 iCloud Drive）")
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, minHeight: 46)
+                .background(.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+            .disabled(exportState == .preparing || isMakingProject || playback != nil)
+
+            if case .failed(let message) = exportState {
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(.yellow)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding(.horizontal, 16)
+    }
+
+    private func exportToFiles() {
+        guard exportState != .preparing, exportFile == nil else { return }
+        let previous = exportState
+        exportState = .preparing
+        player?.pause()
+        let source = video.url
+        Task { @MainActor in
+            do {
+                let prepared = try await FileExport.prepare(source)
+                // 存過一次的，這次取消也還是存過。
+                exportState = previous == .exported ? .exported : .idle
+                exportPrepared = prepared
+                exportFile = ExportFile(url: prepared)
+            } catch {
+                exportState = .failed("沒辦法存到檔案：\(error.localizedDescription)")
+                camera.log("存到檔案失敗：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func exportClosed() {
+        // 存檔視窗的 onFinish 會先到，這時候狀態已經更新好了。
+        if let prepared = exportPrepared { FileExport.cleanUp(prepared) }
+        exportPrepared = nil
+        if let waiting = waitingSubtitle, playback == nil {
+            waitingSubtitle = nil
+            sharedSubtitle = waiting
+        }
     }
 
     private func save() {

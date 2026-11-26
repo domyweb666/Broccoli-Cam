@@ -24,11 +24,14 @@ struct CaptionEditorView: View {
     private enum Sheet: Identifiable {
         case srt(String)
         case share(URL)
+        /// 存到「檔案」。
+        case files(URL)
 
         var id: String {
             switch self {
             case .srt: return "srt"
             case .share(let url): return url.path
+            case .files(let url): return "files:" + url.path
             }
         }
     }
@@ -36,6 +39,8 @@ struct CaptionEditorView: View {
     @State private var panel: Panel = .none
     @State private var keyboardUp = false
     @State private var sheet: Sheet?
+    /// 給存檔視窗取了好認檔名的那一份，視窗關掉要收掉。
+    @State private var exportPrepared: URL?
     @State private var askReplace = false
     @State private var findText = ""
     @State private var replaceText = ""
@@ -56,12 +61,15 @@ struct CaptionEditorView: View {
 
     private var presented: some View {
         alerts
-            .sheet(item: $sheet) { item in
+            .sheet(item: $sheet, onDismiss: sheetClosed) { item in
                 switch item {
                 case .srt(let text):
                     CaptionSRTView(text: text) { try model.srtFile() }
                 case .share(let url):
                     ShareSheet(items: [url])
+                case .files(let url):
+                    FileExportPicker(url: url) { _ in }
+                        .ignoresSafeArea()
                 }
             }
     }
@@ -144,7 +152,7 @@ struct CaptionEditorView: View {
                 editor
             }
             if model.burn != .none {
-                CaptionBurnView(model: model, onShare: shareBurned, onShowSRT: showSRT)
+                CaptionBurnView(model: model, onShare: shareBurned, onExport: exportBurned, onShowSRT: showSRT)
                     .transition(.opacity)
             }
         }
@@ -320,6 +328,7 @@ struct CaptionEditorView: View {
                     Button("字幕版存到照片", systemImage: "photo") { model.saveBurnedToPhotos() }
                         .disabled(model.burnPhoto == .saving)
                     Button("分享字幕版", systemImage: "square.and.arrow.up", action: shareBurned)
+                    Button("字幕版存到「檔案」", systemImage: "folder", action: exportBurned)
                 }
             }
             Section {
@@ -502,6 +511,27 @@ struct CaptionEditorView: View {
         hideKeyboard()
         model.pause()
         sheet = .share(url)
+    }
+
+    /// 字幕版存到「檔案」，可以選 iCloud Drive。存的是複本。
+    private func exportBurned() {
+        guard let url = model.burnedURL, sheet == nil, exportPrepared == nil else { return }
+        hideKeyboard()
+        model.pause()
+        Task { @MainActor in
+            do {
+                let prepared = try await FileExport.prepare(url, label: "字幕版")
+                exportPrepared = prepared
+                sheet = .files(prepared)
+            } catch {
+                model.show("沒辦法存到檔案：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func sheetClosed() {
+        if let prepared = exportPrepared { FileExport.cleanUp(prepared) }
+        exportPrepared = nil
     }
 
     private func hideKeyboard() {
