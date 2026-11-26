@@ -44,6 +44,8 @@ final class FramePipeline: NSObject {
         var heavySkipped = false
         /// 錄影中算不完，這一段剩下的時間降噪和柔膚都不做。
         var tooSlow = false
+        /// 畫面上把預覽淡到幾乎看不見（「不看自己」）。只跳過預覽的繪製，錄影、臉、音量照舊。
+        var previewHidden = false
 
         /// 一鍵優化後的過場，只有預覽會看。錄影那條路（render、ticket）完全不讀它。
         var transition: PreviewTransition?
@@ -117,6 +119,10 @@ final class FramePipeline: NSObject {
     /// 臉不見多久之後才開始淡出柔膚（秒）。
     private static let faceHold: CFTimeInterval = 1.2
 
+    /// 沒在錄影時，預覽套濾鏡的那張短邊最多幾像素。drawable 是螢幕原生解析度（約 1179），
+    /// 照那個大小算比錄 1080p 還重；算小一點，再交給 MetalPreviewRenderer 等比例放大到整個框。
+    private static let previewMaxShortSide: CGFloat = 720
+
     // MARK: - 設定（任何執行緒）
 
     private func update(_ change: (inout Settings) -> Void) {
@@ -156,6 +162,11 @@ final class FramePipeline: NSObject {
 
     func setHeavySkipped(_ on: Bool) {
         update { $0.heavySkipped = on }
+    }
+
+    /// 預覽藏起來的期間不畫 Metal 預覽。改回 false 之後，下一格進來就會照常畫。
+    func setPreviewHidden(_ hidden: Bool) {
+        update { $0.previewHidden = hidden }
     }
 
     /// 開始一段預覽過場：從 params（和 wasEnabled）換到之後 setLook 給的新設定。
@@ -448,7 +459,9 @@ final class FramePipeline: NSObject {
             }
         }
 
-        guard canDraw, now.needsMetal, let target = renderer.availableSize() else { return }
+        // 預覽藏起來就到此為止：上面錄影那段已經寫完，這裡只省掉預覽。
+        // previewHidden 放在 availableSize() 前面，藏著的時候不算成「來不及畫」。
+        guard canDraw, now.needsMetal, !now.previewHidden, let target = renderer.availableSize() else { return }
         let image: CIImage
         if let finished {
             image = finished
@@ -465,24 +478,26 @@ final class FramePipeline: NSObject {
         renderer.submit(image, mirrored: !now.mirrored)
     }
 
-    /// 沒在錄影時的預覽：先縮到預覽框的大小再套濾鏡，4K 和小窗都不用算滿整張。
+    /// 沒在錄影時的預覽：先縮小再套濾鏡，4K 和小窗都不用算滿整張。
     private func previewImage(_ pixelBuffer: CVPixelBuffer, size: CGSize, target: CGSize,
                               settings: Settings, filtering: Bool) -> CIImage {
         let source = CameraGPU.image(pixelBuffer)
         guard filtering else { return source }
-        return filtered(shrunkForPreview(source, size: size, target: target), settings: settings)
+        return filtered(shrunkForPreview(source, size: size, target: target), settings: settings, forPreview: true)
     }
 
-    /// 縮到預覽框的大小。差不多大就不縮，省一道取樣。
+    /// 縮到預覽框的大小，短邊再以 previewMaxShortSide 為上限。差不多大就不縮，省一道取樣。
+    /// 長寬用同一個倍率縮、原點留在 (0, 0)，比例不變，MetalPreviewRenderer.fit 放大回框裡的位置和裁切跟沒縮時一樣。
     private func shrunkForPreview(_ source: CIImage, size: CGSize, target: CGSize) -> CIImage {
         let shortSide: CGFloat = min(size.width, size.height)
-        let targetShort: CGFloat = min(target.width, target.height)
+        let targetShort: CGFloat = min(min(target.width, target.height), Self.previewMaxShortSide)
         guard shortSide > 0 else { return source }
         let wanted: CGFloat = min(1, max(0.2, targetShort / shortSide))
         let factor: CGFloat = wanted > 0.9 ? 1 : wanted
         guard factor < 1 else { return source }
-        let extent = CGRect(x: 0, y: 0, width: (size.width * factor).rounded(.down),
-                            height: (size.height * factor).rounded(.down))
+        // 四捨五入：1080 × (720 / 1080) 算出 719.9999… 時不會少掉一整排。多出的不到一像素是 clampedToExtent 延伸的邊。
+        let extent = CGRect(x: 0, y: 0, width: (size.width * factor).rounded(),
+                            height: (size.height * factor).rounded())
         return source
             .clampedToExtent()
             .transformed(by: CGAffineTransform(scaleX: factor, y: factor))
@@ -495,11 +510,12 @@ final class FramePipeline: NSObject {
                                  filtering: Bool, transition: PreviewTransition, progress: CGFloat) -> CIImage {
         // 兩邊都在預覽大小上算，4K 也只多算一張小圖。
         let source: CIImage = shrunkForPreview(CameraGPU.image(pixelBuffer), size: size, target: target)
-        let after: CIImage = filtering ? filtered(source, settings: settings) : source
+        let after: CIImage = filtering ? filtered(source, settings: settings, forPreview: true) : source
         let fromFiltering: Bool = transition.fromEnabled && !transition.from.needsNoPixelWork
             && LookFilter.hasWork(transition.from, skipHeavy: settings.skipsHeavy)
         let before: CIImage = fromFiltering
-            ? filtered(source, look: transition.from, skipHeavy: settings.skipsHeavy, using: fromFilter)
+            ? filtered(source, look: transition.from, skipHeavy: settings.skipsHeavy, forPreview: true,
+                       using: fromFilter)
             : source
         let focus: CGPoint = transitionFocusPoint(for: transition, in: source.extent)
         return LookTransitionMask.compose(before: before, after: after, style: transition.style,
@@ -523,14 +539,19 @@ final class FramePipeline: NSObject {
         return CGPoint(x: extent.minX + unit.x * extent.width, y: extent.minY + unit.y * extent.height)
     }
 
-    private func filtered(_ image: CIImage, settings: Settings) -> CIImage {
-        filtered(image, look: settings.look, skipHeavy: settings.skipsHeavy, using: filter)
+    /// forPreview 一定要寫明：錄影那條路（render）傳 false，錄出來的畫面才不會被預覽的省電做法影響。
+    private func filtered(_ image: CIImage, settings: Settings, forPreview: Bool) -> CIImage {
+        filtered(image, look: settings.look, skipHeavy: settings.skipsHeavy, forPreview: forPreview, using: filter)
     }
 
-    private func filtered(_ image: CIImage, look: LookParams, skipHeavy: Bool, using lookFilter: LookFilter) -> CIImage {
+    /// 半徑類的參數用這張圖實際的短邊換算（scale = 短邊 / 1080）。預覽縮到 720 時 scale 約 0.67，
+    /// 銳利半徑跟著變小、柔膚一樣在短邊 540 的小圖上算，放大到螢幕上和錄出來的比例一致，不會變成兩倍強。
+    private func filtered(_ image: CIImage, look: LookParams, skipHeavy: Bool, forPreview: Bool,
+                          using lookFilter: LookFilter) -> CIImage {
         let extent: CGRect = image.extent
         let scale: CGFloat = min(extent.width, extent.height) / 1080
-        return lookFilter.apply(look, to: image, face: face(in: extent.size), scale: scale, skipHeavy: skipHeavy)
+        return lookFilter.apply(look, to: image, face: face(in: extent.size), scale: scale, skipHeavy: skipHeavy,
+                                forPreview: forPreview)
     }
 
     /// 錄影用：套處理、轉到成品方向、畫進寫檔器的緩衝區。
@@ -544,7 +565,7 @@ final class FramePipeline: NSObject {
         let source = CameraGPU.image(pixelBuffer)
         var image: CIImage = source
         if filtering {
-            image = filtered(image, settings: settings)
+            image = filtered(image, settings: settings, forPreview: false)
         }
         image = Self.turned(image, by: ticket.turn)
         let bounds = CGRect(x: 0, y: 0, width: ticket.width, height: ticket.height)

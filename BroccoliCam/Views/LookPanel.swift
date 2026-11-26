@@ -1,7 +1,9 @@
 import SwiftUI
 
 /// 畫面優化面板：從底部滑出，只佔下面一截，上方的預覽看得到即時效果。
-/// 參數直接寫進 settings，由 RecordingView 套到相機。
+/// 參數寫進 settings，由 RecordingView 套到相機。
+/// 拖滑桿的期間例外：值先放在 draft、直接叫相機套，放開才寫回 settings，
+/// 拖動中不會每格都存一次設定、也不會讓整個主畫面跟著重算。
 struct LookPanel: View {
     @EnvironmentObject private var camera: CameraService
     @EnvironmentObject private var settings: SettingsStore
@@ -15,6 +17,10 @@ struct LookPanel: View {
     @State private var note: String?
     /// 第幾次分析。面板關掉再開、或等太久放棄之後，舊的結果不可以再改畫面上的字。
     @State private var attempt = 0
+    /// 拖動中的參數。nil 代表沒在拖，畫面直接顯示 settings.look。
+    @State private var draft: LookParams?
+    /// 正在被手指按住的滑桿（兩隻手指各拉一條也算得清楚）。全部放開才寫回 settings。
+    @State private var editingItems: Set<LookItem> = []
 
     var body: some View {
         VStack(spacing: 8) {
@@ -35,6 +41,9 @@ struct LookPanel: View {
         .background { panelBackground }
         .contentShape(Rectangle())
         .onDisappear {
+            // 拖到一半面板被關掉，收不到放開的事件，拖到的值在這裡存回去。
+            editingItems = []
+            commitDraft()
             // 按著比對的時候面板被關掉，也要還原。
             camera.setLookBypassed(false)
         }
@@ -124,7 +133,9 @@ struct LookPanel: View {
         ScrollView {
             VStack(spacing: 2) {
                 ForEach(LookItem.allCases) { item in
-                    LookSliderRow(item: item, value: binding(item))
+                    LookSliderRow(item: item, value: binding(item)) { editing in
+                        noteEditing(item, editing)
+                    }
                 }
             }
             .padding(.bottom, 8)
@@ -134,15 +145,48 @@ struct LookPanel: View {
 
     private func binding(_ item: LookItem) -> Binding<Double> {
         Binding<Double>(
-            get: { settings.look[keyPath: item.keyPath] },
+            get: { (draft ?? settings.look)[keyPath: item.keyPath] },
             set: { value in
+                if !editingItems.isEmpty {
+                    // 拖動中：只改 draft、直接套到相機，不寫設定。
+                    // draft 被還原或一鍵優化清掉之後還在拖，就從最新的 settings 接著改。
+                    var next: LookParams = draft ?? settings.look
+                    guard next[keyPath: item.keyPath] != value || !settings.lookEnabled else { return }
+                    next[keyPath: item.keyPath] = value
+                    draft = next
+                    camera.setLook(next, enabled: true)
+                    if !settings.lookEnabled {
+                        // 原本關著：打開的這一次連值一起存，RecordingView 跟著套的才是現在這個值，不會退回舊的。
+                        // 整段拖動只會多寫這一次。
+                        if settings.look != next { settings.look = next }
+                        settings.lookEnabled = true
+                    }
+                    return
+                }
+                if !settings.lookEnabled { settings.lookEnabled = true }
+                // 雙擊歸零、VoiceOver 調整：只改一次，直接寫回設定。
                 // 滑桿拖動時同一格會重複回報，沒變就不要再寫。
                 if settings.look[keyPath: item.keyPath] != value {
                     settings.look[keyPath: item.keyPath] = value
                 }
-                if !settings.lookEnabled { settings.lookEnabled = true }
             }
         )
+    }
+
+    /// 滑桿按下、放開。全部放開才把 draft 寫回 settings（RecordingView 會再 setLook 一次同樣的值）。
+    private func noteEditing(_ item: LookItem, _ editing: Bool) {
+        if editing {
+            editingItems.insert(item)
+        } else {
+            editingItems.remove(item)
+            if editingItems.isEmpty { commitDraft() }
+        }
+    }
+
+    private func commitDraft() {
+        guard let next = draft else { return }
+        draft = nil
+        if settings.look != next { settings.look = next }
     }
 
     // MARK: - 動作
@@ -163,15 +207,22 @@ struct LookPanel: View {
                 note = "現在沒有畫面"
                 return
             }
+            // 結果回來時手指還按著滑桿的話，畫面上看的是 draft，以它當舊的樣子。
+            let shown: LookParams = draft ?? store.look
             var params: LookParams = result.params
-            params.smooth = store.look.smooth
+            params.smooth = shown.smooth
             // 先記下舊的樣子開始過場，再寫新的參數，預覽才會從舊的慢慢換成新的（QC-0012）。
             let style: LookTransition = store.lookTransition
             if style != LookTransition.none {
-                service.beginLookTransition(from: store.look, wasEnabled: store.lookEnabled, style: style)
+                service.beginLookTransition(from: shown, wasEnabled: store.lookEnabled, style: style)
             }
+            // 拖到一半的值作廢，滑桿改顯示新的結果。
+            let dropped: Bool = draft != nil
+            draft = nil
             store.look = params
             store.lookEnabled = true
+            // 存著的值剛好沒變時 RecordingView 不會再套一次，相機會停在 draft，自己補套。
+            if dropped { service.setLook(params, enabled: true) }
             note = Self.noteText(result)
         }
         // 分析到一半相機被打斷的話，不要一直轉圈。
@@ -189,8 +240,13 @@ struct LookPanel: View {
         camera.cancelOptimize()
         // 還原不做過場，進行中的也停掉。
         camera.cancelLookTransition()
+        // 拖到一半的值作廢，滑桿改顯示還原後的值。
+        let dropped: Bool = draft != nil
+        draft = nil
         settings.look = .neutral
         settings.lookEnabled = false
+        // 同上：存著的值沒變的話相機會停在 draft。
+        if dropped { camera.setLook(.neutral, enabled: false) }
         note = nil
     }
 
@@ -276,6 +332,8 @@ private enum LookItem: String, CaseIterable, Identifiable {
 private struct LookSliderRow: View {
     let item: LookItem
     @Binding var value: Double
+    /// 手指按下滑桿（true）、放開（false）。
+    let onEditing: (Bool) -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -289,7 +347,7 @@ private struct LookSliderRow: View {
                 .onTapGesture(count: 2, perform: zero)
                 .accessibilityHidden(true)
 
-            Slider(value: $value, in: item.range, step: item.step)
+            Slider(value: $value, in: item.range, step: item.step, onEditingChanged: onEditing)
                 .accessibilityLabel(item.label)
                 .accessibilityValue(item.text(value))
                 .accessibilityAction(named: "歸零", zero)

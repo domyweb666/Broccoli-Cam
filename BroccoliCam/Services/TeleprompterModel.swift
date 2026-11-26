@@ -155,16 +155,41 @@ final class TeleprompterModel: ObservableObject {
     /// 文字上緣留的空白，畫面和這裡的換算要一致。
     static let topPadding: CGFloat = 12
 
-    @Published private(set) var offset: CGFloat = 0
+    /// 捲動位置。每一格都在變，不發布：發布的話，訂閱整個 model 的預覽區和控制列每秒要重算 60 次。
+    /// 畫字的 view 用 observeScroll 登記，一變就直接推過去，不經過 SwiftUI。
+    private(set) var offset: CGFloat = 0 {
+        didSet {
+            guard offset != oldValue else { return }
+            let started = offset > 0
+            if started != hasStarted { hasStarted = started }
+            notifyScroll()
+        }
+    }
+    /// 提詞捲過了（offset > 0）。只在 0 和大於 0 之間切換時才發布，給「提詞開始了沒」用。
+    @Published private(set) var hasStarted = false
     @Published private(set) var isPlaying = false
     /// 目前是不是跟著聲音走。
     @Published private(set) var isFollowing = false
     /// 語音跟隨已經唸到稿子的第幾個字（UTF-16），這之前的字會變色。沒在跟隨時是 0。
-    @Published private(set) var spokenOffset = 0
+    /// 跟讀時最多每 0.1 秒變一次，也不發布（不然預覽區整個跟著重算），和 offset 一樣直接推給畫字的 view。
+    private(set) var spokenOffset = 0 {
+        didSet {
+            guard spokenOffset != oldValue else { return }
+            notifyScroll()
+        }
+    }
+
+    /// 收捲動位置和唸到哪的畫面。key 是登記時給的號碼。
+    private var scrollListeners: [Int: (_ offset: CGFloat, _ spoken: Int) -> Void] = [:]
+    private var lastListener = 0
 
     /// 捲動速度（pt／秒）
     var speed: CGFloat = 36
-    var viewportHeight: CGFloat = 0
+    var viewportHeight: CGFloat = 0 {
+        didSet {
+            if viewportHeight != oldValue { roomChanged() }
+        }
+    }
     /// 文字排版的寬度與字級，由提詞 view 提供。
     private var layoutWidth: CGFloat = 0
     private var fontSize: CGFloat = 26
@@ -201,6 +226,25 @@ final class TeleprompterModel: ObservableObject {
 
     var isAtEnd: Bool {
         maxOffset > 0 && offset >= maxOffset
+    }
+
+    // MARK: - 推給畫面
+
+    /// 畫字的 view 登記：捲動位置或唸到哪一變，就用新的值叫 handler。回傳的號碼拿來取消登記。
+    func observeScroll(_ handler: @escaping (_ offset: CGFloat, _ spoken: Int) -> Void) -> Int {
+        lastListener += 1
+        scrollListeners[lastListener] = handler
+        return lastListener
+    }
+
+    func stopObservingScroll(_ id: Int) {
+        scrollListeners[id] = nil
+    }
+
+    private func notifyScroll() {
+        for handler in scrollListeners.values {
+            handler(offset, spokenOffset)
+        }
     }
 
     func play() {
@@ -250,7 +294,12 @@ final class TeleprompterModel: ObservableObject {
         stoppedAtEnd = false
         offset = min(maxOffset, max(0, value))
         followTarget = offset
-        if !isPlaying { stopLink() }
+        if !isPlaying {
+            stopLink()
+        } else if !isFollowing {
+            // 停在最後幾行時每一幀不再空轉，往回滑了要接著捲。跟讀中目標就是手指的位置，不用動。
+            startLink()
+        }
     }
 
     // MARK: - 跟著聲音
@@ -268,6 +317,8 @@ final class TeleprompterModel: ObservableObject {
         isFollowing = false
         spokenOffset = 0
         followTarget = offset
+        // 跟讀到位時每一幀已經停了，改回固定速度要重新開始。
+        if isPlaying { startLink() }
     }
 
     /// 唸到 text 的第 utf16Offset 個字了（也可能是退回去重唸）：把那一行捲到閱讀區最上面。
@@ -276,7 +327,11 @@ final class TeleprompterModel: ObservableObject {
         spokenOffset = utf16Offset
         place(cursorAt: utf16Offset, in: text)
         followTarget = min(maxOffset, cursorTop)
-        if isPlaying { glideTarget = nil }
+        if isPlaying {
+            glideTarget = nil
+            // 到位後每一幀就停了，有新的目標才再開。
+            if abs(followTarget - offset) >= 0.5 { startLink() }
+        }
     }
 
     // MARK: - 跳轉
@@ -458,8 +513,17 @@ final class TeleprompterModel: ObservableObject {
         let built = PromptLayout(text: text, width: layoutWidth, fontSize: fontSize, spokenColor: UIColor(Theme.good))
         cachedLayout = built
         lastBuild = CACurrentMediaTime()
-        contentHeight = built.height + Self.topPadding
+        let height = built.height + Self.topPadding
+        if height != contentHeight {
+            contentHeight = height
+            roomChanged()
+        }
         return built
+    }
+
+    /// 字級、版面變了，捲得到的最遠位置跟著變。停在最後幾行而停掉的每一幀要再開，重新看還有沒有得捲。
+    private func roomChanged() {
+        if isPlaying { startLink() }
     }
 
     // MARK: - 每一幀
@@ -468,6 +532,8 @@ final class TeleprompterModel: ObservableObject {
         guard displayLink == nil else { return }
         lastTimestamp = 0
         let link = CADisplayLink(target: self, selector: #selector(step(_:)))
+        // 捲字 60fps 就夠順，ProMotion 不用跑到 120；忙的時候可以降到 30。
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
         link.add(to: .main, forMode: .common)
         displayLink = link
     }
@@ -508,11 +574,16 @@ final class TeleprompterModel: ObservableObject {
             return
         }
         if isFollowing {
-            _ = ease(to: followTarget, dt: dt, rate: 5)
+            // 到位就停，不要每一幀空轉；follow 給了新目標再開。
+            if ease(to: followTarget, dt: dt, rate: 5) { stopLink() }
             return
         }
         if restsAtEnd {
-            if offset >= maxOffset - 0.5 { return }
+            // 已經沒得捲了，停掉每一幀。往回滑、跳轉、版面變了會再開。
+            if offset >= maxOffset - 0.5 {
+                stopLink()
+                return
+            }
             // 字級或版面變了、或退回去了，又有得捲了。
             restsAtEnd = false
         }

@@ -28,8 +28,8 @@ struct TeleprompterView: View {
     var body: some View {
         GeometryReader { geo in
             let width = max(0, geo.size.width - 28)
-            PromptLines(layout: model.layout(for: text, width: width, fontSize: fontSize),
-                        offset: model.offset, spoken: model.spokenOffset)
+            // 捲動位置和唸到哪不經過這裡的 body，由 model 直接推給畫字的 view。
+            PromptLines(layout: model.layout(for: text, width: width, fontSize: fontSize), model: model)
                 .frame(width: width, height: geo.size.height)
                 .frame(width: geo.size.width, height: geo.size.height)
                 .allowsHitTesting(false)
@@ -128,7 +128,7 @@ struct PromptPointView: View {
     }
 
     private func still(_ layout: PromptLayout?, width: CGFloat, size: CGSize) -> some View {
-        PromptLines(layout: layout, offset: 0, spoken: 0)
+        PromptLines(layout: layout, model: nil)
             .frame(width: width, height: size.height)
             .frame(width: size.width, height: size.height)
             .background(Color.black.opacity(backgroundOpacity))
@@ -141,27 +141,37 @@ struct PromptPointView: View {
 
 /// 畫提詞的文字。用的就是換算用的那一份排版，點到哪行、捲到哪行才不會差。
 /// 整篇一鏡到底的稿子很長，只留看得到的那幾行，一行一個小圖層；捲動時只搬位置，不重畫。
+/// 捲動位置、唸到哪每一格都在變，不放在這裡：放在這裡就要每一格重算整個 SwiftUI body。
+/// 由 model 直接推給 PromptLinesUIView；這裡只在排版換了、或 view 第一次出來時，當下去 model 讀一次。
 private struct PromptLines: UIViewRepresentable {
     let layout: PromptLayout?
-    let offset: CGFloat
-    /// 唸到第幾個字（UTF-16），這之前的字變綠。
-    let spoken: Int
+    /// 捲動位置和唸到哪的來源。重點那張靜止的是 nil：停在最上面、不變色。
+    let model: TeleprompterModel?
 
     func makeUIView(context: Context) -> PromptLinesUIView {
         PromptLinesUIView(frame: .zero)
     }
 
     func updateUIView(_ view: PromptLinesUIView, context: Context) {
-        view.show(layout, offset: offset, spoken: spoken)
+        view.attach(to: model)
+        view.show(layout, offset: model?.offset ?? 0, spoken: model?.spokenOffset ?? 0)
+    }
+
+    static func dismantleUIView(_ view: PromptLinesUIView, coordinator: ()) {
+        view.detach()
     }
 }
 
 private final class PromptLinesUIView: UIView {
     private var layout: PromptLayout?
     private var offset: CGFloat = 0
+    /// 唸到第幾個字（UTF-16），這之前的字變綠。
     private var spoken = 0
     private let content = UIView()
     private var lineViews: [Int: PromptLineUIView] = [:]
+    /// 正在跟著哪個 model 捲，和登記的號碼。
+    private weak var source: TeleprompterModel?
+    private var listener: Int?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -184,6 +194,33 @@ private final class PromptLinesUIView: UIView {
         refresh()
     }
 
+    /// 跟著這個 model 捲。換了 model 就把舊的登記取消。
+    func attach(to model: TeleprompterModel?) {
+        guard model !== source else { return }
+        detach()
+        guard let model else { return }
+        source = model
+        listener = model.observeScroll { [weak self] offset, spoken in
+            self?.scrolled(to: offset, spoken: spoken)
+        }
+    }
+
+    func detach() {
+        if let listener {
+            source?.stopObservingScroll(listener)
+        }
+        listener = nil
+        source = nil
+    }
+
+    /// model 推過來的新位置。每一格都會來，沒變就不動。
+    private func scrolled(to nextOffset: CGFloat, spoken nextSpoken: Int) {
+        guard nextOffset != offset || nextSpoken != spoken else { return }
+        offset = nextOffset
+        spoken = nextSpoken
+        refresh()
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         refresh()
@@ -196,13 +233,14 @@ private final class PromptLinesUIView: UIView {
         let margin = PromptLineUIView.margin
         let lowest = -shift - margin
         let highest = bounds.height - shift + margin
-        let visible: (Int) -> Bool = { index in
-            let line = layout.lines[index]
-            return line.top + line.height >= lowest && line.top <= highest
-        }
-        removeLines { !visible($0) }
-        for index in layout.lines.indices where visible(index) {
-            let line = layout.lines[index]
+        // 行是由上往下排好的，用二分搜尋找看得到的那一段，長稿每一格才不用整篇掃一遍。
+        let lines = layout.lines
+        let first = Self.firstIndex(in: lines) { $0.top + $0.height >= lowest }
+        let end = Self.firstIndex(in: lines) { $0.top > highest }
+        let visible = first..<max(first, end)
+        removeLines { !visible.contains($0) }
+        for index in visible {
+            let line = lines[index]
             guard !line.isBlank else { continue }
             if let existing = lineViews[index] {
                 existing.setSpoken(spoken)
@@ -212,6 +250,21 @@ private final class PromptLinesUIView: UIView {
                 lineViews[index] = view
             }
         }
+    }
+
+    /// 第一個符合條件的行；都不符合是 lines.count。條件要是前面的行都不符合、從某一行起都符合。
+    private static func firstIndex(in lines: [PromptLayout.Line], where isPast: (PromptLayout.Line) -> Bool) -> Int {
+        var low = 0
+        var high = lines.count
+        while low < high {
+            let mid = (low + high) / 2
+            if isPast(lines[mid]) {
+                high = mid
+            } else {
+                low = mid + 1
+            }
+        }
+        return low
     }
 
     private func removeLines(where gone: (Int) -> Bool) {

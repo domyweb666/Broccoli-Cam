@@ -306,6 +306,13 @@ final class CameraService: NSObject, ObservableObject {
         handler(metalPreviewOn)
     }
 
+    /// 畫面把預覽淡到幾乎看不見（「不看自己」）時呼叫 true，回來時呼叫 false。請在主執行緒呼叫。
+    /// 只停掉處理過的預覽（Metal）那層的繪製，錄影、臉部偵測、音量、音量鍵快門都照舊；
+    /// 改回 false 後下一格影格就會重新畫。Metal 圖層本身不拿掉，回來時不用重新掛、不會黑一下。
+    func setPreviewHidden(_ hidden: Bool) {
+        pipeline.setPreviewHidden(hidden)
+    }
+
     /// 有逐格處理或有開防抖才疊上處理過的畫面，不然直接看原生預覽。
     private func refreshMetalPreview() {
         DispatchQueue.main.async { [weak self] in

@@ -164,7 +164,15 @@ final class SettingsStore: ObservableObject {
     private let defaults = UserDefaults.standard
 
     /// 正在用的那篇稿子的內文。列表在 ScriptLibrary，這裡是它的鏡像，由 ScriptLibrary 寫入。
-    @Published var script: String { didSet { defaults.set(script, forKey: "script") } }
+    @Published var script: String {
+        didSet {
+            defaults.set(script, forKey: "script")
+            hasScript = SettingsStore.hasText(script)
+        }
+    }
+    /// 稿子裡有沒有字（空白不算）。usesPrompter 一次畫面更新會叫十幾次，每次都整篇去頭尾太浪費，
+    /// 改成稿子一改就算好存著。不用 @Published：script 本身改了就會通知。
+    private(set) var hasScript: Bool
 
     @Published var resolution: VideoResolution { didSet { defaults.set(resolution.rawValue, forKey: "resolution") } }
     @Published var fps: Int { didSet { defaults.set(fps, forKey: "fps") } }
@@ -265,7 +273,10 @@ final class SettingsStore: ObservableObject {
 
     init() {
         let d = UserDefaults.standard
-        script = d.string(forKey: "script") ?? ""
+        // init 裡設值不會走 didSet，hasScript 要自己算。self 還沒初始化完不能讀 script，用區域變數。
+        let savedScript = d.string(forKey: "script") ?? ""
+        script = savedScript
+        hasScript = SettingsStore.hasText(savedScript)
         resolution = VideoResolution(rawValue: d.string(forKey: "resolution") ?? "") ?? .hd1080
         fps = (d.object(forKey: "fps") as? Int) ?? 30
         mirrorOutput = (d.object(forKey: "mirrorOutput") as? Bool) ?? false
@@ -315,8 +326,8 @@ final class SettingsStore: ObservableObject {
         showDebug = (d.object(forKey: "showDebug") as? Bool) ?? false
     }
 
-    var hasScript: Bool {
-        !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    private static func hasText(_ text: String) -> Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// 現在要不要顯示提詞：有稿子，而且沒有選不看。

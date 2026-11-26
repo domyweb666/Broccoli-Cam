@@ -598,6 +598,7 @@ private enum PromptBand {
 private struct PreviewStack: View {
     @EnvironmentObject private var camera: CameraService
     @EnvironmentObject private var settings: SettingsStore
+    /// 捲動位置、唸到哪都不發布，這裡只會在播放、跟讀、開始了沒這幾個很少變的狀態變了才重算。
     @ObservedObject var prompter: TeleprompterModel
     let clipPlayer: CompanionClipPlayer
     let phase: RecordingViewModel.Phase
@@ -731,7 +732,8 @@ private struct PreviewStack: View {
     private var prompting: Bool {
         // 重點不會捲，開錄就算開始了。
         if settings.usesPrompter && isPoint { return isRolling }
-        return settings.usesPrompter && (prompter.isPlaying || prompter.offset > 0)
+        // 不讀 offset：它每一格都在變、沒有發布，讀了也不會跟著重畫。hasStarted 只在 0 和大於 0 之間切換時發布。
+        return settings.usesPrompter && (prompter.isPlaying || prompter.hasStarted)
     }
 
     /// 有稿件時，頭像框只在開始提詞前顯示供對位；提詞開始後淡出。
@@ -781,8 +783,19 @@ private struct PreviewStack: View {
             .onChange(of: angle, initial: true) { _, value in
                 selfView.upright = value == 0
             }
+            // 看不到自己的時候，相機就不畫處理過的預覽，省 GPU。停止錄影時 hidesSelf 變 false，這裡也會叫回來。
+            .task(id: selfHidden) { [hidden = selfHidden] in
+                guard hidden else {
+                    camera.setPreviewHidden(false)
+                    return
+                }
+                // 等淡出跑完再停，不然淡出那半秒畫面會定住。中途又淡回來，這個 task 會被取消。
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if !Task.isCancelled { camera.setPreviewHidden(true) }
+            }
             .onDisappear {
                 selfView.stop()
+                camera.setPreviewHidden(false)
             }
     }
 

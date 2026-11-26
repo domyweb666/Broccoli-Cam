@@ -112,6 +112,7 @@ final class MetalPreviewRenderer {
 
     /// 等比例放進框裡（和原生預覽的 resizeAspect 一樣）。
     /// 比例只差一點點（框的尺寸四捨五入）就填滿，邊上才不會有一條黑線。
+    /// 倍率只看影像的比例，不看大小：FramePipeline 把預覽縮到短邊 720 再交過來，這裡放大回來的位置和裁切跟原尺寸一樣。
     private static func fit(_ image: CIImage, in bounds: CGRect) -> CIImage {
         let extent: CGRect = image.extent
         guard extent.width > 0, extent.height > 0 else { return image }

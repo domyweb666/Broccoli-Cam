@@ -230,13 +230,15 @@ final class LookFilter {
 
     /// source：原點在 (0, 0) 的影格。scale：短邊是 1080 的幾倍，半徑類的參數跟著縮放，
     /// 4K、1080p、縮小的預覽看起來才會一樣。
+    /// forPreview：只有預覽傳 true。預覽已經先縮到短邊 720，降噪照錄影的規則算，看到的強度才和錄出來的一樣。
     func apply(_ params: LookParams, to source: CIImage, face: LookFace?, scale: CGFloat,
-               skipHeavy: Bool) -> CIImage {
+               skipHeavy: Bool, forPreview: Bool) -> CIImage {
         let extent: CGRect = source.extent
         guard !extent.isInfinite, extent.width >= 4, extent.height >= 4 else { return source }
         var image: CIImage = source
         if params.denoise > 0, !skipHeavy {
-            image = denoised(image, amount: Float(params.denoise / 100), extent: extent, scale: scale)
+            image = denoised(image, amount: Float(params.denoise / 100), extent: extent, scale: scale,
+                             halved: forPreview)
         }
         image = colored(image, params: params)
         if params.smooth > 0, !skipHeavy, let face, face.strength > 0.01 {
@@ -272,10 +274,13 @@ final class LookFilter {
 
     // MARK: - 降噪
 
-    private func denoised(_ image: CIImage, amount: Float, extent: CGRect, scale: CGFloat) -> CIImage {
+    /// halved：目前沒用到，留著給之後真機量過再決定預覽要不要再省。
+    private func denoised(_ image: CIImage, amount: Float, extent: CGRect, scale: CGFloat,
+                          halved: Bool) -> CIImage {
         noise.noiseLevel = 0.01 + 0.06 * amount
         noise.sharpness = 0.3
         // 4K 直接做太重：縮一半算，平的地方換成降噪過的，輪廓留原圖。
+        // 預覽不走這條：縮一半算出來比錄的更滑，看到的就和錄到的不一樣了。
         if scale > 1.3 {
             let factor: CGFloat = 0.5
             let smallExtent = CGRect(x: 0, y: 0, width: ceil(extent.width * factor), height: ceil(extent.height * factor))
