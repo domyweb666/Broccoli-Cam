@@ -188,10 +188,12 @@ final class AudioRouter {
     }
 
     private static var hfpOption: AVAudioSession.CategoryOptions {
+        // 新版 SDK 改名叫 allowBluetoothHFP（舊系統一樣能用），舊 SDK 只有舊名字。
         #if compiler(>=6.2)
-        if #available(iOS 26.0, *) { return .allowBluetoothHFP }
-        #endif
+        return .allowBluetoothHFP
+        #else
         return .allowBluetooth
+        #endif
     }
 
     /// AirPods 高品質收音現在有沒有開著。

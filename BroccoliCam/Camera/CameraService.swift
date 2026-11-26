@@ -84,6 +84,8 @@ final class CameraService: NSObject, ObservableObject {
     private var micWaitingFor: String?
     /// 這段錄影開始時用的麥克風。sessionQueue 讀寫。
     private var recordingMicName: String?
+    /// 上次看到在用的麥克風，換了才跳提示。sessionQueue 讀寫。
+    private var lastSeenMicName: String?
     /// 錄影中換過麥克風的段落，錄完交給完成頁講。micNoteLock 保護。
     private let micNoteLock = NSLock()
     private var micNotes: [URL: String] = [:]
@@ -508,10 +510,10 @@ final class CameraService: NSObject, ObservableObject {
     // MARK: - 設定
 
     private func configureSession() {
-        // 音訊自己管：要能挑外接麥、要能錄雙聲道，相機自動設定的音訊做不到。
-        session.automaticallyConfiguresApplicationAudioSession = false
-        router.activate()
         session.beginConfiguration()
+        // 音訊自己管：要能挑外接麥、要能錄雙聲道，相機自動設定的音訊做不到。
+        // 音訊 session 等設定完、開相機前才切（start 裡的 applyAudioRoute）。
+        session.automaticallyConfiguresApplicationAudioSession = false
         // 全程 709 SDR，不要被系統切到廣色域。
         session.automaticallyConfiguresCaptureDeviceForWideColor = false
 
@@ -1322,7 +1324,8 @@ final class CameraService: NSObject, ObservableObject {
 
     @objc private func sessionRuntimeError(_ note: Notification) {
         let error = note.userInfo?[AVCaptureSessionErrorKey] as? AVError
-        let text = "執行期錯誤：\(error?.localizedDescription ?? "未知")"
+        let code = error.map { " (\($0.code.rawValue))" } ?? ""
+        let text = "執行期錯誤：\(error?.localizedDescription ?? "未知")\(code)"
         log(text)
         finishRecordingNow()
         DispatchQueue.main.async {
@@ -1366,20 +1369,21 @@ final class CameraService: NSObject, ObservableObject {
             publishMicRoute()
             return
         }
-        let plugged = reason == .newDeviceAvailable || reason == .oldDeviceUnavailable
         guard pipeline.isRecording, let url = pipeline.recorder?.url else {
-            // 沒在錄：直接照設定挑。
-            let before = router.currentInputName
+            // 沒在錄：直接照設定挑。換麥是非同步的，這次看不到新名字，下一次路由變更會看到，所以跟上次看到的比。
             applyAudioRoute()
-            if plugged, let after = router.currentInputName, after != before {
+            let now = router.currentInputName
+            if let now, let seen = lastSeenMicName, now != seen {
                 if router.currentKind == .bluetooth && !router.bluetoothHQActive {
-                    showMicNotice("改用「\(after)」收音。藍牙麥克風是電話音質，要好音質請接 USB-C 接收器")
+                    showMicNotice("改用「\(now)」收音。藍牙麥克風是電話音質，要好音質請接 USB-C 接收器")
                 } else {
-                    showMicNotice("改用「\(after)」收音")
+                    showMicNotice("改用「\(now)」收音")
                 }
             }
+            if now != nil { lastSeenMicName = now }
             return
         }
+        if let now = router.currentInputName { lastSeenMicName = now }
         // 錄影中：不主動換麥，免得聲音斷掉；外接麥掉了系統會自己退回手機麥克風，錄影照常。
         micWaitingFor = router.applyChoice(recording: true)
         let now = router.currentInputName ?? "沒有麥克風"
