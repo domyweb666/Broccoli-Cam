@@ -1212,21 +1212,26 @@ private struct ControlBar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            BarButton(title: "腳本", systemImage: "doc.text", angle: angle) {
-                showScript = true
+            // 用不到的鍵換成一樣大的空位：左右的鍵不移位，旁白也念不到。
+            // 只把鍵淡到 0 或加 accessibilityHidden，模擬器的無障礙樹裡還是看得到。
+            if isOff {
+                BarSlot()
+            } else {
+                BarButton(title: "腳本", systemImage: "doc.text", angle: angle) {
+                    showScript = true
+                }
+                .disabled(viewModel.isBusy)
+                .opacity(viewModel.isBusy ? 0.35 : 1)
             }
-            .disabled(viewModel.isBusy || isOff)
-            .opacity(isOff ? 0 : (viewModel.isBusy ? 0.35 : 1))
-            // 看不見的鍵也不要讓旁白念到。位置照留，左右的鍵才不會移位。
-            .accessibilityHidden(isOff)
 
-            BarButton(title: prompter.isPlaying ? "暫停" : "提詞",
-                      systemImage: prompter.isPlaying ? "pause.fill" : "play.fill", angle: angle) {
-                viewModel.togglePrompter()
+            if scrolls {
+                BarButton(title: prompter.isPlaying ? "暫停" : "提詞",
+                          systemImage: prompter.isPlaying ? "pause.fill" : "play.fill", angle: angle) {
+                    viewModel.togglePrompter()
+                }
+            } else {
+                BarSlot()
             }
-            .opacity(scrolls ? 1 : 0)
-            .disabled(!scrolls)
-            .accessibilityHidden(!scrolls)
 
             RecordButton(phase: viewModel.phase) {
                 viewModel.primaryTapped(
@@ -1238,12 +1243,13 @@ private struct ControlBar: View {
             .disabled(viewModel.pending != nil || viewModel.isMerging)
             .opacity(viewModel.pending != nil || viewModel.isMerging ? 0.35 : 1)
 
-            BarButton(title: "回開頭", systemImage: "arrow.counterclockwise", angle: angle) {
-                prompter.reset()
+            if rewinds {
+                BarButton(title: "回開頭", systemImage: "arrow.counterclockwise", angle: angle) {
+                    prompter.reset()
+                }
+            } else {
+                BarSlot()
             }
-            .opacity(rewinds ? 1 : 0)
-            .disabled(!rewinds)
-            .accessibilityHidden(!rewinds)
 
             BarButton(title: "設定", systemImage: "slider.horizontal.3", angle: angle) {
                 showSettings = true
@@ -1460,6 +1466,17 @@ private struct BarButton: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// 控制列上空出來的位置，跟 BarButton 一樣大。
+private struct BarSlot: View {
+    var body: some View {
+        // Color 會把能拿的高度都吃掉，高度要釘死，不然整條控制列會被撐到畫面中間。
+        Color.clear
+            .frame(maxWidth: .infinity)
+            .frame(height: 52)
+            .accessibilityHidden(true)
     }
 }
 
