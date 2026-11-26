@@ -53,7 +53,10 @@ final class CaptionVideo: @unchecked Sendable {
     private let overlay = CaptionOverlay()
     private let lock = NSLock()
     private var loaded: Media?
-    private var refreshQueued = false
+    /// 每改一次加一，等 0.2 秒後還是同一號才重畫，連續打字只畫最後一次。
+    private var refreshTicket = 0
+    /// 上次檢查之後第一次改之前的字幕，用來判斷停著的那一格有沒有變。
+    private var refreshBaseline: CaptionOverlay.State?
     @MainActor private weak var currentItem: AVPlayerItem?
 
     init(clips: [(url: URL, start: Double?, end: Double?)], isLandscape: Bool) {
@@ -202,19 +205,25 @@ final class CaptionVideo: @unchecked Sendable {
         return composition
     }
 
-    /// 換字幕或樣式。播放中下一格就生效，暫停中會把停著的這一格重畫。
+    /// 換字幕或樣式。播放中下一格就生效；暫停中停手 0.2 秒後，停著的那一格附近真的變了才重畫。
     func update(lines: [CaptionLine], style: CaptionStyle) {
-        guard overlay.set(lines: lines, style: style) else { return }
-        let needsQueue: Bool = lock.withLock {
-            if refreshQueued { return false }
-            refreshQueued = true
-            return true
+        guard let previous = overlay.replace(lines: lines, style: style) else { return }
+        let ticket: Int = lock.withLock {
+            if refreshBaseline == nil { refreshBaseline = previous }
+            refreshTicket += 1
+            return refreshTicket
         }
-        // 連續改好幾個地方只重畫一次。
-        guard needsQueue else { return }
-        Task { @MainActor in
-            self.lock.withLock { self.refreshQueued = false }
-            self.refresh()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard let self else { return }
+            let due: (isLatest: Bool, baseline: CaptionOverlay.State?) = self.lock.withLock {
+                guard self.refreshTicket == ticket else { return (false, nil) }
+                let baseline = self.refreshBaseline
+                self.refreshBaseline = nil
+                return (true, baseline)
+            }
+            guard due.isLatest else { return }
+            self.refresh(since: due.baseline)
         }
     }
 
@@ -222,8 +231,18 @@ final class CaptionVideo: @unchecked Sendable {
     /// 播放中不換，換了會頓一下。
     @MainActor
     func refresh() {
+        refresh(since: nil)
+    }
+
+    /// previous 是改之前的字幕；停著那一格前後的句子跟它一樣就不換。nil 一律換。
+    @MainActor
+    private func refresh(since previous: CaptionOverlay.State?) {
         guard let media = current, let item = currentItem else { return }
         if let timebase = item.timebase, CMTimebaseGetRate(timebase) != 0 { return }
+        if let previous {
+            let time: Double = item.currentTime().seconds
+            if time.isFinite, !overlay.differs(from: previous, near: time) { return }
+        }
         item.videoComposition = makeVideoComposition(media)
     }
 }
@@ -232,10 +251,16 @@ final class CaptionVideo: @unchecked Sendable {
 
 /// 現在有哪些字幕。改的人和畫的人在不同執行緒，用鎖交接。
 final class CaptionOverlay: @unchecked Sendable {
-    private struct Entry: Equatable {
+    fileprivate struct Entry: Equatable {
         let start: Double
         let end: Double
         let text: String
+    }
+
+    /// 某一刻的全部字幕，給 CaptionVideo 比對改之前和改之後。
+    struct State {
+        fileprivate let entries: [Entry]
+        fileprivate let style: CaptionStyle
     }
 
     private let lock = NSLock()
@@ -245,15 +270,34 @@ final class CaptionOverlay: @unchecked Sendable {
     /// 隱藏的、空的不會畫。沒有變化回 false。
     @discardableResult
     func set(lines: [CaptionLine], style newStyle: CaptionStyle) -> Bool {
+        replace(lines: lines, style: newStyle) != nil
+    }
+
+    /// 跟 set 一樣，有變化時回改之前的字幕，沒有變化回 nil。
+    func replace(lines: [CaptionLine], style newStyle: CaptionStyle) -> State? {
         let fresh: [Entry] = lines
             .filter { !$0.isHidden && !$0.text.isEmpty && $0.end > $0.start }
             .sorted { $0.start < $1.start }
             .map { Entry(start: $0.start, end: $0.end, text: $0.text) }
         return lock.withLock {
-            if fresh == entries && newStyle == style { return false }
+            if fresh == entries && newStyle == style { return nil }
+            let previous = State(entries: entries, style: style)
             entries = fresh
             style = newStyle
-            return true
+            return previous
+        }
+    }
+
+    /// 停在 seconds 這一刻時，畫面上那一格會不會跟 previous 畫的不一樣。
+    /// 播放器停的時間和那一格的時間差不到一格，前後各多看 0.25 秒，寧可多畫不要漏畫。
+    func differs(from previous: State, near seconds: Double) -> Bool {
+        let margin = 0.25
+        func near(_ list: [Entry]) -> [Entry] {
+            list.filter { $0.end > seconds - margin && $0.start < seconds + margin }
+        }
+        return lock.withLock {
+            if style != previous.style { return true }
+            return near(entries) != near(previous.entries)
         }
     }
 
@@ -341,9 +385,31 @@ final class CaptionFrameMaker {
 
     static let pixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
 
+    /// 做好、或顯示晶片還在畫的一格。要用之前交給 finish。
+    struct Pending {
+        fileprivate let output: CVPixelBuffer
+        fileprivate let drawing: Drawing?
+    }
+
+    /// 顯示晶片還在畫的那一格。畫壞了要用這些改走系統的縮放，所以都先留著。
+    fileprivate struct Drawing {
+        let task: CIRenderTask
+        let destination: CIRenderDestination
+        let source: CVPixelBuffer
+        let placement: Placement
+        let bitmap: CaptionBitmap?
+    }
+
     /// 回來的可能就是 source 本身。newBuffer 給一個 size 大小、420v 的緩衝區。
     func frame(from source: CVPixelBuffer, at seconds: Double,
                newBuffer: () -> CVPixelBuffer?) throws -> CVPixelBuffer {
+        try finish(start(from: source, at: seconds, newBuffer: newBuffer))
+    }
+
+    /// 跟 frame 一樣，只是顯示晶片那條路不等它畫完就回來，可以先去讀下一格。
+    /// 回來的要照順序交給 finish；在那之前 source 和輸出的緩衝區都不能動。
+    func start(from source: CVPixelBuffer, at seconds: Double,
+               newBuffer: () -> CVPixelBuffer?) throws -> Pending {
         var bitmap: CaptionBitmap?
         if let caption = overlay.caption(at: seconds) {
             bitmap = CaptionRenderer.bitmap(text: caption.text, style: caption.style, canvas: size)
@@ -354,25 +420,46 @@ final class CaptionFrameMaker {
         let isPlain: Bool = placement.isUpright && CVPixelBufferGetPixelFormatType(source) == Self.pixelFormat
         let isSameSize: Bool = sourceWidth == width && sourceHeight == height
 
-        if isPlain, isSameSize, bitmap == nil { return source }
+        if isPlain, isSameSize, bitmap == nil { return Pending(output: source, drawing: nil) }
         guard let output = newBuffer() else { throw CaptionVideoError.cannotDraw }
         Self.copyColorTags(from: source, to: output)
 
         if isPlain, isSameSize, Self.copyPixels(from: source, to: output) {
             if let bitmap, !bitmap.blend(onto: output) { throw CaptionVideoError.cannotDraw }
-            return output
+            return Pending(output: output, drawing: nil)
         }
 
-        if CaptionGPUAccess.shared.isAllowed, draw(source, placement: placement, bitmap: bitmap, to: output) {
-            Self.copyColorTags(from: source, to: output)
-            return output
+        if CaptionGPUAccess.shared.isAllowed,
+           let drawing = startDrawing(source, placement: placement, bitmap: bitmap, to: output) {
+            return Pending(output: output, drawing: drawing)
         }
+        try scaleInstead(source, placement: placement, bitmap: bitmap, to: output)
+        return Pending(output: output, drawing: nil)
+    }
+
+    /// 等顯示晶片畫完這一格。畫失敗（剛好切到背景之類）就改走系統的縮放，跟原本一樣。
+    func finish(_ pending: Pending) throws -> CVPixelBuffer {
+        guard let drawing = pending.drawing else { return pending.output }
+        if (try? drawing.task.waitUntilCompleted()) != nil {
+            Self.copyColorTags(from: drawing.source, to: pending.output)
+            return pending.output
+        }
+        try scaleInstead(drawing.source, placement: drawing.placement, bitmap: drawing.bitmap,
+                         to: pending.output)
+        return pending.output
+    }
+
+    /// 不用顯示晶片的那條路。
+    private func scaleInstead(_ source: CVPixelBuffer, placement: Placement, bitmap: CaptionBitmap?,
+                              to output: CVPixelBuffer) throws {
+        let sourceWidth = CVPixelBufferGetWidth(source)
+        let sourceHeight = CVPixelBufferGetHeight(source)
         // 縮放要等比例，長寬比不一樣會變形，就不走這條。
         let isSameShape: Bool = abs(sourceWidth * height - sourceHeight * width) <= 4 * (width + height)
         if placement.isUpright, isSameShape, scale(source, to: output) {
             Self.copyColorTags(from: source, to: output)
             if let bitmap, !bitmap.blend(onto: output) { throw CaptionVideoError.cannotDraw }
-            return output
+            return
         }
         throw CaptionVideoError.cannotDraw
     }
@@ -385,9 +472,10 @@ final class CaptionFrameMaker {
 
     // MARK: 顯示晶片
 
-    private func draw(_ source: CVPixelBuffer, placement: Placement, bitmap: CaptionBitmap?,
-                      to output: CVPixelBuffer) -> Bool {
-        guard let context = CameraGPU.context else { return false }
+    /// 交給顯示晶片就回來，不等它畫完。連交都交不出去回 nil。
+    private func startDrawing(_ source: CVPixelBuffer, placement: Placement, bitmap: CaptionBitmap?,
+                              to output: CVPixelBuffer) -> Drawing? {
+        guard let context = CameraGPU.context else { return nil }
         let bounds = CGRect(x: 0, y: 0, width: width, height: height)
         var image: CIImage = placed(CameraGPU.image(source), placement: placement, in: bounds)
         if let bitmap {
@@ -396,13 +484,13 @@ final class CaptionFrameMaker {
         let destination = CIRenderDestination(pixelBuffer: output)
         destination.colorSpace = CameraGPU.colorSpace
         do {
-            // 用 task 才知道有沒有畫成功；剛好切到背景時會失敗，交給下一條路。
+            // 用 task 才知道有沒有畫成功；剛好切到背景時會失敗，finish 會改走下一條路。
             let task = try context.startTask(toRender: image.cropped(to: bounds), from: bounds,
                                              to: destination, at: .zero)
-            _ = try task.waitUntilCompleted()
-            return true
+            return Drawing(task: task, destination: destination, source: source,
+                           placement: placement, bitmap: bitmap)
         } catch {
-            return false
+            return nil
         }
     }
 

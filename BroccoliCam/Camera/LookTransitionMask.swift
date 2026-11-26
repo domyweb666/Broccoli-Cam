@@ -2,6 +2,8 @@ import CoreGraphics
 import CoreImage
 import CoreImage.CIFilterBuiltins
 import Foundation
+import ImageIO
+import Metal
 
 /// 一鍵優化後預覽的過場（QC-0012）：用遮罩把舊樣子一步步換成新樣子，交界再疊一點亮光。
 /// 只給預覽用，錄影寫檔不會經過這裡。
@@ -36,6 +38,65 @@ enum LookTransitionMask {
             return blinds(before: before, after: after, extent: extent, progress: p)
         case .none:
             return after
+        }
+    }
+
+    // MARK: - 預熱
+
+    private static let prewarmLock = NSLock()
+    private static var prewarmed = false
+
+    /// 第一次開一鍵優化時呼叫（任何執行緒）：在背景用很小的圖把百葉窗過場從頭到尾畫一遍，
+    /// 讓 Core Image 先把這些組合編好，第一次真的播的時候比較不會卡幾格。
+    /// 只做一次；畫進一張不顯示的小貼圖，不碰預覽圖層，也不碰錄影。
+    /// 用的是預覽那組 CIContext（MetalPreviewRenderer 畫過場用的就是它），編好的才用得上。
+    static func prewarmOnce() {
+        prewarmLock.lock()
+        let first: Bool = !prewarmed
+        prewarmed = true
+        prewarmLock.unlock()
+        guard first else { return }
+        DispatchQueue.global(qos: .utility).async {
+            prewarm()
+        }
+    }
+
+    private static func prewarm() {
+        guard let context = CameraGPU.previewContext ?? CameraGPU.context,
+              let device = CameraGPU.device else { return }
+        let width = 72
+        let height = 128
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: width * 2,
+                                                                  height: height * 2, mipmapped: false)
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        guard let texture = device.makeTexture(descriptor: descriptor) else { return }
+        let extent = CGRect(x: 0, y: 0, width: width, height: height)
+        let bounds = CGRect(x: 0, y: 0, width: width * 2, height: height * 2)
+        let before: CIImage = CIImage(color: CIColor(red: 0.35, green: 0.32, blue: 0.30)).cropped(to: extent)
+        let after: CIImage = CIImage(color: CIColor(red: 0.55, green: 0.48, blue: 0.42)).cropped(to: extent)
+        let black: CIImage = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: bounds)
+        let focus = CGPoint(x: extent.midX, y: extent.maxY * 0.62)
+        // 每 0.025 一格，涵蓋每一條開始翻、翻完的每個階段（條數變了，Core Image 的組合就不一樣）。
+        for step in 1..<40 {
+            let progress = CGFloat(step) / 40
+            let composed: CIImage = compose(before: before, after: after, style: .blinds,
+                                            progress: progress, focus: focus)
+            // 和 MetalPreviewRenderer 一樣：鏡像、放大到框、四周補黑。
+            let mirrored: CIImage = composed.oriented(.upMirrored)
+            let origin: CGPoint = mirrored.extent.origin
+            let shown: CIImage = mirrored
+                .transformed(by: CGAffineTransform(a: 2, b: 0, c: 0, d: 2, tx: -origin.x * 2, ty: -origin.y * 2))
+                .cropped(to: bounds)
+                .composited(over: black)
+            let destination = CIRenderDestination(mtlTexture: texture, commandBuffer: nil)
+            destination.colorSpace = CameraGPU.colorSpace
+            do {
+                let task: CIRenderTask = try context.startTask(toRender: shown, from: bounds, to: destination,
+                                                               at: CGPoint.zero)
+                _ = try task.waitUntilCompleted()
+            } catch {
+                return
+            }
         }
     }
 

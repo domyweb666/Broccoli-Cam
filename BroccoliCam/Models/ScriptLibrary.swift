@@ -31,11 +31,25 @@ struct ScriptItem: Identifiable, Codable, Equatable {
     static func displayTitle(title: String, body: String) -> String {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return trimmed }
-        return contentLines(body).first ?? "未命名"
+        return firstContentLine(body) ?? "未命名"
     }
 
     static func shareText(title: String, body: String) -> String {
         body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? title : body
+    }
+
+    /// 第一個有字的行，去掉前後空白。和 contentLines(text).first 一樣，
+    /// 但找到就停：編輯頁每打一個字都要算一次標題（分享的主旨），長稿不用整篇切成一行一行。
+    private static func firstContentLine(_ text: String) -> String? {
+        var rest = Substring(text)
+        while !rest.isEmpty {
+            let end = rest.firstIndex(where: { $0.isNewline }) ?? rest.endIndex
+            let line = rest[..<end].trimmingCharacters(in: .whitespaces)
+            if !line.isEmpty { return line }
+            guard end < rest.endIndex else { return nil }
+            rest = rest[rest.index(after: end)...]
+        }
+        return nil
     }
 
     /// 有字的那幾行，去掉前後空白。
@@ -78,6 +92,10 @@ final class ScriptLibrary: ObservableObject {
 
     private var saveWork: DispatchWorkItem?
     private let saveDelay: TimeInterval = 0.8
+    /// 編碼和寫檔在這條佇列上照順序做，不卡主執行緒（長稿打字時每停一下就存一次）。
+    private let ioQueue = DispatchQueue(label: "org.domyweb.broccolicam.scripts", qos: .utility)
+    /// 第幾次存檔。寫完回來時是最新那次才算存好了。
+    private var saveGeneration = 0
     private var dirty = false
     private var saveFailed = false
     /// 壞檔留不了底的時候不准寫，免得把原檔蓋掉。
@@ -135,9 +153,11 @@ final class ScriptLibrary: ObservableObject {
     }
 
     /// 立刻併進列表並寫檔。離開頁面、進背景時呼叫。
+    /// 寫檔在背景佇列，但這裡等它寫完才回來（和以前一樣），進背景之後才不會沒寫到。
     func flush() {
         commitDrafts()
         if dirty { save() }
+        ioQueue.sync {}
     }
 
     // MARK: - 列表操作
@@ -249,6 +269,8 @@ final class ScriptLibrary: ObservableObject {
     // MARK: - 讀寫檔
 
     private func load() {
+        // 還在背景寫的先寫完，才不會讀到一半、或改名時被寫回來。
+        ioQueue.sync {}
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             migrate()
             return
@@ -342,24 +364,44 @@ final class ScriptLibrary: ObservableObject {
     }
 
     /// 寫失敗時 dirty 留著，下次改動或進背景會再試一次。
+    /// 內容在主執行緒拍下來，編碼和寫檔丟到 ioQueue，寫完回主執行緒更新狀態。
     private func save() {
         saveWork?.cancel()
         saveWork = nil
         dirty = true
         guard !writingBlocked else { return }
-        do {
-            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
-                                                    withIntermediateDirectories: true)
-            let data = try JSONEncoder().encode(StoredFile(activeID: activeID, items: items))
-            try data.write(to: fileURL, options: .atomic)
-            dirty = false
-            if saveFailed {
-                saveFailed = false
-                errorMessage = nil
+        saveGeneration += 1
+        let generation = saveGeneration
+        let stored = StoredFile(activeID: activeID, items: items)
+        let url = fileURL
+        ioQueue.async { [weak self] in
+            var failure: String?
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true)
+                let data = try JSONEncoder().encode(stored)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                failure = error.localizedDescription
             }
-        } catch {
+            let result = failure
+            DispatchQueue.main.async {
+                self?.saveFinished(generation: generation, failure: result)
+            }
+        }
+    }
+
+    private func saveFinished(generation: Int, failure: String?) {
+        if let failure {
             saveFailed = true
-            errorMessage = "腳本沒存成功：\(error.localizedDescription)"
+            errorMessage = "腳本沒存成功：\(failure)"
+            return
+        }
+        // 寫完之前又改了、又排了一次存檔，那一次寫完才算存好。
+        if generation == saveGeneration { dirty = false }
+        if saveFailed {
+            saveFailed = false
+            errorMessage = nil
         }
     }
 }

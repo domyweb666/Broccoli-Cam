@@ -295,6 +295,13 @@ enum CaptionAligner {
         return a.isLetter || b.isLetter ? -1 : -2
     }
 
+    /// 設成 true 的工作被取消時，比對會中途放棄、回傳沒對上（結果要丟掉）。
+    /// 只給「錄完檢查」用：它被取消就不會用結果。字幕那邊不設，行為完全照舊。
+    @TaskLocal static var stopsWhenCancelled = false
+
+    /// 比對表超過這麼多格才改用省記憶體的算法；以下照原本整張表記著。
+    private static let compactCells = 4_000_000
+
     /// 全域比對，回傳（稿子第幾個音，聽到的第幾個音）。對錯的字也會配成一對，好借它的時間。
     /// 斷開要扣分，所以重講時會整段挑同一次，不會東拼西湊；一樣好就挑後面那次。
     /// fit：聽到的頭尾多出來的不扣分，中間拖越長扣越多，用來在一段聲音裡找一句完整的。
@@ -303,8 +310,7 @@ enum CaptionAligner {
         let m = h.count
         guard n > 0, m > 0, n <= cellLimit / (m + 1) else { return [] }
         let width = m + 1
-        // 每格記三個狀態各從哪裡來：0 = 配對，1 = 稿子多，2 = 聽到多。
-        var trace = [UInt8](repeating: 0, count: (n + 1) * width)
+        let watchesCancel: Bool = stopsWhenCancelled
         var mPrev = [Int32](repeating: unreachable, count: width)
         var xPrev = [Int32](repeating: unreachable, count: width)
         var yPrev = [Int32](repeating: unreachable, count: width)
@@ -314,41 +320,124 @@ enum CaptionAligner {
         mPrev[0] = 0
         for j in 1...m { yPrev[j] = fit ? 0 : -gapOpen }
         let gapExtend: Int32 = fit ? 1 : 0
+        var cancelled = false
 
-        trace.withUnsafeMutableBufferPointer { trace in
-            for i in 1...n {
-                let a = s[i - 1]
-                mRow[0] = unreachable
-                yRow[0] = unreachable
-                xRow[0] = -gapOpen
-                // 第 0 欄只會一路往上，來源不影響結果。
-                for j in 1...m {
-                    var source: UInt8 = 0
-                    var diagonal = mPrev[j - 1]
-                    if xPrev[j - 1] > diagonal { diagonal = xPrev[j - 1]; source = 1 }
-                    if yPrev[j - 1] > diagonal { diagonal = yPrev[j - 1]; source = 2 }
-                    mRow[j] = diagonal + score(a, h[j - 1])
-
-                    var up = mPrev[j] - gapOpen
-                    var upSource: UInt8 = 0
-                    if xPrev[j] > up { up = xPrev[j]; upSource = 1 }
-                    if yPrev[j] - gapOpen > up { up = yPrev[j] - gapOpen; upSource = 2 }
-                    xRow[j] = up
-
-                    var left = mRow[j - 1] - gapOpen
-                    var leftSource: UInt8 = 0
-                    if yRow[j - 1] - gapExtend > left { left = yRow[j - 1] - gapExtend; leftSource = 2 }
-                    if xRow[j - 1] - gapOpen > left { left = xRow[j - 1] - gapOpen; leftSource = 1 }
-                    yRow[j] = left
-
-                    trace[i * width + j] = source | (upSource << 2) | (leftSource << 4)
+        if (n + 1) * width <= compactCells {
+            // 每格記三個狀態各從哪裡來：0 = 配對，1 = 稿子多，2 = 聽到多。
+            var trace = [UInt8](repeating: 0, count: (n + 1) * width)
+            trace.withUnsafeMutableBufferPointer { trace in
+                for i in 1...n {
+                    if watchesCancel, i & 31 == 0, Task.isCancelled {
+                        cancelled = true
+                        return
+                    }
+                    fillRow(s[i - 1], h, m: m, gapExtend: gapExtend, mPrev: mPrev, xPrev: xPrev, yPrev: yPrev,
+                            mRow: &mRow, xRow: &xRow, yRow: &yRow, trace: trace, offset: i * width)
+                    swap(&mPrev, &mRow)
+                    swap(&xPrev, &xRow)
+                    swap(&yPrev, &yRow)
                 }
+            }
+            if cancelled { return [] }
+            return traceBack(n: n, m: m, fit: fit, mLast: mPrev, xLast: xPrev, yLast: yPrev) { i, j in
+                trace[i * width + j]
+            }
+        }
+
+        // 長稿：整張來源表要 n × m 個位元組。改成每隔 block 列記一次分數（檢查點），
+        // 往回找的時候再從檢查點把那一塊重算出來。每一格的算法和上面同一個 fillRow，結果相同，只是多算一遍。
+        let block: Int = max(1, Int((12 * Double(n)).squareRoot()))
+        var checkpoints: [(m: [Int32], x: [Int32], y: [Int32])] = []
+        checkpoints.reserveCapacity(n / block + 1)
+        var scratch = [UInt8](repeating: 0, count: width)
+        scratch.withUnsafeMutableBufferPointer { scratch in
+            for i in 1...n {
+                if (i - 1) % block == 0 {
+                    if watchesCancel, Task.isCancelled {
+                        cancelled = true
+                        return
+                    }
+                    // 第 i - 1 列算完的分數，第 i 列起的這一塊從這裡重算。
+                    checkpoints.append((mPrev, xPrev, yPrev))
+                }
+                fillRow(s[i - 1], h, m: m, gapExtend: gapExtend, mPrev: mPrev, xPrev: xPrev, yPrev: yPrev,
+                        mRow: &mRow, xRow: &xRow, yRow: &yRow, trace: scratch, offset: 0)
                 swap(&mPrev, &mRow)
                 swap(&xPrev, &xRow)
                 swap(&yPrev, &yRow)
             }
         }
+        if cancelled { return [] }
 
+        var blockTrace = [UInt8](repeating: 0, count: block * width)
+        var loadedBlock = -1
+        var blockFirstRow = 1
+        /// 把第 index 塊（第 index × block + 1 列起）每格的來源重算進 blockTrace。
+        func load(_ index: Int) {
+            let first: Int = index * block + 1
+            let last: Int = min(n, (index + 1) * block)
+            var mp: [Int32] = checkpoints[index].m
+            var xp: [Int32] = checkpoints[index].x
+            var yp: [Int32] = checkpoints[index].y
+            var mr = [Int32](repeating: unreachable, count: width)
+            var xr = mr
+            var yr = mr
+            blockTrace.withUnsafeMutableBufferPointer { trace in
+                for i in first...last {
+                    fillRow(s[i - 1], h, m: m, gapExtend: gapExtend, mPrev: mp, xPrev: xp, yPrev: yp,
+                            mRow: &mr, xRow: &xr, yRow: &yr, trace: trace, offset: (i - first) * width)
+                    swap(&mp, &mr)
+                    swap(&xp, &xr)
+                    swap(&yp, &yr)
+                }
+            }
+            loadedBlock = index
+            blockFirstRow = first
+        }
+        return traceBack(n: n, m: m, fit: fit, mLast: mPrev, xLast: xPrev, yLast: yPrev) { i, j in
+            let index: Int = (i - 1) / block
+            if index != loadedBlock { load(index) }
+            return blockTrace[(i - blockFirstRow) * width + j]
+        }
+    }
+
+    /// 算比對表的一列（a 是這一列的稿子音）。prev 是上一列，算好的放進 row，
+    /// 每格的來源寫進 trace[offset + j]（第 0 格不寫）。
+    @inline(__always)
+    private static func fillRow(_ a: Symbol, _ h: [Symbol], m: Int, gapExtend: Int32,
+                                mPrev: [Int32], xPrev: [Int32], yPrev: [Int32],
+                                mRow: inout [Int32], xRow: inout [Int32], yRow: inout [Int32],
+                                trace: UnsafeMutableBufferPointer<UInt8>, offset: Int) {
+        mRow[0] = unreachable
+        yRow[0] = unreachable
+        xRow[0] = -gapOpen
+        // 第 0 欄只會一路往上，來源不影響結果。
+        for j in 1...m {
+            var source: UInt8 = 0
+            var diagonal = mPrev[j - 1]
+            if xPrev[j - 1] > diagonal { diagonal = xPrev[j - 1]; source = 1 }
+            if yPrev[j - 1] > diagonal { diagonal = yPrev[j - 1]; source = 2 }
+            mRow[j] = diagonal + score(a, h[j - 1])
+
+            var up = mPrev[j] - gapOpen
+            var upSource: UInt8 = 0
+            if xPrev[j] > up { up = xPrev[j]; upSource = 1 }
+            if yPrev[j] - gapOpen > up { up = yPrev[j] - gapOpen; upSource = 2 }
+            xRow[j] = up
+
+            var left = mRow[j - 1] - gapOpen
+            var leftSource: UInt8 = 0
+            if yRow[j - 1] - gapExtend > left { left = yRow[j - 1] - gapExtend; leftSource = 2 }
+            if xRow[j - 1] - gapOpen > left { left = xRow[j - 1] - gapOpen; leftSource = 1 }
+            yRow[j] = left
+
+            trace[offset + j] = source | (upSource << 2) | (leftSource << 4)
+        }
+    }
+
+    /// 從最後一列往回走。cell(i, j) 給第 i 列第 j 格的來源，i 只會越來越小。
+    private static func traceBack(n: Int, m: Int, fit: Bool, mLast mPrev: [Int32], xLast xPrev: [Int32],
+                                  yLast yPrev: [Int32], cell: (Int, Int) -> UInt8) -> [(Int, Int)] {
         var j = m
         var state: UInt8 = 0
         if fit {
@@ -370,18 +459,18 @@ enum CaptionAligner {
         var pairs: [(Int, Int)] = []
         var i = n
         while i > 0 && j > 0 {
-            let cell = trace[i * width + j]
+            let source: UInt8 = cell(i, j)
             switch state {
             case 0:
                 pairs.append((i - 1, j - 1))
-                state = cell & 3
+                state = source & 3
                 i -= 1
                 j -= 1
             case 1:
-                state = (cell >> 2) & 3
+                state = (source >> 2) & 3
                 i -= 1
             default:
-                state = (cell >> 4) & 3
+                state = (source >> 4) & 3
                 j -= 1
             }
         }

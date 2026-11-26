@@ -372,7 +372,8 @@ final class CaptionEditorModel: ObservableObject {
             if let error {
                 self?.dirty = true
                 self?.saveError = "字幕沒存成功：\(error.localizedDescription)"
-            } else {
+            } else if self?.saveError != nil {
+                // 本來就沒有錯誤訊息就不要再設一次，設了整頁都會重算。
                 self?.saveError = nil
             }
             then?(error == nil)

@@ -1096,6 +1096,8 @@ final class CameraService: NSObject, ObservableObject {
             DispatchQueue.main.async { completion(nil) }
             return
         }
+        // 分析要等曝光穩定，趁這段時間在背景把過場先畫一次（只有 App 開著後的第一次會真的做）。
+        LookTransitionMask.prewarmOnce()
         // 臉在裝置座標的位置，用預覽層換算，方向、鏡像、機型差異都包含在裡面。
         var point: CGPoint?
         if let layer = previewLayer, let face = faces.faceRect {
