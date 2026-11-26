@@ -224,6 +224,8 @@ struct SettingsView: View {
             lines.append("藍牙麥克風走電話用的通道，聲音只有電話音質、會比較悶。DJI Mic Mini、Mic 3 要好音質，請把 USB-C 接收器插在手機上。")
         } else if settings.bluetoothMic {
             lines.append("藍牙麥克風（DJI 直連手機、AirPods）是電話音質，比 USB-C 接收器差。")
+        } else {
+            lines.append("藍牙麥克風關著：戴 AirPods、DJI 用藍牙直連時，還是用手機麥克風收音。")
         }
         if settings.micChannelMode == .stereo {
             lines.append("立體聲：兩支發射器各錄在左、右聲道。只有一支發射器時請選合成單聲道，不然只有一邊耳朵有聲音。")

@@ -318,7 +318,7 @@ final class SettingsStore: ObservableObject {
         hideSelf = (d.object(forKey: "hideSelf") as? Bool) ?? false
         airPodsMic = (d.object(forKey: "airPodsMic") as? Bool) ?? false
         micChoice = d.string(forKey: "micChoice") ?? "auto"
-        bluetoothMic = (d.object(forKey: "bluetoothMic") as? Bool) ?? true
+        bluetoothMic = (d.object(forKey: "bluetoothMic") as? Bool) ?? false
         micChannelMode = MicChannelMode(rawValue: d.string(forKey: "micChannelMode") ?? "") ?? .mono
         takeCheck = (d.object(forKey: "takeCheck") as? Bool) ?? true
         autoLandscape = (d.object(forKey: "autoLandscape") as? Bool) ?? true

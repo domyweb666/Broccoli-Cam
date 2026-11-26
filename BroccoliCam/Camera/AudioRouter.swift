@@ -141,7 +141,7 @@ final class AudioRouter {
     struct Preferences: Equatable {
         var choice: MicChoice = .automatic
         /// 藍牙麥克風（DJI Mic Mini／Mic 3 直連、AirPods）。
-        var allowsBluetooth = true
+        var allowsBluetooth = false
         var channelMode: MicChannelMode = .mono
         /// iOS 26 的 AirPods 高品質收音。
         var bluetoothHQ = false
@@ -250,7 +250,9 @@ final class AudioRouter {
         case .automatic:
             break
         }
-        let usable = inputs.filter { preferences.allowsBluetooth || MicKind($0.portType) != .bluetooth }
+        // 藍牙麥關著時不挑藍牙；只開 AirPods 高品質收音的話照舊用 AirPods（這個開關本來就是要用它收音）。
+        let bluetoothOK = preferences.allowsBluetooth || (preferences.bluetoothHQ && bluetoothHQActive)
+        let usable = inputs.filter { bluetoothOK || MicKind($0.portType) != .bluetooth }
         return usable.min { MicKind($0.portType).priority < MicKind($1.portType).priority }
     }
 
