@@ -1217,6 +1217,8 @@ private struct ControlBar: View {
             }
             .disabled(viewModel.isBusy || isOff)
             .opacity(isOff ? 0 : (viewModel.isBusy ? 0.35 : 1))
+            // 看不見的鍵也不要讓旁白念到。位置照留，左右的鍵才不會移位。
+            .accessibilityHidden(isOff)
 
             BarButton(title: prompter.isPlaying ? "暫停" : "提詞",
                       systemImage: prompter.isPlaying ? "pause.fill" : "play.fill", angle: angle) {
@@ -1224,6 +1226,7 @@ private struct ControlBar: View {
             }
             .opacity(scrolls ? 1 : 0)
             .disabled(!scrolls)
+            .accessibilityHidden(!scrolls)
 
             RecordButton(phase: viewModel.phase) {
                 viewModel.primaryTapped(
@@ -1240,6 +1243,7 @@ private struct ControlBar: View {
             }
             .opacity(rewinds ? 1 : 0)
             .disabled(!rewinds)
+            .accessibilityHidden(!rewinds)
 
             BarButton(title: "設定", systemImage: "slider.horizontal.3", angle: angle) {
                 showSettings = true

@@ -311,7 +311,8 @@ struct VideoReviewView: View {
                               busy: isMakingProject, action: addCaptions)
                 // SRT 正在辨識的話等它做完，兩邊一起聽會互相打斷。
                 .disabled(isMakingProject || subtitleState == .working)
-            if sendsAudioOut {
+            // 已經有字幕專案（「改字幕」「還有 N 句」）時打開的是做好的那份，不會再送聲音出去。
+            if sendsAudioOut && (captionProject?.lines.isEmpty ?? true) {
                 CaptionNetworkLine()
             }
             if let captionProblem {
