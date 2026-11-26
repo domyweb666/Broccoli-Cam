@@ -206,6 +206,8 @@ struct RecordingView: View {
         scriptObserved
             .onChange(of: orientation.angle) { _, _ in
                 viewModel.deviceAngle = deviceAngle
+                // 橫過來過一次就知道了，比例小標不用再多寫提示。
+                if deviceAngle != 0, !settings.landscapeHintDone { settings.landscapeHintDone = true }
             }
             .onChange(of: settings.autoLandscape) { _, _ in
                 viewModel.deviceAngle = deviceAngle
@@ -426,6 +428,7 @@ struct RecordingView: View {
         VStack(spacing: 10) {
             StatusRow(phase: viewModel.phase, elapsed: viewModel.elapsed, estimate: estimate,
                       canSwitchMode: !viewModel.isBusy && viewModel.pending == nil,
+                      sideways: uiAngle != 0,
                       showModes: $showModes)
             if viewModel.isSegmented {
                 SegmentBar(viewModel: viewModel)
@@ -986,7 +989,10 @@ private struct StatusRow: View {
     let estimate: TimeInterval?
     /// 待機時才能切換看多少字、有沒有人聽。
     let canSwitchMode: Bool
+    /// 手機現在橫放，會錄 16:9。
+    let sideways: Bool
     @Binding var showModes: Bool
+    @State private var showRatioInfo = false
 
     private var timeText: String {
         let now = Self.format(elapsed)
@@ -1023,8 +1029,62 @@ private struct StatusRow: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(modeName)
+
+                ratioChip
             }
         }
+        .alert(ratioTitle, isPresented: $showRatioInfo) {
+            if settings.autoLandscape {
+                Button("好") {}
+            } else {
+                Button("打開") { settings.autoLandscape = true }
+                Button("先不要", role: .cancel) {}
+            }
+        } message: {
+            Text(ratioMessage)
+        }
+    }
+
+    // MARK: - 比例
+
+    /// 現在會錄成什麼比例。還不知道可以橫著拍的人，多一句「橫拿錄 16:9」。
+    private var ratioChip: some View {
+        let hint: Bool = !sideways && settings.autoLandscape && !settings.landscapeHintDone
+        return Button {
+            settings.landscapeHintDone = true
+            showRatioInfo = true
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: sideways ? "rectangle" : "rectangle.portrait")
+                Text(sideways ? "16:9" : "9:16")
+                    .fontWeight(.medium)
+                if hint {
+                    Text("橫拿錄 16:9")
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.black.opacity(0.55), in: Capsule())
+            .contentShape(Rectangle().inset(by: -10))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(sideways ? "目前錄橫式 16:9" : "目前錄直式 9:16，手機橫過來可以錄 16:9")
+    }
+
+    private var ratioTitle: String {
+        if sideways { return "現在錄橫式 16:9" }
+        return settings.autoLandscape ? "想錄橫的 16:9？" : "橫式錄影關掉了"
+    }
+
+    private var ratioMessage: String {
+        if sideways { return "手機直放就回到直式 9:16。" }
+        if settings.autoLandscape {
+            return "把手機橫過來架好，錄出來就是 16:9，適合放 YouTube。提詞會變成貼著鏡頭的一直欄。"
+        }
+        return "打開之後，手機橫過來架就會錄 16:9。設定裡的「手機橫放時錄橫式影片」也可以開關。"
     }
 
     /// 看多少字；有聆聽者就亮起來。

@@ -239,6 +239,8 @@ final class SettingsStore: ObservableObject {
     @Published var takeCheck: Bool { didSet { defaults.set(takeCheck, forKey: "takeCheck") } }
     /// 手機橫放時錄橫式 16:9
     @Published var autoLandscape: Bool { didSet { defaults.set(autoLandscape, forKey: "autoLandscape") } }
+    /// 使用者已經知道可以橫著拍（橫過來過一次，或點過比例小標）。之前比例小標會多寫一句提示
+    @Published var landscapeHintDone: Bool { didSet { defaults.set(landscapeHintDone, forKey: "landscapeHintDone") } }
 
     /// 稿件編輯頁的字級倍率 0.8–1.8
     @Published var scriptTextScale: Double { didSet { defaults.set(scriptTextScale, forKey: "scriptTextScale") } }
@@ -313,6 +315,7 @@ final class SettingsStore: ObservableObject {
         airPodsMic = (d.object(forKey: "airPodsMic") as? Bool) ?? false
         takeCheck = (d.object(forKey: "takeCheck") as? Bool) ?? true
         autoLandscape = (d.object(forKey: "autoLandscape") as? Bool) ?? true
+        landscapeHintDone = d.bool(forKey: "landscapeHintDone")
         scriptTextScale = (d.object(forKey: "scriptTextScale") as? Double) ?? 1.0
         segmentedRecording = (d.object(forKey: "segmentedRecording") as? Bool) ?? true
         jumpMode = JumpMode(rawValue: d.string(forKey: "jumpMode") ?? "") ?? .paragraph
