@@ -238,8 +238,8 @@ struct RecordingView: View {
                 // 只多一個人或少一個人，段落和稿子都不動。
                 updateCompanion()
             }
-            .onChange(of: settings.airPodsMic) { _, on in
-                camera.setBluetoothHQ(on)
+            .onChange(of: settings.micPreferences) { _, preferences in
+                camera.setMicPreferences(preferences)
             }
             .onChange(of: settings.script) { _, _ in
                 // 腳本頁開著時不跟著打字更新，不然改一個字已錄的各段就作廢，關掉那一頁再一次算。
@@ -301,7 +301,7 @@ struct RecordingView: View {
         viewModel.prompter.speed = CGFloat(settings.speed)
         viewModel.deviceAngle = deviceAngle
         UIApplication.shared.isIdleTimerDisabled = true
-        camera.setBluetoothHQ(settings.airPodsMic)
+        camera.setMicPreferences(settings.micPreferences)
         startCamera()
         updateCompanion()
         askSpeechIfNeeded()
@@ -936,6 +936,21 @@ private struct PreviewStack: View {
             .zIndex(6)
         }
 
+        if camera.interruptionText == nil, let note = camera.micNotice {
+            Label(note, systemImage: "mic.fill")
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 40)
+                .rotationEffect(.degrees(angle))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(false)
+                .zIndex(6)
+        }
+
         if let note = camera.interruptionText {
             Text(note)
                 .font(.footnote.weight(.medium))
@@ -1016,7 +1031,7 @@ private struct StatusRow: View {
                 .background(.black.opacity(0.55), in: Capsule())
             }
 
-            MicIndicator(meter: camera.meter)
+            MicIndicator(meter: camera.meter, route: camera.micRoute)
                 .onLongPressGesture(minimumDuration: 1.0) {
                     settings.showDebug.toggle()
                 }
@@ -1120,6 +1135,14 @@ private struct StatusRow: View {
 /// 簡單的收音狀態：音量條會動代表有收到聲音；完全沒訊號才提示。
 private struct MicIndicator: View {
     @ObservedObject var meter: SpeechActivityMonitor
+    /// 外接麥才在旁邊寫名字；藍牙是電話音質，用黃字提醒。
+    let route: MicRoute
+
+    private var accessibilityText: String {
+        let source = route.kind.isExternal ? "收音用\(route.name)" : "收音用手機麥克風"
+        let quality = route.isPhoneQuality ? "，藍牙是電話音質" : ""
+        return meter.micStatus == .noSignal ? "\(source)，沒有偵測到聲音" : source + quality
+    }
 
     private var fraction: CGFloat {
         // -60 dB…0 dB 對應到 0…1
@@ -1129,7 +1152,7 @@ private struct MicIndicator: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: meter.micStatus == .noSignal ? "mic.slash.fill" : "mic.fill")
+            Image(systemName: meter.micStatus == .noSignal ? "mic.slash.fill" : (route.kind.isExternal ? "mic.badge.plus" : "mic.fill"))
                 .font(.caption)
             if meter.micStatus == .noSignal {
                 Text("沒有偵測到聲音")
@@ -1143,9 +1166,19 @@ private struct MicIndicator: View {
                             .fill(Theme.good)
                             .frame(width: 44 * fraction, height: 4)
                     }
+                if let badge = route.badge {
+                    Text(badge)
+                        .font(.caption2.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 120)
+                        .foregroundStyle(route.isPhoneQuality ? Color.yellow : Color.white)
+                }
             }
         }
         .foregroundStyle(meter.micStatus == .noSignal ? Color.yellow : Color.white)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityText)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.black.opacity(0.55), in: Capsule())

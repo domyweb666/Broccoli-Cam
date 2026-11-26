@@ -89,9 +89,10 @@ final class FrameRecorder {
     /// 聲音比畫面早到（開防抖時畫面會晚幾百毫秒），先放著，等畫面跟上再寫。
     private var pendingAudio: [CMSampleBuffer] = []
     private var lastAudioEnd: CMTime = .invalid
-    private var audioBasic: AudioStreamBasicDescription?
-    private var audioDescription: CMFormatDescription?
-    private var reformatter: AudioReformatter?
+    /// 聲音的格式從第一包定下來，之後換麥克風、格式變了就轉回這個格式。
+    private let audioKeeper: AudioFormatKeeper
+    /// 補無聲用的取樣率，跟寫檔設定一樣，才不用多轉一次。
+    private let silenceRate: Double
 
     /// 聲音最多比畫面超前多少就先寫進去。
     private static let audioLead = CMTime(value: 1, timescale: 2)
@@ -102,8 +103,9 @@ final class FrameRecorder {
 
     /// 建立寫檔器並且暖機。會花一點時間，請在 sessionQueue 呼叫。
     /// startTimeout 內一格都沒收到就算失敗；停止後最多等 tailTimeout 收晚到的影格。
+    /// audioSettings 依序試，第一個能用的就用；空的就只錄畫面。audioChannels 是音軌要幾聲道（1 或 2）。
     init(url: URL, width: Int, height: Int, turn: Int,
-         videoSettings: [String: Any], audioSettings: [String: Any]?,
+         videoSettings: [String: Any], audioSettings: [[String: Any]], audioChannels: Int,
          frameDuration: CMTime, startTimeout: TimeInterval, tailTimeout: TimeInterval) throws {
         let assetWriter = try AVAssetWriter(outputURL: url, fileType: .mov)
         // App 被系統殺掉或寫檔出錯時，前面的片段還能救回來。
@@ -123,12 +125,15 @@ final class FrameRecorder {
 
         // 沒有麥克風、或聲音設定不能用，就只錄畫面。
         var audio: AVAssetWriterInput?
-        if let audioSettings, assetWriter.canApply(outputSettings: audioSettings, forMediaType: .audio) {
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        var rate: Double = 44100
+        for settings in audioSettings where assetWriter.canApply(outputSettings: settings, forMediaType: .audio) {
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
             input.expectsMediaDataInRealTime = true
             if assetWriter.canAdd(input) {
                 assetWriter.add(input)
                 audio = input
+                if let wanted = (settings[AVSampleRateKey] as? NSNumber)?.doubleValue, wanted >= 8000 { rate = wanted }
+                break
             }
         }
 
@@ -145,6 +150,8 @@ final class FrameRecorder {
         self.videoInput = video
         self.adaptor = bufferAdaptor
         self.audioInput = audio
+        self.audioKeeper = AudioFormatKeeper(channels: min(2, max(1, audioChannels)))
+        self.silenceRate = rate
         self.pool = bufferPool
         self.width = width
         self.height = height
@@ -351,15 +358,15 @@ final class FrameRecorder {
         guard let audioInput, pendingAudio.isEmpty else { return }
         var start: CMTime = lastAudioEnd.isValid ? lastAudioEnd : firstVideoTime
         while start < limit, writer.status == .writing, audioInput.isReadyForMoreMediaData {
-            guard let sample = Self.silence(at: start) else { return }
+            guard let sample = Self.silence(at: start, rate: silenceRate) else { return }
             writeAudioLocked(sample, at: start, to: audioInput)
             guard lastAudioEnd.isValid, lastAudioEnd > start else { return }
             start = lastAudioEnd
         }
     }
 
-    private static func silence(at time: CMTime) -> CMSampleBuffer? {
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1),
+    private static func silence(at time: CMTime, rate: Double) -> CMSampleBuffer? {
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: rate, channels: 1),
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1024),
               let samples = buffer.floatChannelData else { return nil }
         buffer.frameLength = 1024
@@ -376,7 +383,7 @@ final class FrameRecorder {
         guard Self.fakesAudio, audioInput != nil else { return }
         var start: CMTime = fakeAudioEnd.isValid ? fakeAudioEnd : firstVideoTime
         while start < time {
-            guard let sample = Self.silence(at: start) else { return }
+            guard let sample = Self.silence(at: start, rate: silenceRate) else { return }
             pendingAudio.append(sample)
             start = audioEnd(sample, from: start)
         }
@@ -411,22 +418,21 @@ final class FrameRecorder {
 
         var output: CMSampleBuffer = sampleBuffer
         var outputTime: CMTime = time
-        if let wanted = audioBasic, let wantedDescription = audioDescription {
-            if !Self.sameFormat(basic, wanted) {
-                // 錄到一半插拔耳機，收音格式變了。轉回一開始的格式再寫，轉不了就丟掉這包，不能讓整支影片壞掉。
-                if reformatter == nil || !reformatter!.accepts(basic) {
-                    reformatter = AudioReformatter(from: basic, to: wanted, description: wantedDescription)
-                }
-                if lastAudioEnd.isValid, lastAudioEnd > outputTime { outputTime = lastAudioEnd }
-                guard let converted = reformatter?.convert(sampleBuffer, at: outputTime) else {
-                    counts.audioDropped += 1
-                    return
-                }
-                output = converted
+        if !audioKeeper.isSettled {
+            guard audioKeeper.settle(basic, description: description) else {
+                counts.audioDropped += 1
+                return
             }
-        } else {
-            audioBasic = basic
-            audioDescription = description
+        }
+        if audioKeeper.needsConversion(basic) {
+            // 錄到一半插拔麥克風、或立體聲要合成單聲道：轉成一開始定下的格式再寫。
+            // 轉不了就丟掉這包，不能讓整支影片壞掉。
+            if lastAudioEnd.isValid, lastAudioEnd > outputTime { outputTime = lastAudioEnd }
+            guard let converted = audioKeeper.convert(sampleBuffer, from: basic, at: outputTime) else {
+                counts.audioDropped += 1
+                return
+            }
+            output = converted
         }
 
         // 時間倒退超過 5 毫秒的聲音會讓寫檔器出錯。
@@ -452,14 +458,6 @@ final class FrameRecorder {
             pendingAudio.removeFirst()
             counts.audioDropped += 1
         }
-    }
-
-    private static func sameFormat(_ a: AudioStreamBasicDescription, _ b: AudioStreamBasicDescription) -> Bool {
-        a.mFormatID == b.mFormatID
-            && a.mSampleRate == b.mSampleRate
-            && a.mFormatFlags == b.mFormatFlags
-            && a.mChannelsPerFrame == b.mChannelsPerFrame
-            && a.mBitsPerChannel == b.mBitsPerChannel
     }
 
     // MARK: - 收尾
@@ -568,93 +566,5 @@ final class FrameRecorder {
         if first {
             onEnded?(outcome)
         }
-    }
-}
-
-/// 把變了格式的收音轉回一開始的格式。
-private final class AudioReformatter {
-    private final class Feed {
-        var used = false
-    }
-
-    private let source: AudioStreamBasicDescription
-    private let sourceFormat: AVAudioFormat
-    private let targetFormat: AVAudioFormat
-    private let targetDescription: CMFormatDescription
-    private let converter: AVAudioConverter
-
-    init?(from source: AudioStreamBasicDescription, to target: AudioStreamBasicDescription,
-          description: CMFormatDescription) {
-        var sourceCopy = source
-        var targetCopy = target
-        guard let input = AVAudioFormat(streamDescription: &sourceCopy),
-              let output = AVAudioFormat(streamDescription: &targetCopy),
-              let made = AVAudioConverter(from: input, to: output) else { return nil }
-        self.source = source
-        sourceFormat = input
-        targetFormat = output
-        targetDescription = description
-        converter = made
-    }
-
-    func accepts(_ basic: AudioStreamBasicDescription) -> Bool {
-        basic.mSampleRate == source.mSampleRate
-            && basic.mFormatID == source.mFormatID
-            && basic.mFormatFlags == source.mFormatFlags
-            && basic.mChannelsPerFrame == source.mChannelsPerFrame
-            && basic.mBitsPerChannel == source.mBitsPerChannel
-    }
-
-    func convert(_ sampleBuffer: CMSampleBuffer, at time: CMTime) -> CMSampleBuffer? {
-        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
-        guard frames > 0,
-              let input = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: AVAudioFrameCount(frames)) else {
-            return nil
-        }
-        input.frameLength = AVAudioFrameCount(frames)
-        let copied: OSStatus = CMSampleBufferCopyPCMDataIntoAudioBufferList(
-            sampleBuffer, at: 0, frameCount: Int32(frames), into: input.mutableAudioBufferList)
-        guard copied == noErr else { return nil }
-
-        let ratio: Double = targetFormat.sampleRate / sourceFormat.sampleRate
-        let capacity = AVAudioFrameCount(Double(frames) * ratio) + 64
-        guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return nil }
-        let feed = Feed()
-        var conversionError: NSError?
-        let status: AVAudioConverterOutputStatus = converter.convert(to: output, error: &conversionError) { _, inputStatus in
-            if feed.used {
-                inputStatus.pointee = .noDataNow
-                return nil
-            }
-            feed.used = true
-            inputStatus.pointee = .haveData
-            return input
-        }
-        guard status != .error, conversionError == nil, output.frameLength > 0 else { return nil }
-        return Self.sampleBuffer(from: output, description: targetDescription, at: time)
-    }
-
-    static func sampleBuffer(from buffer: AVAudioPCMBuffer, description: CMFormatDescription,
-                                     at time: CMTime) -> CMSampleBuffer? {
-        let rate = CMTimeScale(buffer.format.sampleRate.rounded())
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: rate),
-                                        presentationTimeStamp: time,
-                                        decodeTimeStamp: .invalid)
-        var made: CMSampleBuffer?
-        let created: OSStatus = CMSampleBufferCreate(
-            allocator: kCFAllocatorDefault, dataBuffer: nil, dataReady: false,
-            makeDataReadyCallback: nil, refcon: nil, formatDescription: description,
-            sampleCount: CMItemCount(buffer.frameLength), sampleTimingEntryCount: 1,
-            sampleTimingArray: &timing, sampleSizeEntryCount: 0, sampleSizeArray: nil,
-            sampleBufferOut: &made)
-        guard created == noErr, let result = made else { return nil }
-        let filled: OSStatus = CMSampleBufferSetDataBufferFromAudioBufferList(
-            result, blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault,
-            flags: 0, bufferList: buffer.audioBufferList)
-        guard filled == noErr else { return nil }
-        if !CMSampleBufferDataIsReady(result) {
-            guard CMSampleBufferSetDataReady(result) == noErr else { return nil }
-        }
-        return result
     }
 }
